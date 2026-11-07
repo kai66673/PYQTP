@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from urllib.parse import unquote, urlparse
 
 from PySide6.QtCore import Signal
@@ -11,9 +11,17 @@ from PySide6.QtWidgets import QFileDialog, QMessageBox, QToolBar
 
 from pyqtp.base.base_document_view import BaseDocumentView
 from pyqtp.controls.base_control import BaseControl
+from pyqtp.controls.doc_control.editor_settings_page import EditorSettingsPage
 from pyqtp.utils.action import Action
 from pyqtp.utils.priority_menu import PriorityMenu
 from pyqtp.views.monaco_document_view import MonacoDocumentView
+from pyqtp.web.editor_options import (
+    DEFAULT_EDITOR_UX_OPTIONS,
+    read_editor_ux_options,
+    to_monaco_options,
+    validate_editor_ux_options,
+    write_editor_ux_options,
+)
 
 if TYPE_CHECKING:
     from pyqtp.base.base_main_window import BaseMainWindow
@@ -87,6 +95,9 @@ class DocumentManager(BaseControl):
             self._main_wnd.theme_manager.icon('io/save.svg')
         )
 
+        # этап 7: страница «Редактор» в окне настроек приложения
+        self._main_wnd.settings_page_register(EditorSettingsPage(self))
+
     def setup_toolbars(self) -> None:
         self.toolbar = toolbar = QToolBar('Документы')
         toolbar.setObjectName('DocumentsToolBar')
@@ -107,6 +118,50 @@ class DocumentManager(BaseControl):
 
         self.file_menu.addAction(self.action_open_doc, priority=5)
         self.file_menu.addAction(self.action_save_doc, priority=6)
+
+    # --- UX-настройки редактора (этап 7, страница «Редактор») ---
+
+    def editor_ux_options(self) -> dict[str, Any]:
+        """Текущие логические UX-настройки редактора (источник — QSettings)."""
+        return read_editor_ux_options(self._main_wnd.settings)
+
+    def apply_editor_ux_options(self, options: dict[str, Any]) -> None:
+        """Валидирует, сохраняет в QSettings и применяет к всем открытым
+        редакторам.
+
+        При некорректных значениях бросает ValueError/TypeError (окно
+        настроек покажет ошибку, источник не будет тронут).
+        """
+        validate_editor_ux_options(options)  # ValueError/TypeError до записи
+        write_editor_ux_options(self._main_wnd.settings, options)
+        self._main_wnd.settings.sync()
+        monaco_payload = to_monaco_options(options)
+        for view in self._opened_docs.values():
+            self._apply_editor_ux_options(view, monaco_payload)
+
+    def reset_editor_ux_options(self) -> None:
+        """Сбрасывает настройки редактора к значениям по умолчанию."""
+        self.apply_editor_ux_options(dict(DEFAULT_EDITOR_UX_OPTIONS))
+
+    def _apply_editor_ux_options(
+        self, view: BaseDocumentView, payload: dict[str, Any] | None = None
+    ) -> None:
+        """Доводит UX-настройки Monaco до редактора конкретной вьюхи (этап 7).
+
+        ``payload`` — уже готовые опции Monaco (чтобы не перечитывать QSettings
+        на каждую вьюху при массовом применении); по умолчанию — текущие
+        сохранённые настройки. Вьюхи без Monaco (plain text) пропускаются.
+
+        Сообщения, посланные до инициализации моста, буферизуются
+        ``qtmonaco.Connector`` и уходят в JS сразу после неё, поэтому настройки
+        применимы сразу после создания вьюхи.
+        """
+        edit_widget = getattr(view, 'edit_widget', None)
+        if edit_widget is None:
+            return
+        if payload is None:
+            payload = to_monaco_options(self.editor_ux_options())
+        edit_widget.update_editor_options(payload)
 
     def _open_document(self):
         # Выбираем файл
@@ -134,6 +189,7 @@ class DocumentManager(BaseControl):
         new_view = _document_view_cls_from_identity(identity)(
             self._main_wnd, key=identity
         )
+        self._apply_editor_ux_options(new_view)
         self._main_wnd.view_central_register(
             new_view, close_cb=self._handle_doc_view_close_requested
         )

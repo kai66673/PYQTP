@@ -25,7 +25,8 @@
 | semanticTokens (полный ответ → Monaco) | работает, live-тест |
 | Междокументные переходы (definition в другой файл → вкладка+курсор+фокус) | работает, live-тест |
 | Док-система KDD: вкладки, закрытие, Qt-фокус | работает |
-| Регрессия: 25 pytest-тестов (7 live/webengine), ruff/pyright базы не меняются | работает |
+| Встроенный UX Monaco: поиск/замена, складки, сварт-селект, зум шрифта, история jump (Alt+←/→) | работает, webengine-тесты + страница настроек «Редактор» |
+| Регрессия: 34 pytest-теста (17 live/webengine), ruff/pyright базы не меняются | работает |
 
 Главный **осознанный trade-off** — редакторы на QWebEngine тяжелее нативных
 (GtkSourceView). Цифры — в разделе «Метрики» ниже.
@@ -52,14 +53,28 @@
 
 ## 3. Этапы 7–13
 
-### Этап 7 — «бесплатный» Monaco: встроенные фичи в UI
+### Этап 7 — «бесплатный» Monaco: встроенные фичи в UI ✅ (готово)
 Всё уже есть в Monaco; нужно лишь включить/назначить:
 find/replace (regex/case/word), folding, minimap, bracket pairs + автопары,
-multi-cursor, expand selection (Ctrl+Shift+W), zoom, jump history Alt+←/→
-(`goBack`/`goForward`).
-Правки: `packages/qtmonaco/backend/src/main.ts` (editor options, команды) →
-пересборка `js_build`. Опции — на страницу настроек «Внешний вид»/редактор.
-**Приёмка:** webengine-тесты find/replace и folding; живая проверка.
+multi-cursor, expand selection, zoom, jump history Alt+←/→.
+Правки: `packages/qtmonaco/backend/src/main.ts` (патч вендора: `multiCursorModifier:
+"alt"`, `scrollBeyondLastLine: false` в дефолты; правила `addKeybindingRules` —
+зум шрифта `Ctrl+=`/`Ctrl+-`/`Ctrl+0`, smart select `Ctrl+Shift+.`/`,`, история
+переходов `Alt+←/→`; свои команды `qtmonaco.editor.navigation.goBack/goForward`
++ собственный стек позиций (в standalone-бандле workbench navigation history
+нет); слушатель каретки привязан к редактору через `attachEditorListeners`,
+отправная точка истории (`navLastPos`) засеивается текущей позицией после каждой
+смены модели/редактора и подмены текста (`seedNavHistory`) — иначе первый крупный
+переход после открытия файла в историю не попадал) →
+пересборка `js_build`. Опции (minimap/folding/зум колесом/размер шрифта) —
+страница настроек «Редактор» (`EditorSettingsPage`, key `editor`, order 10),
+хранение в QSettings-группе `EditorOptions` (`pyqtp/web/editor_options.py`),
+рассылка в открытые редакторы через `DocumentManager.apply_editor_ux_options`
+(`update_editor_options`, буферизуется коннектором до инициализации моста).
+Связки Ctrl+F/H и Ctrl+K- chords folding уже были встроены в Monaco.
+**Приёмка:** webengine-тесты `tests/test_editor_ux_stage7.py` (опции из
+Python, find/replace, folding, smart select, история переходов, зум,
+регистрация связок); живая проверка.
 
 ### Этап 8 — завершение LSP-клиента
 По образцу существующих фабрик провайдеров (`claimProvider`,

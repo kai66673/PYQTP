@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from PySide6.QtCore import Signal
 from qtmonaco.monaco import Monaco
@@ -74,6 +74,15 @@ class QtMonacoEditorWidget(Monaco):
     def _handle_text_changed(self, value: str) -> None:
         modified = value != self._saved_text
         self.modification_changed.emit(modified)
+
+    def update_editor_options(self, options: dict[str, Any]) -> None:
+        """Шлёт набор опций в Monaco (сообщение ``update_editor_options``).
+
+        Сообщения, отправленные до инициализации моста, буферизуются
+        ``Connector`` и доставляются сразу после инициализации — поэтому
+        настройки можно применять сразу при создании виджета.
+        """
+        self._connector.send('update_editor_options', options)
 
     def _open_uri_request(self, value: dict) -> None:
         """Обработчик `_open_uri_request` из JS-стороны (этап 6).

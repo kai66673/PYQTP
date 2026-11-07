@@ -47,9 +47,10 @@ Verify in this order: **ruff → pyright → tests → run the app**.
 - Tests: `uv run pytest` (`pytest` + `pytest-qt` are dev deps of core/ide). Config
   `[tool.pytest.ini_options]` is in the **root** pyproject; tests live in
   `packages/pyqtp-core/tests/` (settings window) and `packages/pyqtp-ide/tests/`
-  (LSP registry + live editor). Markers `live` (real LSP server processes) and `webengine`
-  (real QWebEngineView/Monaco) are deselected by default via `addopts` → 17 passed / 7 deselected;
-  run them with `uv run pytest -m 'live or webengine'` (~30 s, they work offscreen) or all 24 in one
+  (LSP registry + live editor + stage-7 editor UX). Markers `live` (real LSP server processes) and
+  `webengine` (real QWebEngineView/Monaco) are deselected by default via `addopts` → 17 passed / 17
+  deselected; run them with `uv run pytest -m 'live or webengine'` (~1 min, they work offscreen) or
+  all 34 in one
   process with `uv run pytest -m ''`. Test-suite gotchas:
   - root `conftest.py` sets `QT_QPA_PLATFORM=offscreen` + `QTWEBENGINE_DISABLE_SANDBOX=1` at import
     and overrides `qapp` as a **session-scoped** fixture (pytest-qt's DESTROY_ON_POLICY would kill
@@ -57,6 +58,19 @@ Verify in this order: **ruff → pyright → tests → run the app**.
     qFatal-aborts the process with no Python exception to catch.
   - PySide6 6.6 returns JS booleans from `runJavaScript` as `''` (both `true` and `false`!) — every
     JS predicate in tests must return a string marker (`'READY'`) and compare on the Python side.
+    Same trap in JS: `getFoldingModel()` returns a **promise** (no `getAllFolds()` — probe
+    `model.regions.getStartLineNumber/getEndLineNumber/isCollapsed(i)`), and in this Monaco build
+    `EditorOption.effectiveFontSize` is missing (use `EditorOption.fontInfo` → `.fontSize` +
+    `.zoomLevel`, or `getOption(monaco.editor.EditorOption.multiCursorModifier)` = `'altKey'`).
+  - Offscreen WebEngine delivers real `QTest` key presses only to the DOM, **not** to Monaco
+    (Monaco has no `inputarea` there) — and neither synthetic keydowns nor
+    `monaco.editor.trigger(...)` reach the editor's actions; only
+    `editor.trigger(..., getAction(id))` on the instance works. So keybinding tests assert the
+    chords are registered (`editor._standaloneKeybindingService.getKeybindings()` →
+    `getCommandId()`/`getHash()`) and then run the command via the instance.
+  - `QtMonacoEditorWidget` buffers early bridge traffic (including startup `set_text`) until
+    `bridge_initialized`, so a test that `setValue`s text right after `editor_init` gets it
+    overwritten a moment later — re-issue `setValue` inside the readiness predicate.
   - pytest-qt 4.5 `waitUntil` has no `retry_interval` — expensive predicates use the local
     `wait_for(...)` polling helper.
   - pytest 8 applies `testpaths` only when the invocation dir == rootdir, so `addopts` also carries
@@ -156,6 +170,14 @@ Verify in this order: **ruff → pyright → tests → run the app**.
     key `appearance`, order 0 — `apply()` = `theme_manager.switch_to` + синхрон
     corner-комбика `theme_switch_toolbar.theme_combo_box` через blockSignals,
     reset = «Светлая», persistence — общим `theme_settings_write`), ide
+    «Редактор» (`doc_control/editor_settings_page.EditorSettingsPage`, key
+    `editor`, order 10 — UX-опции Monaco (`pyqtp/web/editor_options.py`:
+    minimap/сворачивание/колесо+Ctrl/размер шрифта), владелец — `DocumentManager`
+    (`editor_ux_options/apply_editor_ux_options/reset_editor_ux_options`,
+    персистентность — ключи QSettings `EditorOptions/*`, применение —
+    широковещательный `update_editor_options()` по всем открытым редакторам;
+    опции шлёт и `open_document`, т.к. `QtMonacoEditorWidget` появляется позже
+    поздних вьюх),
     «Языковые серверы (LSP)» (`lsp_settings_page.LspRegistrySettingsPage`, key
     `lsp`, order 50) — её `LspHub` регистрирует в `setup()`; кнопок применения
     на самой странице нет — кнопки окна вызывают `registry_apply_json/
@@ -276,6 +298,27 @@ Verify in this order: **ruff → pyright → tests → run the app**.
   the 300 ms didChange debounce, so the server completed over stale text (no '.'
   yet → no member suggestions); hub routing is sequential so the flushed
   didChange always precedes the request;
+  built-in editor UX (stage 7, `docs/IDE_ROADMAP.md`): in `main.ts` —
+  `monaco.editor.addKeybindingRules` for actions Monaco standalone doesn't bind
+  (fontZoomIn/Out/Reset `Ctrl+=`/`Ctrl+-`/`Ctrl+0`, smartSelect expand/shrink
+  `Ctrl+Shift+.`/`Ctrl+Shift+,`; find `Ctrl+F`/`Ctrl+H` and folding default chords
+  stay built-in), own in-document jump history `navBack`/`navForward` (limit 80) +
+  commands `qtmonaco.editor.navigation.goBack/goForward` bound to Alt+←/→
+  (`when: 'editorFocus'`): recorded in `onDidChangeCursorPosition` when the line
+  delta ≥ `NAV_MIN_LINES` (4) and the reason is not Undo/Redo, `_navNavigating`
+  guards our own moves (otherwise every back would push a forward point), history
+  is cleared on `model` swap and on editor replacement in `setActiveEditor`, and
+  `seedNavHistory()` re-arms `navLastPos` from the current cursor after every model
+  swap/editor replacement/whole-text `set_text` — without that seed the first big
+  jump after opening a document has no start point and Alt+← does nothing (this was
+  the live-IDE bug behind `test_stage7_navigation_first_jump_recorded`);
+  `attachEditorListeners()` centralizes `onDidChangeModelContent` (the `_current_text`
+  sync) + `onDidChangeCursorPosition` wiring for the real editor and the placeholder
+  (called only from `setActiveEditor`, which also disposes the old cursor disposable);
+  `defaultEditorOptions` now sets `multiCursorModifier: "alt"` (so Ctrl+click stays
+  "go to definition") and `scrollBeyondLastLine: false` — the rest of the Monaco UX
+  options (minimap/folding/font zoom/smart select/…) come from Python:
+  `pyqtp-ide/pyqtp/web/editor_options.py` + `QtMonacoEditorWidget.update_editor_options()`;
   python patch in `monaco.py` —
   `Monaco.__init__` takes an `lsp_host` param and no longer eagerly spawns
   `get_pylsp_host()` (lazy `_resolve_lsp_host()` fallback keeps standalone
