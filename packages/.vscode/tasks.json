@@ -1,0 +1,77 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+            "label": "launcer",
+            "type": "shell",
+            "command": "uv run python launcher.py",
+            "options": {
+                "cwd": "${workspaceFolder}/pyqtp-core/pyqtp"
+            },
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "presentation": {
+                "reveal": "always",
+                "panel": "new",
+                "focus": true
+            },
+            "problemMatcher": []
+        },
+		{
+            "label": "central_dock",
+            "type": "shell",
+            "command": "uv run python central_dock.py",
+            "options": {
+                "cwd": "${workspaceFolder}/pyqtp-core/examples/central_dock"
+            },
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "presentation": {
+                "reveal": "always",
+                "panel": "new",
+                "focus": true
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "kddw_docs",
+            "type": "shell",
+            "command": "uv run python docs_main.py",
+            "options": {
+                "cwd": "${workspaceFolder}/pyqtp-core/examples/kddw_docs"
+            },
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "presentation": {
+                "reveal": "always",
+                "panel": "new",
+                "focus": true
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "ide",
+            "type": "shell",
+            "command": "uv run python ide.py -v",
+            "options": {
+                "cwd": "${workspaceFolder}/pyqtp-ide/pyqtp"
+            },
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "presentation": {
+                "reveal": "always",
+                "panel": "new",
+                "focus": true
+            },
+            "problemMatcher": []
+        }
+    ]
+}

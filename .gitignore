@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.pytest_cache/
+
+# Виртуальное окружение uv
+.venv/
+
+# Кеши линтеров
+.ruff_cache/
+.mypy_cache/
+.pyre/
+
+# Node (qtmonaco frontend)
+node_modules/
+
+# Собранный JS-фронтен Monaco (пересобирать после клона/правок TS,
+# команда — в AGENTS.md, раздел Commands)
+**/js_build/
+
+# Логи
+*.log
+
+# Состояние окружений/редакторов (PyCharm; runtime-состояние PYQTP IDE)
+**/.idea/
+**/.iide/
+
+# Случайные артефакты ОС
+.DS_Store

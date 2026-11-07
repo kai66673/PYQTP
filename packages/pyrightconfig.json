@@ -1,0 +1,31 @@
+{
+  "venvPath": "..",
+  "venv": ".venv",
+  "include": [
+    "pyqtp-common",
+    "pyqtp-core",
+    "pyqtp-ide",
+  ],
+  "exclude": [
+    "**/ui_*.py",
+    "**/__pycache__",
+    "qtmonaco"
+  ],
+  "defineConstant": {
+    "DEBUG": true
+  },
+  "reportMissingImports": "error",
+  "reportMissingTypeStubs": false,
+  "reportIncompatibleVariableOverride": false,
+  "typeCheckingMode": "standard",
+  "executionEnvironments": [
+    {
+      "root": ".",
+      "extraPaths": [
+        "pyqtp-common",
+        "pyqtp-core",
+        "pyqtp-ide",
+      ]
+    }
+  ]
+}

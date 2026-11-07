@@ -1,0 +1,2 @@
+# pyqtp-core
+

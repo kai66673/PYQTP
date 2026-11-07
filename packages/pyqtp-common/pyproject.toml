@@ -1,0 +1,197 @@
+[project]
+name = "pyqtp_common"
+version = "1.0.0"
+description = "PySide6 Desktop Application Platform Common Modules"
+authors = [{ name = "КАИ", email = "kai66673@mail.ru" }]
+requires-python = ">=3.11"
+readme = "README.md"
+dependencies = [
+    "pyside6>=6.6.2,<7",
+    "pygments",
+]
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "pytest-cov",
+    "sphinx",
+    "sphinx-pyproject",
+    "sphinx-rtd-theme",
+    "pre-commit",
+    "ruff",
+    "pydoclint",
+    "pyright",
+    "commitizen",
+]
+
+[tool.hatch.build.targets.sdist]
+include = ["pyqtp"]
+
+[tool.hatch.build.targets.wheel]
+include = ["pyqtp"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pyright]
+include = ["pyqtp", "tests"]
+exclude = [
+    "**/ui_*.py",
+    "**/__pycache__",
+    "**/.venv",
+    "**/.git",
+    "**/.idea",
+    "pyqtp/utils/highlighter.py",
+]
+reportMissingImports = "error"
+reportMissingTypeStubs = false
+reportIncompatibleVariableOverride = false
+reportUnusedCallResult = false
+typeCheckingMode = "standard"
+
+[tool.ruff]
+include = [
+    "pyproject.toml",
+    "pyqtp/**/*.py"
+]
+exclude = [
+    "pyqtp/resources/*_rc.py",
+    "pyqtp/help/**/*_rc.py",
+    "pyqtp/utils/priority_menu.py",
+    "pyqtp/utils/highlighter.py",
+    "pyqtp/utils/pygments_highlighter.py",
+]
+
+line-length = 80
+fix = true
+
+[tool.ruff.lint]
+select = [
+    "ALL"
+]
+ignore = [
+    "CPY001",
+    #### modules
+    "ANN",  # flake8-annotations
+    "COM",  # flake8-commas
+    "C90",  # mccabe complexity
+    "DJ",   # django
+    "EXE",  # flake8-executable
+    "TID",  # flake8-tidy-imports
+    "S101", # flake8-bandit
+    #### specific rules
+    "D100",   # ignore missing docs
+    "D101",
+    "D102",
+    "D103",
+    "D104",
+    "D105",
+    "D106",
+    "D107",
+    "D200",
+    "D205",
+    "D212",
+    "D400",
+    "D401",
+    "D415",
+    "E402",    # false positives for local imports
+    "E501",    # line too long
+    "TRY003",  # external messages in exceptions are too verbose
+    "TD002",
+    "TD003",
+    "FIX002",  # too verbose descriptions of todos
+
+    "RUF001",  # String contains ambiguous `С`
+    "RUF002",  # ambigous unicode
+    "RUF003",  # Comment contains ambiguous...
+    "D211",    # no blankline before class
+    "INP001",  # is part of an implicit namespace package
+    "SLF001", # Private member accessed
+
+    # Правила, несовместимые с правилом форматтера quote-style = "single"
+    "ISC001",
+    "Q000",
+    "Q003",
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["pyqtp*"]
+
+[tool.ruff.format]
+# 5. Use single quotes for non-triple-quoted strings.
+quote-style = "single"
+
+[tool.ruff.lint.pep8-naming]
+# PyQt methods
+ignore-names = [
+    "closeEvent",
+    "paintEvent",
+    "keyPressEvent",
+    "mousePressEvent",
+    "mouseMoveEvent",
+    "mouseReleaseEvent",
+    "headerData",
+    "setData",
+    "rowCount",
+    "columnCount",
+    "boundingRect",
+    "mouseDoubleClickEvent",
+    "itemChange",
+    "hoverEnterEvent",
+    "wheelEvent",
+    "dragMoveEvent",
+    "dragEnterEvent",
+    "dropEvent",
+    "hoverLeaveEvent",
+    "focusInEvent",
+    "focusOutEvent",
+    "lessThan",
+    "sizeHint",
+    "editorEvent",
+    "closeEditor",
+    "javaScriptConsoleMessage",
+    "enterEvent",
+    "leaveEvent",
+    "createEditor",
+    "setEditorData",
+    "setModelData",
+    "updateEditorGeometry",
+    "mimeTypes",
+    "supportedDropActions",
+    "supportedDragActions",
+    "mimeData",
+    "canDropMimeData",
+    "dropMimeData",
+    "moveRows",
+    "sourceParent",
+    "sourceRow",
+    "destinationParent",
+    "destinationChild",
+    "removeRows",
+    "insertRows"
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"  # Accepts: "google", "numpy", or "pep257".
+
+[tool.pydoclint]
+style = "google"
+exclude = '\.git|docs|tests|\.venv'
+
+[tool.sphinx-pyproject]
+author = "ЛИТПМ МФТИ"
+language = "ru"
+package_root = "sphinx_pyproject"
+extensions = [
+    "sphinx.ext.autodoc",
+    "sphinx.ext.autosummary",
+    "sphinx.ext.napoleon",
+    "sphinx.ext.todo",
+    "sphinx.ext.viewcode",
+#    "sphinx.ext.graphviz",
+#    "sphinx.ext.inheritance_diagram"
+]
+napoleon_google_docstring = true
+autodoc_typehints = "description"
+html_theme = "sphinx_rtd_theme"

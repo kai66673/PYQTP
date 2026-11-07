@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <link rel="stylesheet" href="xterm.css" />
+    <script src="xterm.js"></script>
+    <script src="addon-fit.js"></script>
+    <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+    <style>
+        /* Подключаем локальный Nerd Font */
+        @font-face {
+            font-family: 'NerdFont';
+            /* Укажите точное имя файла шрифта, который вы положили в папку */
+            src: url('AdwaitaMonoNerdFontMono-Regular.ttf') format('truetype');
+            font-weight: normal;
+            font-style: normal;
+        }
+
+        html, body { margin: 0; padding: 0; width: 100%; height: 100%; background: #1e1e1e; overflow: hidden; }
+        #terminal { width: 100%; height: 100%; }
+    </style>
+</head>
+<body>
+    <div id="terminal"></div>
+    <script>
+        let term, fitAddon;
+
+        function initTerminal() {
+            term = new Terminal({
+                cursorBlink: true,
+                fontSize: 14,
+                // Задаем наш подключенный Nerd Font. 
+                // Monospace указан как запасной, пока файл шрифта грузится
+                fontFamily: 'NerdFont, monospace', 
+                theme: { background: '#1e1e1e' }
+            });
+            fitAddon = new FitAddon.FitAddon();
+            term.loadAddon(fitAddon);
+            term.open(document.getElementById('terminal'));
+            fitAddon.fit();
+
+            // === БЛОК ОПЕРАЦИЙ С БУФЕРОМ ОБМЕНА ===
+            
+            // Настраиваем перехват горячих клавиш
+            term.attachCustomKeyEventHandler((event) => {
+                if (event.ctrlKey && event.shiftKey && event.type === 'keydown') {
+                    
+                    // Ctrl + Shift + C : Просто копируем то, что выделено. Выделение остается на экране.
+                    if (event.key === 'C' || event.key === 'с') {
+                        if (term.hasSelection()) {
+                            document.execCommand('copy'); 
+                        }
+                        return false; 
+                    }
+                    
+                    // Ctrl + Shift + V : Просто вставляем текст туда, где стоит курсор терминала.
+                    if (event.key === 'V' || event.key === 'м') {
+                        document.execCommand('paste');
+                        return false; 
+                    }
+                }
+                return true; 
+            });
+
+            // ======================================
+            new QWebChannel(qt.webChannelTransport, function (channel) {
+                window.backend = channel.objects.backend;
+                term.onData(data => backend.receive_input(data));
+                
+                window.addEventListener('resize', () => {
+                    fitAddon.fit();
+                    backend.resize_pty(term.rows, term.cols);
+                });
+                
+                fitAddon.fit();
+                backend.resize_pty(term.rows, term.cols);
+            });
+        }
+
+        function writeToTerminal(data) {
+            if (term) term.write(data);
+        }
+
+        document.addEventListener('DOMContentLoaded', initTerminal);
+    </script>
+</body>
+</html>
