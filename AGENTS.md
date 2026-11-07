@@ -241,6 +241,10 @@ Verify in this order: **ruff → pyright → tests → run the app**.
 
 ## Conventions
 
+- Перед `git commit`/`git push` — всегда спрашивать подтверждение пользователя
+  (показать что коммитится/пушится и сообщение коммита, внести свои предложения
+  по составу среза и сообщению); пользователь может
+  скорректировать состав среза или сообщение.
 - Comments, docstrings and UI strings are Russian — keep them Russian.
 - Loggers keep the pre-rename `bcad.*` names (`bcad.dev`, `bcad.sys`, `bcad.med`, `bcad.lsp`,
   `bcad.project`); that is intentional, not a bug to fix.
