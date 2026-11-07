@@ -1,0 +1,452 @@
+import * as monaco from "monaco-editor";
+import LspClient from "./lsp";
+import { initVimMode, type CMAdapter } from "monaco-vim";
+
+const container = document.getElementById("container");
+if (!container) {
+  throw new Error("Container element not found");
+}
+const editorContainer: HTMLElement = container;
+
+const defaultEditorOptions: monaco.editor.IStandaloneEditorConstructionOptions = {
+  value: "",
+  language: "python",
+  automaticLayout: true,
+  theme: "vs-dark",
+};
+
+let editor = monaco.editor.create(editorContainer, defaultEditorOptions);
+let diffEditor: monaco.editor.IStandaloneDiffEditor | null = null;
+let contentChangeDisposable: monaco.IDisposable | null = null;
+
+(window as any).qtmonaco = {
+  editor: editor,
+  diffEditor: diffEditor,
+  monaco: monaco,
+  vimMode: null as CMAdapter | null,
+  initialized: false,
+};
+
+let qtmonaco = (window as any).qtmonaco;
+
+// Build qt bridge
+let bridge: any = null;
+
+let lspClient: LspClient | null = null;
+let lspHeader: string | null = null;
+
+let decorationsCollection: monaco.editor.IEditorDecorationsCollection | null = null;
+
+function disposeContentChangeListener() {
+  if (contentChangeDisposable) {
+    contentChangeDisposable.dispose();
+    contentChangeDisposable = null;
+  }
+}
+
+function disposeVimMode() {
+  if (qtmonaco.vimMode) {
+    qtmonaco.vimMode.dispose();
+    qtmonaco.vimMode = null;
+  }
+}
+
+function disposeEditorModel(codeEditor: monaco.editor.IStandaloneCodeEditor) {
+  const model = codeEditor.getModel();
+  if (model) {
+    model.dispose();
+  }
+}
+
+function disposeDiffEditor() {
+  if (!diffEditor) {
+    return;
+  }
+  const diffModel = diffEditor.getModel();
+  diffEditor.dispose();
+  diffModel?.original.dispose();
+  diffModel?.modified.dispose();
+  diffEditor = null;
+  qtmonaco.diffEditor = null;
+}
+
+function setActiveEditor(newEditor: monaco.editor.IStandaloneCodeEditor) {
+  disposeContentChangeListener();
+  decorationsCollection = null;
+  editor = newEditor;
+  qtmonaco.editor = editor;
+  contentChangeDisposable = editor.onDidChangeModelContent((_event) => {
+    const model = editor.getModel();
+    if (model) {
+      sendToPython("_current_text", model.getValue());
+    }
+  });
+}
+
+function switchToStandaloneEditor() {
+  if (!diffEditor) {
+    return;
+  }
+  disposeVimMode();
+  disposeContentChangeListener();
+  disposeDiffEditor();
+  setActiveEditor(monaco.editor.create(editorContainer, defaultEditorOptions));
+}
+
+function switchToDiffEditor(data: any) {
+  disposeVimMode();
+  disposeContentChangeListener();
+  if (diffEditor) {
+    disposeDiffEditor();
+  } else {
+    disposeEditorModel(editor);
+    editor.dispose();
+  }
+
+  const options: monaco.editor.IStandaloneDiffEditorConstructionOptions = {
+    automaticLayout: true,
+    theme: "vs-dark",
+    ...(data.options || {}),
+  };
+  diffEditor = monaco.editor.createDiffEditor(editorContainer, options);
+  qtmonaco.diffEditor = diffEditor;
+
+  const language = data.language ?? undefined;
+  const originalUri = data.originalUri ? monaco.Uri.parse(data.originalUri) : undefined;
+  const modifiedUri = data.modifiedUri ? monaco.Uri.parse(data.modifiedUri) : undefined;
+  const originalModel = monaco.editor.createModel(data.original, language, originalUri);
+  const modifiedModel = monaco.editor.createModel(data.modified, language, modifiedUri);
+
+  diffEditor.setModel({
+    original: originalModel,
+    modified: modifiedModel,
+  });
+  setActiveEditor(diffEditor.getModifiedEditor());
+  sendToPython("_current_text", modifiedModel.getValue());
+  sendToPython("_current_uri", modifiedModel.uri.toString());
+}
+
+// Define init function
+function init() {
+  // Add any initialization code here if needed
+  console.log("Editor initialized");
+  sendToPython("bridge_initialized", true);
+  qtmonaco.initialized = true;
+}
+
+// Declare QWebChannel for TypeScript
+declare global {
+  interface Window {
+    qt: {
+      webChannelTransport: any;
+    };
+  }
+  class QWebChannel {
+    constructor(transport: any, callback: (channel: any) => void);
+  }
+}
+
+window.onload = function () {
+  console.log("Window loaded, initializing QWebChannel");
+  new QWebChannel(window.qt.webChannelTransport, function (channel) {
+    bridge = channel.objects.connector;
+
+    // Check if bridge has the expected methods
+    if (bridge) {
+      bridge.javascript_data_sent.connect(updateFromPython);
+      console.log("Successfully connected to javascript_data signal");
+    } else {
+      console.warn("Bridge javascript_data_sent.connect not available");
+    }
+
+    setActiveEditor(editor);
+
+    init();
+  });
+};
+
+function sendToPython(name: string, value: any) {
+  if (bridge) {
+    bridge._receive(name, JSON.stringify(value));
+  }
+}
+
+function updateFromPython(name: string, value: string) {
+  const data = JSON.parse(value);
+  console.log(`Received update from Python: ${name} =`, data);
+  switch (name) {
+    case "set_text": {
+      switchToStandaloneEditor();
+      const model = editor.getModel();
+      if (model) {
+        // Only create a new model if the URI or language is changing
+        if (
+          (data.uri && model.uri.toString() !== monaco.Uri.parse(data.uri).toString()) ||
+          (data.language && model.getLanguageId() !== data.language)
+        ) {
+          // If the URI or language is changing, dispose the old model
+          model.dispose();
+          let language = data.language ?? undefined;
+          let uri = data.uri ? monaco.Uri.parse(data.uri) : undefined;
+
+          const new_model = monaco.editor.createModel(data.data, language, uri);
+          editor.setModel(new_model);
+          sendToPython("_current_uri", new_model.uri.toString());
+          break;
+        }
+        // If no new language or uri is specified, just update the text
+        model.pushEditOperations(
+          [],
+          [
+            {
+              range: model.getFullModelRange(),
+              text: data.data,
+            },
+          ],
+          () => null,
+        );
+        break;
+      } else {
+        // If no model exists, create a new one
+        let language = data.language ?? undefined;
+        let uri = data.uri ? monaco.Uri.parse(data.uri) : undefined;
+
+        const new_model = monaco.editor.createModel(data.data, language, uri);
+        editor.setModel(new_model);
+        sendToPython("_current_uri", new_model.uri.toString());
+        break;
+      }
+    }
+
+    case "open_diffs":
+      switchToDiffEditor(data);
+      break;
+
+    case "read":
+      // Readout the current value from the editor
+      const currentValue = editor.getValue();
+      sendToPython("_current_text", currentValue); // Send back the current value
+      break;
+
+    case "update_editor_options":
+      // Update editor options
+      diffEditor?.updateOptions(data);
+      editor.updateOptions(data);
+      break;
+
+    case "set_cursor": {
+      // Set the cursor position in the editor
+      const position = data; // Assuming data is an object with line and column properties
+      const model = editor.getModel();
+      if (model) {
+        const lineNumber = position.line || 1; // Default to line 1 if not provided
+        const column = position.column || 1; // Default to column 1 if not provided
+        const moveToPosition = position.moveToPosition || ""; // Optional moveToPosition flag
+        const newPosition = new monaco.Position(lineNumber, column);
+        const newSelection = new monaco.Selection(lineNumber, column, lineNumber, column);
+        editor.setPosition(newPosition);
+        editor.setSelection(newSelection);
+        if (typeof moveToPosition === "string" && moveToPosition) {
+          // If moveToPosition is provided, we move the cursor to that location
+          if (moveToPosition === "center") {
+            editor.revealPositionInCenter(newPosition);
+          } else if (moveToPosition === "top") {
+            editor.revealPositionNearTop(newPosition, monaco.editor.ScrollType.Smooth);
+          } else {
+            editor.revealPosition(newPosition); // Ensure the cursor is visible
+          }
+        }
+        sendToPython("_current_cursor", { line: lineNumber, column: column }); // Send back the new cursor position
+      }
+      break;
+    }
+    case "highlight_lines":
+      // Highlight a range of lines in the editor
+      const highlight = data; // Expecting data with start and end line numbers
+      const highlightRange = new monaco.Range(highlight.start, 1, highlight.end, 1);
+      if (decorationsCollection) {
+        decorationsCollection.clear(); // Clear previous decorations if any
+      } else {
+        decorationsCollection = editor.createDecorationsCollection(); // Create a new collection if it doesn't exist
+      }
+      const highlightDecoration = {
+        range: highlightRange,
+        options: {
+          isWholeLine: true,
+          linesDecorationsClassName: "highlighted-line",
+        },
+      };
+      decorationsCollection.set([highlightDecoration]);
+      break;
+    case "remove_highlight":
+      // Remove the highlight from the editor
+      if (decorationsCollection) {
+        decorationsCollection.clear(); // Clear all decorations
+      }
+      break;
+    case "delete_line": {
+      // Delete a specific line in the editor
+      const model = editor.getModel();
+      if (!model) break;
+      let lineToDelete: number | null = null;
+      if (typeof data === "number") {
+        lineToDelete = data; // If data is a number, use it directly
+      } else if (data === "current") {
+        const position = editor.getPosition();
+        if (position) {
+          lineToDelete = position.lineNumber; // Use the current line number
+        }
+      } else {
+        console.warn("Invalid data for delete_line, expected a line number or 'current'");
+        break;
+      }
+      if (lineToDelete !== null) {
+        const lineRange = model.getLineContent(lineToDelete);
+        const range = new monaco.Range(lineToDelete, 1, lineToDelete, lineRange.length + 1);
+        const editOperation = { range: range, text: "" }; // Replace with empty string to delete
+        model.pushEditOperations([], [editOperation], () => null); // Apply the edit operation
+      }
+      break;
+    }
+    case "insert": {
+      // Insert text at the specified position
+      const model = editor.getModel();
+      if (!model) break;
+      let position = null;
+      if (data.line !== null) {
+        position = new monaco.Position(data.line, data.column || 1);
+      } else {
+        position = editor.getPosition(); // Use current cursor position if no line is specified
+      }
+
+      if (position) {
+        const insertText = data.text || ""; // Default to empty string if no text provided
+        const editOperation = {
+          range: new monaco.Range(position.lineNumber, position.column, position.lineNumber, position.column),
+          text: insertText,
+        };
+        model.pushEditOperations([], [editOperation], () => null); // Apply the edit operation
+      }
+      break;
+    }
+    case "readonly":
+      // Set the editor to read-only mode
+      const isReadOnly = data === true;
+      diffEditor?.updateOptions({ readOnly: isReadOnly });
+      editor.updateOptions({ readOnly: isReadOnly });
+      break;
+    case "language": {
+      const diffModel = diffEditor?.getModel();
+      if (diffModel) {
+        monaco.editor.setModelLanguage(diffModel.original, data);
+        monaco.editor.setModelLanguage(diffModel.modified, data);
+      } else {
+        const model = editor.getModel();
+        if (model) {
+          monaco.editor.setModelLanguage(model, data);
+        }
+      }
+      break;
+    }
+    case "add_action":
+      // Add a new action to the editor
+      let action = data;
+      if (action && typeof action === "object") {
+        action.contextMenuGroupId = "navigation";
+        action.contextMenuOrder = 1.5;
+        action.run = () => {
+          sendToPython(`_context_menu_action`, {
+            id: action.id,
+            label: action.label,
+          });
+        };
+        editor.addAction(action);
+      }
+      break;
+    case "theme":
+      // Set the theme - Monaco will use a fallback if the theme doesn't exist
+      try {
+        monaco.editor.setTheme(data);
+        console.log(`Applied theme: ${data}`);
+        sendToPython("_theme", data); // Send back the theme name
+      } catch (error) {
+        console.warn(`Failed to apply theme "${data}":`, error);
+        // Fallback to default theme
+        monaco.editor.setTheme("vs-dark");
+        sendToPython("_theme", "vs-dark");
+      }
+      break;
+    case "lsp_url":
+      // Destroy existing LSP client if it exists
+      if (lspClient) {
+        lspClient.destroy();
+        lspClient = null;
+      }
+      // Update LSP client with new URL
+      if (data && typeof data === "string") {
+        const pylspUrl = data;
+        console.log(`Setting up LSP client with URL: ${pylspUrl}`);
+        lspClient = new LspClient(pylspUrl);
+        lspClient.prependedData = lspHeader || ""; // Set the LSP header if available
+
+        // Set up the signature help callback
+        lspClient.onSignatureHelp = (signatureHelp) => {
+          // Send the signature help data to Python
+          sendToPython("_signature_help", signatureHelp);
+        };
+      }
+      break;
+    case "set_lsp_header":
+      // Set the LSP header for the client
+      lspHeader = data; // Store the header for later use
+      if (lspClient) {
+        lspClient.prependedData = data;
+
+        // Make sure the signature help callback is still set
+        if (!lspClient.onSignatureHelp) {
+          lspClient.onSignatureHelp = (signatureHelp) => {
+            sendToPython("_signature_help", signatureHelp);
+          };
+        }
+      }
+      break;
+    case "get_lsp_header":
+      // Get the current LSP header
+      const headerData = lspClient ? lspClient.prependedData : "";
+      sendToPython("_lsp_header", headerData);
+      break;
+    case "vim_mode":
+      // Enable or disable Vim mode
+      if (data === true) {
+        if (!qtmonaco.vimMode) {
+          var statusNode = document.getElementById("status");
+          qtmonaco.vimMode = initVimMode(editor, statusNode);
+          console.log("Vim mode enabled");
+        }
+      } else {
+        if (qtmonaco.vimMode) {
+          qtmonaco.vimMode.dispose(); // Dispose Vim mode if it exists
+          qtmonaco.vimMode = null;
+          console.log("Vim mode disabled");
+        }
+      }
+      break;
+    case "update_workspace_config":
+      // Update workspace configuration
+      if (!lspClient) {
+        console.log(lspClient);
+        console.warn("LSP client not initialized, cannot update workspace config");
+        sendToPython("_workspace_config_updated", { success: false, error: "LSP client not initialized" });
+        break;
+      }
+      if (!data || typeof data !== "object") {
+        console.warn("Invalid data provided for workspace config update");
+        sendToPython("_workspace_config_updated", { success: false, error: "Invalid data provided" });
+        break;
+      }
+
+      lspClient.settings = data; // Store settings in the LSP client
+
+      break;
+  }
+}
