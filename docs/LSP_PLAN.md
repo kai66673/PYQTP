@@ -253,6 +253,86 @@ basedpyright декодируется по легенде сервера, ест
 из одного basedpyright через `registry_json` фабрики `editor_pair`).
 `ruff (13) → pyright (18) → pytest -m '' (23/23)` зелёные; `js_build` пересобран.
 
+## Этап 6 — междокументный переход к определению
+
+В standalone-редакторе Monaco навигация на ресурс вне текущей модели без
+зарегистрированного opener'а не делает ничего («default behavior is to do
+nothing» — `registerEditorOpener` в `standaloneEditor.js`), поэтому этап 4
+работал только внутри документа.
+
+Механика:
+
+- `monaco.editor.registerEditorOpener` (JS, `main.ts`): для той же модели —
+  `false` (локальный переход остаётся за Monaco, поведение этапа 4 без
+  изменений); для чужого ресурса шлёт в Python `_open_uri_request`
+  `{uri, range}` (range — IRange/IPosition из `selectionOrPosition`,
+  monaco-нумерация 1-based) и возвращает `true`;
+- `QtMonacoEditorWidget._open_uri_request` — обработчик моста (вендоренный
+  python `monaco.py` не тронут: `on_new_data_received` диспатчит по `hasattr`,
+  находится метод подкласса) → сигнал `open_uri_requested = Signal(dict)`;
+- `MonacoDocumentView` коннектит сигнал на `DocumentManager.open_definition_uri`:
+  file-scheme/существование файла, `open_document(path)` — общая часть с
+  «Открыть файл» (activate уже открытого / регистрация новой central-вьюхи), затем
+  `edit_widget.set_cursor(line, col, move_to_position='center')` — для ещё не
+  инициализированного редактора каретка буферизуется коннектором и встанет
+  после загрузки модели (сообщения моста обрабатываются JS последовательно).
+
+**Статус: выполнено.** Тест `test_cross_document_definition_open_request`
+(webengine): F12 на импортированном `finx` → basedpyright Location в
+`helper.py` (тот же каталог = корень workspace по fallback-правилу) →
+`open_uri_requested` с uri helper и range (1, 5). Фабрика `editor_pair`
+дополнилась `extra_files`. `js_build` пересобран. Живой IDE: переход открывает
+и активирует вкладку целевого файла, каретка на определении.
+
+### Доработки по итогам живой проверки (этап 6.1)
+
+1. **Активация вкладки.** `ensure_visible_requested` central-вьюхи ранее никуда
+   не подключался (сигнал уходил в никуда). В `view_central_register` теперь
+   коннектится обработчик: `dock.open()` (если док закрыт) + `dock.setAsCurrentTab()`
+   — в KDD переключение вкладки делает только `setAsCurrentTab`
+   (`QWidget.raise_` вкладки не переключает) + перенос Qt-фокуса в вьюху:
+   без него при программной смене вкладки клавиатура оставалась на исходном
+   документе (JS `editor.focus()` фокусирует страницу только внутри своего
+   webview, а Qt-фокус он не передаёт). Фокус цельный — `_focus_central_view`:
+   Qt молча игнорирует `setFocus()` на NoFocus-контейнерах (типовые вьюхи —
+   именно такие, фокус держит дочерний редактор), поэтому целью берётся первый
+   фокусируемый потомок (проверено xcb-пробой на живом X: real KDD-вкладки +
+   NoFocus-контейнер с фокусируемым потомком — фокус уходит за целевой вкладкой
+   в обе стороны).
+2. **JS-обработка `set_cursor` (vendored-patch `main.ts`).** У неактивной
+   вкладки/свежего дока редактор не разложен (нулевой viewport), `reveal*` в
+   нём «схлопывается». Добавлен `pendingCursor`: если `getLayoutInfo()` нулевой,
+   reveal откладывается до первого `onDidLayoutChange` с реальным размером;
+   при `set_text`/смене редактора pending сбрасывается; после reveal и сразу в
+   `set_cursor` ставится `editor.focus()` — каретка активированного документа
+   видна.
+3. **Корректное закрытие документа.** Семантика python-сборки PyKDDockWidgets
+   (PYTHON_BINDINGS, проверено пробами на v2.5.0): `kdd.DockWidget` — обычный
+   QWidget, core KDD «не видит» Qt-закрытие (`close()`/QCloseEvent лишь скрывают
+   виджет, core-состояние и вкладка остаются); закрывается только
+   `forceClose()`, который сам QCloseEvent не генерирует; в биндингах нет
+   `closeRequested`/`closed`/`closeDockWidget` (существующие коннекты
+   `dock.closeRequested` в kdd_views_manager — мёртвый код). Поэтому:
+   - `view_central_register` при `close_cb` ставит доку `DockWidgetOption_DeleteOnClose`
+     и вешает на него `_CentralDockCloseFilter`: QCloseEvent (крестик вкладки)
+     отменяется (`ignore` + фильтр съедает событие), а `close_cb` вызывается
+     через `QTimer.singleShot(0, ...)` (диалог сохранения вне обработки Close);
+     close_cb закрывает док через `forceClose()` — рекурсии нет;
+     `DeleteOnClose` уничтожает и док, и гостя (webview → ws-соединение Monaco
+     закрывается само); `isOpenChanged(False)` вычёркивает док из `documents_dock`;
+   - `DocumentManager._handle_doc_view_close_requested` вместо несуществующего
+     у bare-доков `closeDockWidget()` зовёт `forceClose()`
+     (`getattr(dock, 'closeDockWidget', None) or getattr(dock, 'forceClose')`)
+     и защищён от повторного вызова (`.get` + ранний return).
+   - «Уведомление JS о закрытии» не нужно: webview уничтожается вместе с доком,
+     а LSP-серверам hub и так синтезирует `didClose` в `_detach` при разрыве
+     ws-подключения.
+
+`ruff (12 — стало на 1 меньше базлайна, close_cb начал использоваться) →
+pyright (18) → pytest -m '' (24/24)` зелёные; механика закрытия проверена
+оффскрин-пробой с боевым `_CentralDockCloseFilter` (закрытый док и гость
+уничтожены, при «Отмене» в диалоге док остаётся открытым).
+
 ## Сквозная проверка каждого этапа
 
 `uv run ruff check --no-fix <изменённое>` (baseline 13) →

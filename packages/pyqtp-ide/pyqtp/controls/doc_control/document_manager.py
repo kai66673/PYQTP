@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 from typing import TYPE_CHECKING
+from urllib.parse import unquote, urlparse
 
 from PySide6.QtCore import Signal
 from PySide6.QtGui import QIcon, QKeySequence, Qt
@@ -120,25 +121,65 @@ class DocumentManager(BaseControl):
         # Открываем файл
         if identity:
             self._last_open_dir = Path(identity).parent
-            doc_view = self._opened_docs.get(identity)
-            if doc_view is not None:
-                doc_view.ensure_visible()
-                return
+            self.open_document(identity)
 
-            new_view = _document_view_cls_from_identity(identity)(
-                self._main_wnd, key=identity
+    def open_document(self, identity: str | Path) -> BaseDocumentView:
+        """Открывает документ (или активирует уже открытый); путь — ключ вьюхи."""
+        identity = str(Path(identity))
+        doc_view = self._opened_docs.get(identity)
+        if doc_view is not None:
+            doc_view.ensure_visible()
+            return doc_view
+
+        new_view = _document_view_cls_from_identity(identity)(
+            self._main_wnd, key=identity
+        )
+        self._main_wnd.view_central_register(
+            new_view, close_cb=self._handle_doc_view_close_requested
+        )
+        self._opened_docs[identity] = new_view
+        new_view.ensure_visible()
+        self.document_opened.emit(new_view)
+        return new_view
+
+    def open_definition_uri(self, payload: dict) -> None:
+        """Этап 6: LSP-навигация «переход к определению» в другой файл.
+
+        Ответ редактора (``QtMonacoEditorWidget.open_uri_requested``):
+        ``{'uri': 'file:///...', 'range': {'startLineNumber': ...,
+        'startColumn': ...} | None}`` — нумерация Monaco (1-based).
+        Открывает (или активирует) документ и ставит каретку на определение.
+        """
+        uri = str(payload.get('uri') or '')
+        parsed = urlparse(uri)
+        if parsed.scheme != 'file' or not parsed.path:
+            med_log.warning('Пропущен переход по не-файловому uri: %s', uri)
+            return
+        path = Path(unquote(parsed.path))
+        if not path.is_file():
+            med_log.warning('Пропущен переход к несуществующему файлу: %s', path)
+            return
+
+        view = self.open_document(path)
+        line = (payload.get('range') or {}).get('startLineNumber')
+        if not isinstance(line, int):
+            return
+        column = (payload.get('range') or {}).get('startColumn')
+        edit_widget = getattr(view, 'edit_widget', None)
+        if edit_widget is not None:
+            # set_cursor буферизуется коннектором до инициализации моста JS —
+            # для только что открытого документа каретка встанет после загрузки
+            edit_widget.set_cursor(
+                line, column if isinstance(column, int) else 1,
+                move_to_position='center',
             )
-            self._main_wnd.view_central_register(
-                new_view, close_cb=self._handle_doc_view_close_requested
-            )
-            self._opened_docs[identity] = new_view
-            new_view.ensure_visible()
-            self.document_opened.emit(new_view)
 
     def _handle_doc_view_close_requested(
         self, dock: BaseDockWidget, view_key: str
     ):
-        view = self._opened_docs[view_key]
+        view = self._opened_docs.get(view_key)
+        if view is None:  # уже закрыт (например, повторный клик по крестику)
+            return
         if view.document().is_modified():
             message_box = QMessageBox(parent=self._main_wnd)
             message_box.setText(
@@ -174,6 +215,13 @@ class DocumentManager(BaseControl):
             elif result != QMessageBox.StandardButton.Discard:
                 return
 
-        dock.closeDockWidget()
+        # central-доки KDD — «голые» kdd.DockWidget: у них в python-биндингах
+        # нет ads-совместимого closeDockWidget, есть только forceClose
+        # (закрывает core-состояние дока без повторного QCloseEvent —
+        # рекурсии в фильтр закрытия из view_central_register не будет)
+        # getattr, а не прямой вызов: у «голых» kdd.DockWidget метода
+        # closeDockWidget нет (ruff B009 / pyright об Protocol)
+        close_dock = getattr(dock, 'closeDockWidget', None) or getattr(dock, 'forceClose')  # noqa: B009
+        close_dock()
         self.document_closed.emit(view)
         del self._opened_docs[view_key]

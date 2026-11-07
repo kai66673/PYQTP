@@ -46,6 +46,54 @@ let lspHeader: string | null = null;
 
 let decorationsCollection: monaco.editor.IEditorDecorationsCollection | null = null;
 
+// vendored-patch (PYQTP, этап 6): reveal из set_cursor не работает, пока
+// редактор не разложен (неактивная вкладка или свежий док — нулевой
+// viewport): откладываем reveal до первого onDidLayoutChange с реальным
+// размером и отдаём редактору фокус
+let pendingCursor: { position: monaco.Position; moveTo: string } | null = null;
+let pendingCursorDisposable: monaco.IDisposable | null = null;
+
+function clearPendingCursor() {
+  pendingCursor = null;
+  if (pendingCursorDisposable) {
+    pendingCursorDisposable.dispose();
+    pendingCursorDisposable = null;
+  }
+}
+
+function revealWithMoveTo(
+  ed: monaco.editor.IStandaloneCodeEditor,
+  position: monaco.Position,
+  moveToPosition: string,
+) {
+  // If moveToPosition is provided, we move the cursor to that location
+  if (moveToPosition === "center") {
+    ed.revealPositionInCenter(position);
+  } else if (moveToPosition === "top") {
+    ed.revealPositionNearTop(position, monaco.editor.ScrollType.Smooth);
+  } else {
+    ed.revealPosition(position); // Ensure the cursor is visible
+  }
+}
+
+function scheduleRevealWhenLaidOut(
+  ed: monaco.editor.IStandaloneCodeEditor,
+  position: monaco.Position,
+  moveToPosition: string,
+) {
+  clearPendingCursor();
+  pendingCursor = { position, moveTo: moveToPosition };
+  pendingCursorDisposable = ed.onDidLayoutChange(() => {
+    const info = ed.getLayoutInfo();
+    if (pendingCursor && info.width > 0 && info.height > 0) {
+      const { position: pendingPos, moveTo } = pendingCursor;
+      clearPendingCursor();
+      revealWithMoveTo(ed, pendingPos, moveTo);
+      ed.focus();
+    }
+  });
+}
+
 function disposeContentChangeListener() {
   if (contentChangeDisposable) {
     contentChangeDisposable.dispose();
@@ -81,6 +129,7 @@ function disposeDiffEditor() {
 
 function setActiveEditor(newEditor: monaco.editor.IStandaloneCodeEditor) {
   disposeContentChangeListener();
+  clearPendingCursor(); // vendored-patch (этап 6): pending reveal старого редактора не нужен
   decorationsCollection = null;
   editor = newEditor;
   qtmonaco.editor = editor;
@@ -181,6 +230,40 @@ function sendToPython(name: string, value: any) {
   }
 }
 
+// vendored-patch (этап 6): «переход к определению» (и другие Monaco-навигационные
+// действия: ссылки, go to symbol, ctrl+click по импорту) на ресурс, отличный от
+// текущей модели, без зарегистрированного opener'а в standalone не работает вовсе
+// («default behavior is to do nothing» — monaco standaloneEditor.js). Открывать
+// чужие файлы умеет только IDE-слой на python: при навигации на другой ресурс
+// сообщаем ему uri и диапазон (monaco-нумерация, 1-based; selectionOrPosition
+// приходит либо IRange, либо IPosition) и считаем запрос обработанным. Для той
+// же модели возвращаем false — локальный переход остаётся за Monaco (этап 4).
+// См. QtMonacoEditorWidget.open_uri_requested / DocumentManager.open_definition_uri.
+monaco.editor.registerEditorOpener({
+  openCodeEditor(source, resource, selectionOrPosition) {
+    const model = source.getModel();
+    if (model && model.uri.toString() === resource.toString()) {
+      return false;
+    }
+    if (!bridge) {
+      return false;
+    }
+    let range: monaco.IRange | null = null;
+    if (selectionOrPosition && "startLineNumber" in selectionOrPosition) {
+      range = selectionOrPosition;
+    } else if (selectionOrPosition && "lineNumber" in selectionOrPosition) {
+      range = {
+        startLineNumber: selectionOrPosition.lineNumber,
+        startColumn: selectionOrPosition.column ?? 1,
+        endLineNumber: selectionOrPosition.lineNumber,
+        endColumn: selectionOrPosition.column ?? 1,
+      };
+    }
+    sendToPython("_open_uri_request", { uri: resource.toString(), range });
+    return true;
+  },
+});
+
 // vendored-patch (этап 3.1): общий поднятие стека LSP-клиентов из записей
 // (lsp_stack от хаба IDE или одиночный lsp_url ради обратной совместимости)
 function setupLspStack(entries: LspStackEntry[]) {
@@ -205,6 +288,7 @@ function updateFromPython(name: string, value: string) {
   console.log(`Received update from Python: ${name} =`, data);
   switch (name) {
     case "set_text": {
+      clearPendingCursor(); // vendored-patch (этап 6): старый pending reveal неактуален
       switchToStandaloneEditor();
       const model = editor.getModel();
       if (model) {
@@ -279,15 +363,17 @@ function updateFromPython(name: string, value: string) {
         editor.setPosition(newPosition);
         editor.setSelection(newSelection);
         if (typeof moveToPosition === "string" && moveToPosition) {
-          // If moveToPosition is provided, we move the cursor to that location
-          if (moveToPosition === "center") {
-            editor.revealPositionInCenter(newPosition);
-          } else if (moveToPosition === "top") {
-            editor.revealPositionNearTop(newPosition, monaco.editor.ScrollType.Smooth);
+          // vendored-patch (PYQTP, этап 6): у неактивной вкладки/свежего дока
+          // редактор может быть не разложен (нулевой viewport) — reveal
+          // «схлопнется», откладываем его до первой реальной раскладки
+          const layout = editor.getLayoutInfo();
+          if (layout.width > 0 && layout.height > 0) {
+            revealWithMoveTo(editor, newPosition, moveToPosition);
           } else {
-            editor.revealPosition(newPosition); // Ensure the cursor is visible
+            scheduleRevealWhenLaidOut(editor, newPosition, moveToPosition);
           }
         }
+        editor.focus(); // vendored-patch (этап 6): каретка активированного документа должна быть видна
         sendToPython("_current_cursor", { line: lineNumber, column: column }); // Send back the new cursor position
       }
       break;

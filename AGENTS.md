@@ -48,8 +48,8 @@ Verify in this order: **ruff → pyright → tests → run the app**.
   `[tool.pytest.ini_options]` is in the **root** pyproject; tests live in
   `packages/pyqtp-core/tests/` (settings window) and `packages/pyqtp-ide/tests/`
   (LSP registry + live editor). Markers `live` (real LSP server processes) and `webengine`
-  (real QWebEngineView/Monaco) are deselected by default via `addopts` → 17 passed / 6 deselected;
-  run them with `uv run pytest -m 'live or webengine'` (~30 s, they work offscreen) or all 23 in one
+  (real QWebEngineView/Monaco) are deselected by default via `addopts` → 17 passed / 7 deselected;
+  run them with `uv run pytest -m 'live or webengine'` (~30 s, they work offscreen) or all 24 in one
   process with `uv run pytest -m ''`. Test-suite gotchas:
   - root `conftest.py` sets `QT_QPA_PLATFORM=offscreen` + `QTWEBENGINE_DISABLE_SANDBOX=1` at import
     and overrides `qapp` as a **session-scoped** fixture (pytest-qt's DESTROY_ON_POLICY would kill
@@ -101,6 +101,23 @@ Verify in this order: **ruff → pyright → tests → run the app**.
   (`PySide6QtAds` is not a dependency and not installed). `pyqtp-core/pyqtp/base/docking_system/ads/`
   is dead code slated for deletion — it still imports the pre-rename `bcad.*`; don't repair it or
   add the missing dependency.
+  KDD python-bindings close semantics (probed on v2.5.0): bare `kdd.DockWidget` has
+  no `closeRequested`/`closed`/`closeDockWidget` signal or method (the existing
+  `dock.closeRequested.connect` sites in kdd_views_manager are dead code that would
+  AttributeError if exercised); Qt-level close (close()/QCloseEvent) is invisible to the
+  KDD core — it only hides the widget, the dock stays "open"; only forceClose() actually
+  closes (it emits no QCloseEvent, so no re-entrancy). Central documents
+  (view_central_register, used by the IDE DocumentManager) rely on DeleteOnClose +
+  `_CentralDockCloseFilter`: eat the tab-X QCloseEvent (ignore + return True), dispatch
+  close_cb via QTimer.singleShot(0,...) which then calls forceClose(); keep the filter
+  referenced — it hangs off the dock as `_pyqtp_close_filter`. isOpenChanged(False)
+  purges documents_dock; ensure_visible_requested is wired to dock.open() +
+  setAsCurrentTab() (QWidget.raise_ does NOT switch tabs) + `_focus_central_view`
+  (Qt focus must follow the tab or the keyboard stays on the source document
+  after an LSP jump; Qt ignores setFocus() on NoFocus containers — typical
+  views are exactly such, the child editor holds the focus — so the helper
+  focuses the first focusable descendant; JS editor.focus() alone only
+  focuses inside its own webview and does NOT move Qt-level focus).
 - Панель журнала событий показывает только логгеры, зарегистрированные через
   `EventsControl.events_log_register(name=, group=)` (единственное место, где к логгеру
   добавляется `QLoggingHandler`). Каждый контрол регистрирует свой сам в `setup_relations()`
@@ -201,6 +218,16 @@ Verify in this order: **ruff → pyright → tests → run the app**.
   snippets are gated `priority==0 && languageId=='python'`. Monaco markers expose the
   model uri as `resource` (not `uri`)
   when querying `getModelMarkers` from Python, and marker `owner` is the server name.
+ - Cross-document navigation (stage 6, `docs/LSP_PLAN.md`): go-to-definition/references
+   into **other files** arrives as JS bridge message `_open_uri_request` →
+   `QtMonacoEditorWidget.open_uri_requested` signal (handled via the bridge's
+   `hasattr` dispatch — vendored `monaco.py` untouched) → `MonacoDocumentView` connects it
+   to `DocumentManager.open_definition_uri` (validates file scheme/existence, `open_document`
+   opens-or-activates the tab, `set_cursor(..., move_to_position='center')` places the caret —
+   buffered by the Connector until the new editor's bridge initializes). Stage 6.1
+   follow-ups: tab activation works via `view_central_register` wiring (see the Docking
+   note above); reveal/focus for not-yet-laid-out editors is handled by the
+   `pendingCursor` patch in `main.ts` (vendored).
 - Legacy editor stack (stdio `lsp_control/`, `EditorBridge` in `web/monaco_editor_widget.py`,
   `web/editor/` with `editor.html` + `min/`, the `iide://` scheme handler and its registration in
   `ide.py`) **was deleted**. The new `controls/lsp_control/` (stage 2 of `docs/LSP_PLAN.md`) is a
@@ -232,6 +259,15 @@ Verify in this order: **ruff → pyright → tests → run the app**.
   prepended data) + `extractSemanticLegend`/draft-3.16 hybrid capabilities in `lsp.ts`,
   and `"semanticHighlighting.enabled": true` in `main.ts` defaultEditorOptions (built-in
   standalone themes have it off → the feature never starts otherwise);
+  cross-document navigation (stage 6): `registerEditorOpener` in `main.ts` —
+  same-model returns `false` (local jumps stay Monaco's), foreign resources send
+  `_open_uri_request {uri, range}` to Python and return `true` (without an opener
+  standalone Monaco silently does nothing for foreign resources);
+  stage 6.1 `set_cursor` hardening in `main.ts` —
+  `pendingCursor`/`scheduleRevealWhenLaidOut`: when `getLayoutInfo()` is zero (hidden
+  tab / fresh dock), reveal is deferred to the first `onDidLayoutChange` with a real
+  viewport; pending is cleared by `set_text`/`setActiveEditor`; `editor.focus()` on
+  every set_cursor (caret of the activated document must be visible);
   python patch in `monaco.py` —
   `Monaco.__init__` takes an `lsp_host` param and no longer eagerly spawns
   `get_pylsp_host()` (lazy `_resolve_lsp_host()` fallback keeps standalone

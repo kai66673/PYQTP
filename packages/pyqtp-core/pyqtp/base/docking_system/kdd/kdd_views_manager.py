@@ -4,8 +4,8 @@ from functools import partial
 from typing import TYPE_CHECKING, Literal
 
 import PyKDDockWidgets.KDDockWidgets as kdd  # type: ignore[reportMissingImports] # noqa: N813
-from PySide6.QtCore import QByteArray, QSettings
-from PySide6.QtWidgets import QLabel
+from PySide6.QtCore import QByteArray, QEvent, QObject, QSettings, Qt, QTimer
+from PySide6.QtWidgets import QLabel, QWidget
 
 from pyqtp.base.docking_system.base_views_manager import (
     BaseViewsGroup,
@@ -19,6 +19,25 @@ if TYPE_CHECKING:
     from pyqtp.base.docking_system.base_group_widget import BaseGroupWidget
     from pyqtp.base.pluggable_main_window import PluggableMainWindow
     from pyqtp.theme.theme import Theme
+
+
+def _focus_central_view(view: QWidget) -> None:
+    """Переносит Qt-фокус в вьюху центрального дока (этап 6.1).
+
+    Qt молча игнорирует setFocus() на виджетах с политикой NoFocus, а
+    типовые вьюхи — как раз NoFocus-контейнеры, в которых фокус держит
+    дочерний редактор. Поэтому целью берём первого фокусируемого
+    потомка (в порядке обхода дерева), а если таких нет — саму вьюху.
+    """
+    target = next(
+        (
+            child
+            for child in (view, *view.findChildren(QWidget))
+            if child.focusPolicy() != Qt.FocusPolicy.NoFocus
+        ),
+        view,
+    )
+    target.setFocus()
 
 
 class KddViewsGroup(BaseViewsGroup):
@@ -200,6 +219,34 @@ class KddViewsGroup(BaseViewsGroup):
         # Сохраняем состояния вьюшек
         for dock in self._docks.values():
             dock.widget().state_write()
+
+
+class _CentralDockCloseFilter(QObject):
+    """Перехватчик QCloseEvent у central-доков (документов).
+
+    В python-сборке PyKDDockWidgets (PYTHON_BINDINGS) ``kdd.DockWidget`` —
+    обычный QWidget: core KDD «не видит» Qt-закрытие (close()/QCloseEvent
+    лишь скрывают виджет, core-состояние дока остаётся открытым), корректно
+    закрывается только ``forceClose()`` — см. такой же closeEvent-паттерн в
+    kdd_dock_widget.KddDockWidget. Поэтому QCloseEvent (крестик вкладки)
+    отменяется, а решение отдаётся ``close_cb`` (диалог сохранения в
+    DocumentManager) вне обработки события; close_cb сам вызовет
+    ``dock.forceClose()`` — он QCloseEvent не генерирует, рекурсии в фильтр
+    не будет.
+    """
+
+    def __init__(self, dock, view_key: str, close_cb):
+        super().__init__()
+        self._dock = dock
+        self._view_key = view_key
+        self._close_cb = close_cb
+
+    def eventFilter(self, watched, event) -> bool:  # noqa: N802
+        if watched is self._dock and event.type() == QEvent.Type.Close:
+            event.ignore()
+            QTimer.singleShot(0, lambda: self._close_cb(self._dock, self._view_key))
+            return True
+        return False
 
 
 class ViewsManagerKDD(BaseViewsManager):
@@ -502,6 +549,39 @@ class ViewsManagerKDD(BaseViewsManager):
         dock.setWidget(view)
         self.central_dock_manager.addKDockWidget(dock, kdd.Location.Location_OnLeft)
         self.documents_dock[view.key] = dock
+
+        # Активация вкладки: в KDD переключение вкладки делает только
+        # setAsCurrentTab (QWidget.raise_ вкладки не переключает); open()
+        # на всякий случай возвращает в core-состояние уже закрытый док.
+        # Фокус обязателен: при программной смене вкладки Qt-фокус
+        # остаётся на старом вебвью (клавиатура ушла бы в исходный
+        # документ), а JS editor.focus() фокусует страницу лишь внутри
+        # своего webview
+        def _ensure_visible() -> None:
+            if not dock.isOpen():
+                dock.open()
+            dock.setAsCurrentTab()
+            _focus_central_view(view)
+
+        view.ensure_visible_requested.connect(_ensure_visible)
+
+        # Закрытый док вычёркиваем из реестра (forceClose/DeleteOnClose
+        # уничтожают и док, и гостя — повторное открытие создаст новый)
+        def _on_open_changed(is_open) -> None:
+            if not is_open and self.documents_dock.get(view.key) is dock:
+                self.documents_dock.pop(view.key)
+
+        dock.isOpenChanged.connect(_on_open_changed)
+
+        if close_cb is not None:
+            # Крестик вкладки документирован в _CentralDockCloseFilter:
+            # QCloseEvent отменяется, решение принимает close_cb
+            # (диалог сохранения), а закрывает док он сам через forceClose.
+            dock.setOptions(kdd.DockWidgetOption.DockWidgetOption_DeleteOnClose)
+            close_filter = _CentralDockCloseFilter(dock, view.key, close_cb)
+            dock.installEventFilter(close_filter)
+            # фильтр живёт столько же, сколько док
+            dock._pyqtp_close_filter = close_filter  # type: ignore[attr-defined]
         return dock
 
     @staticmethod

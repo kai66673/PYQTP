@@ -16,9 +16,11 @@ def editor_pair(
 ) -> Iterator[Callable[..., tuple[LspHub, QtMonacoEditorWidget]]]:
     """Фабрика пары ``(hub, editor)``: файл + редактор QtMonaco поверх живого хаба.
 
-    ``make(file_text, suffix='.py', registry_json=None) -> (hub, widget)``;
+    ``make(file_text, suffix='.py', registry_json=None, extra_files=None)``;
     ``registry_json`` — опциональная замена реестра хаба (до старта ws-сервера),
-    например чтобы оставить в стеке один сервер. Очистка (закрытие редактора и
+    например чтобы оставить в стеке один сервер; ``extra_files`` —
+    ``{имя: текст}`` — дополнительные файлы того же «проекта», записанные до
+    старта хаба (междокументные переходы). Очистка (закрытие редактора и
     shutdown хаба) — в финализаторе. Каждый редактор получает изолированный
     каталог-«проект», поэтому тесты не мешают друг другу процессами серверов
     (пул хаба ключуется ``(command, root_uri)``).
@@ -27,9 +29,12 @@ def editor_pair(
 
     def make(
         file_text: str, suffix: str = '.py', registry_json: str | None = None,
+        extra_files: dict[str, str] | None = None,
     ) -> tuple[LspHub, QtMonacoEditorWidget]:
         project = tmp_path / f'project{len(created)}'
         project.mkdir(parents=True, exist_ok=True)
+        for name, text in (extra_files or {}).items():
+            (project / name).write_text(text, encoding='utf-8')
         path = project / f'test_file{suffix}'
         path.write_text(file_text, encoding='utf-8')
         hub = LspHub()

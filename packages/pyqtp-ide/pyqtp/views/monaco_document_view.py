@@ -29,6 +29,11 @@ class MonacoDocumentView(TextDocumentView):
             lsp_host=self._main_wnd.lsp_hub.lsp_stack_for(file_path.as_uri()),
         )
         self.edit_widget.modification_changed.connect(self.set_modified)
+        # этап 6: LSP-навигация (F12/ctrl+click) в другой файл — менеджер
+        # открывает/активирует документ и ставит каретку на определение
+        self.edit_widget.open_uri_requested.connect(
+            self._main_wnd.doc_ctrl.open_definition_uri
+        )
 
         self._main_layout = QVBoxLayout(self)
         self._main_layout.setContentsMargins(0, 0, 0, 0)

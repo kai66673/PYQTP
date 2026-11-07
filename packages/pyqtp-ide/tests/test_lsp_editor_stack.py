@@ -438,3 +438,60 @@ def test_semantic_tokens_highlighting(editor_pair, qtbot) -> None:
     assert any(
         'basedpyright' in cmd for cmd in {key[0] for key in hub._instances}
     )
+
+
+# --- междокументный переход к определению (этап 6) ---
+
+HELPER_SRC = 'def finx():\n    return 1\n'
+CROSS_SRC = 'from helper import finx\n\nfinx()\n'
+
+# каретка на 'finx' в вызове (строка 3) -> revealDefinition: локация в helper.py
+JS_GOTO_CROSS = """
+(() => {
+  const ed = window.qtmonaco.editor;
+  ed.focus();
+  ed.setPosition({ lineNumber: 3, column: 1 });
+  ed.trigger('test', 'editor.action.revealDefinition', {});
+  return 'GOTO_TRIGGERED';
+})()
+"""
+
+
+def test_cross_document_definition_open_request(editor_pair, qtbot) -> None:
+    """F12 на импортированном символе: JS-opener -> open_uri_requested.
+
+    Цепочка: basedpyright отдаёт Location в helper.py -> Monaco зовёт opener
+    (ресурс вне текущей модели) -> `_open_uri_request` в Python -> сигнал
+    ``open_uri_requested``. Дальше документ открывает DocumentManager IDE —
+    здесь проверяется только сам запрос (uri + диапазон Monaco, 1-based).
+    """
+    hub, widget = editor_pair(
+        CROSS_SRC,
+        registry_json=BP_ONLY_REGISTRY,
+        extra_files={'helper.py': HELPER_SRC},
+    )
+    wait_editor_ready(qtbot, widget)
+
+    hits: list[dict] = []
+    widget.open_uri_requested.connect(hits.append)
+
+    def _goto_round() -> bool:
+        run_js(widget, JS_GOTO_CROSS)
+        qtbot.wait(2000)  # basedpyright lazily индексирует helper при запросе
+        return bool(hits)
+
+    wait_for(
+        qtbot,
+        _goto_round,
+        timeout=90.0,
+        poll=1.0,
+        message='JS так и не прислал open_uri_requested по F12 в другой файл',
+    )
+
+    helper_uri = (widget.file_path.parent / 'helper.py').as_uri()
+    payload = hits[-1]
+    assert payload.get('uri') == helper_uri, payload
+    rng = payload.get('range') or {}
+    # 'def finx():' — определение на строке 1, символ 'f' с колонки 5
+    assert rng.get('startLineNumber') == 1, payload
+    assert rng.get('startColumn') == 5, payload

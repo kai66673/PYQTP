@@ -34,6 +34,7 @@ class QtMonacoEditorWidget(Monaco):
     """
 
     modification_changed = Signal(bool)
+    open_uri_requested = Signal(dict)  # этап 6: Monaco-навигация на другой ресурс
 
     def __init__(
         self, file_path: Path, /, *, lsp_host: str | list[dict] | None = None
@@ -73,3 +74,16 @@ class QtMonacoEditorWidget(Monaco):
     def _handle_text_changed(self, value: str) -> None:
         modified = value != self._saved_text
         self.modification_changed.emit(modified)
+
+    def _open_uri_request(self, value: dict) -> None:
+        """Обработчик `_open_uri_request` из JS-стороны (этап 6).
+
+        Monaco вызывает opener при навигации на ресурс вне текущей модели
+        (переход к определению/ссылкам в другом файле); сам qtmonaco чужие
+        ресурсы не открывает — прокидываем запрос наверх через
+        ``open_uri_requested`` (см. ``DocumentManager.open_definition_uri``).
+        """
+        if not isinstance(value, dict) or not value.get('uri'):
+            med_log.warning('Monaco прислал запрос открытия без uri: %r', value)
+            return
+        self.open_uri_requested.emit(value)
