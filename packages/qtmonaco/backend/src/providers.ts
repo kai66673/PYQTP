@@ -18,38 +18,172 @@ export function adjustLineForPrependedData(position: monaco.Position, prependedD
 }
 
 /**
- * Helper to prepare document for LSP requests
+ * Helper to prepare document for LSP requests.
+ *
+ * vendored-patch: didOpen больше не отправляется отсюда — полную жизнь документа
+ * (didOpen/didChange/didClose) ведёт LspClient (см. lsp.ts). Функция оставлена
+ * как точка единого извлечения uri для запросов.
  */
 export function prepareDocument(
-  connection: MessageConnection,
+  _connection: MessageConnection,
   model: monaco.editor.ITextModel,
-  prependModelData: (model: monaco.editor.ITextModel) => string
+  _prependModelData: (model: monaco.editor.ITextModel) => string
 ) {
-  const uri = model.uri.toString();
+  return model.uri.toString();
+}
 
-  connection.sendNotification("textDocument/didOpen", {
-    textDocument: {
-      uri,
-      languageId: "python",
-      version: 1,
-      text: prependModelData(model),
-    },
-  });
+/**
+ * vendored-patch: конвертация LSP CompletionItem в формат Monaco.
+ *
+ * Раньше item раскрывался в Monaco «как есть» (`...item`). Пункты basedpyright
+ * (как и у многих LSP-серверов) не имеют `insertText`, а текст вставки лежит в
+ * `textEdit`; координаты — в формате LSP ({start:{line,character}}), а не
+ * Monaco IRange. При принятии пункта Monaco падал в trimOverwrite
+ * (`undefined.replaceAll`) и вставка не происходила вообще.
+ */
 
-  return uri;
+function undoAdjustLine(line: number, prependedData: string | null): number {
+  if (prependedData) {
+    return line - (prependedData.split("\n").length - 1);
+  }
+  return line;
+}
+
+function lspRangeToMonaco(r: any, prependedData: string | null): monaco.IRange {
+  return {
+    startLineNumber: undoAdjustLine(r.start.line, prependedData) + 1,
+    startColumn: r.start.character + 1,
+    endLineNumber: undoAdjustLine(r.end.line, prependedData) + 1,
+    endColumn: r.end.character + 1,
+  };
+}
+
+const LSP_KIND_TO_MONACO: Record<number, monaco.languages.CompletionItemKind> = {
+  1: monaco.languages.CompletionItemKind.Text,
+  2: monaco.languages.CompletionItemKind.Method,
+  3: monaco.languages.CompletionItemKind.Function,
+  4: monaco.languages.CompletionItemKind.Constructor,
+  5: monaco.languages.CompletionItemKind.Field,
+  6: monaco.languages.CompletionItemKind.Variable,
+  7: monaco.languages.CompletionItemKind.Class,
+  8: monaco.languages.CompletionItemKind.Interface,
+  9: monaco.languages.CompletionItemKind.Module,
+  10: monaco.languages.CompletionItemKind.Property,
+  11: monaco.languages.CompletionItemKind.Unit,
+  12: monaco.languages.CompletionItemKind.Value,
+  13: monaco.languages.CompletionItemKind.Enum,
+  14: monaco.languages.CompletionItemKind.Keyword,
+  15: monaco.languages.CompletionItemKind.Snippet,
+  16: monaco.languages.CompletionItemKind.Color,
+  17: monaco.languages.CompletionItemKind.File,
+  18: monaco.languages.CompletionItemKind.Reference,
+  19: monaco.languages.CompletionItemKind.Folder,
+  20: monaco.languages.CompletionItemKind.EnumMember,
+  21: monaco.languages.CompletionItemKind.Constant,
+  22: monaco.languages.CompletionItemKind.Struct,
+  23: monaco.languages.CompletionItemKind.Event,
+  24: monaco.languages.CompletionItemKind.Operator,
+  25: monaco.languages.CompletionItemKind.TypeParameter,
+};
+
+// documentation LSP (string | MarkupContent) -> Monaco (string | IMarkdownString)
+function mapDocumentation(doc: any): string | monaco.IMarkdownString | undefined {
+  if (!doc) return undefined;
+  if (typeof doc === "string") return doc;
+  if (Array.isArray(doc)) {
+    const parts = doc.map((d: any) => (typeof d === "string" ? d : d?.value ?? "")).filter(Boolean);
+    return parts.length ? { value: parts.join("\n\n") } : undefined;
+  }
+  if (typeof doc.value === "string") return { value: doc.value };
+  return undefined;
+}
+
+// LSP TextEdit[] -> Monaco additionalTextEdits
+function mapAdditionalEdits(edits: any[], prependedData: string | null): monaco.languages.CompletionItem["additionalTextEdits"] {
+  return edits
+    .filter((e) => e && e.range && typeof e.newText === "string")
+    .map((e) => ({ range: lspRangeToMonaco(e.range, prependedData), text: e.newText }));
+}
+
+// Пункт с сохранённым сырым LSP-объектом для позднего completionItem/resolve
+interface MappedCompletionItem extends monaco.languages.CompletionItem {
+  __lspItem?: any;
+}
+
+function mapCompletionItem(
+  item: any,
+  position: monaco.Position,
+  word: { startColumn: number; endColumn: number } | null,
+  prependedData: string | null
+): MappedCompletionItem {
+  const insertFromTextEdit =
+    item.textEdit && typeof item.textEdit.newText === "string" ? item.textEdit.newText : null;
+  const insertText = item.insertText ?? insertFromTextEdit ?? String(item.label ?? "");
+
+  let range: monaco.languages.CompletionItem["range"];
+  const te = item.textEdit;
+  if (te && te.insert && te.replace) {
+    range = {
+      insert: lspRangeToMonaco(te.insert, prependedData),
+      replace: lspRangeToMonaco(te.replace, prependedData),
+    };
+  } else if (te && te.range) {
+    range = lspRangeToMonaco(te.range, prependedData);
+  } else {
+    range = {
+      startLineNumber: position.lineNumber,
+      startColumn: word ? word.startColumn : position.column,
+      endLineNumber: position.lineNumber,
+      endColumn: word ? word.endColumn : position.column,
+    };
+  }
+
+  const mapped: MappedCompletionItem = {
+    label: String(item.label ?? insertText),
+    kind: LSP_KIND_TO_MONACO[item.kind] ?? monaco.languages.CompletionItemKind.Text,
+    insertText,
+    range,
+  };
+  if (item.detail) mapped.detail = String(item.detail);
+  if (item.sortText) mapped.sortText = String(item.sortText);
+  if (item.filterText) mapped.filterText = String(item.filterText);
+  if (item.preselect) mapped.preselect = true;
+  if (item.deprecated || (Array.isArray(item.tags) && item.tags.includes(1))) {
+    mapped.tags = [monaco.languages.CompletionItemTag.Deprecated];
+  }
+  if (item.insertTextFormat === 2) {
+    mapped.insertTextRules = monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet;
+  }
+  const doc = mapDocumentation(item.documentation);
+  if (doc !== undefined) mapped.documentation = doc;
+  if (Array.isArray(item.additionalTextEdits) && item.additionalTextEdits.length) {
+    mapped.additionalTextEdits = mapAdditionalEdits(item.additionalTextEdits, prependedData);
+  }
+  // `command` сервера (например pyright.triggerparameterhints) клиенту неизвестен —
+  // не пропускаем, monaco попытался бы выполнить несуществующую команду.
+  mapped.__lspItem = item;
+  return mapped;
 }
 
 /**
  * Create and register the completion provider
+ *
+ * vendored-patch (этап 3.1): languageId — параметр (на редактор теперь может
+ * висеть несколько LSP-серверов), prependedData — функция-геттер (живое
+ * значение заголовка), addSnippets — добавлять наши python-сниппеты
+ * (только приоритетный сервер python-стека: Monaco дублирует их в списке,
+ * а в стеках других языков сниппеты python вообще не нужны — этап 4).
  */
 export function createCompletionProvider(
+  languageId: string,
   getCurrentConnection: () => MessageConnection | null,
   isConnectionValid: (connection: MessageConnection | null) => boolean,
   prependModelData: (model: monaco.editor.ITextModel) => string,
-  prependedData: string | null,
-  forceReconnect: () => void
+  getPrependedData: () => string | null,
+  forceReconnect: () => void,
+  addSnippets: boolean = true
 ): monaco.IDisposable {
-  return monaco.languages.registerCompletionItemProvider("python", {
+  return monaco.languages.registerCompletionItemProvider(languageId, {
     triggerCharacters: ["."],
     provideCompletionItems: async (model: monaco.editor.ITextModel, position: monaco.Position) => {
       // Always use the current connection, not a captured reference
@@ -68,6 +202,7 @@ export function createCompletionProvider(
       console.log("Current word for snippet filtering:", currentWord);
 
       // Adjust line for prepended data
+      const prependedData = getPrependedData();
       const line = adjustLineForPrependedData(position, prependedData);
       const character = position.column - 1;
 
@@ -83,9 +218,9 @@ export function createCompletionProvider(
 
         const items = Array.isArray(result) ? result : result.items;
 
-        let suggestions = items.map((item: any) => ({
-          ...item,
-        }));
+        let suggestions: MappedCompletionItem[] = items.map((item: any) =>
+          mapCompletionItem(item, position, wordAtPosition, prependedData)
+        );
 
         // Make the suggestions unique
         suggestions = Array.from(
@@ -95,7 +230,9 @@ export function createCompletionProvider(
         );
 
         // Get filtered snippets with properly formatted CompletionItems
-        const snippets = getPythonSnippets(currentWord).map((snippet) => {
+        // (vendored-patch: только от приоритетного сервера языка — Monaco
+        // объединяет результаты всех completion-провайдеров)
+        const snippets = (addSnippets ? getPythonSnippets(currentWord) : []).map((snippet) => {
           // Update the dummy range with the actual position information
           if (snippet.range) {
             snippet.range = {
@@ -121,21 +258,50 @@ export function createCompletionProvider(
         return { suggestions: [] };
       }
     },
+    // vendored-patch: basedpyright объявляет resolveProvider — документацию,
+    // detail и auto-import (additionalTextEdits) подтягиваем lazily;range и
+    // insertText из исходного пункта не трогаем.
+    resolveCompletionItem: async (item: monaco.languages.CompletionItem, _token) => {
+      const mapped = item as MappedCompletionItem;
+      const connection = getCurrentConnection();
+      if (!mapped.__lspItem || !isConnectionValid(connection) || !connection) return item;
+      try {
+        const resolved: any = await connection.sendRequest("completionItem/resolve", mapped.__lspItem);
+        if (!resolved) return item;
+        const merged: MappedCompletionItem = { ...mapped };
+        const doc = mapDocumentation(resolved.documentation);
+        if (doc !== undefined) merged.documentation = doc;
+        if (resolved.detail) merged.detail = String(resolved.detail);
+        if (Array.isArray(resolved.additionalTextEdits) && resolved.additionalTextEdits.length) {
+          merged.additionalTextEdits = mapAdditionalEdits(resolved.additionalTextEdits, getPrependedData());
+        }
+        merged.__lspItem = resolved;
+        return merged;
+      } catch (e) {
+        console.error("LSP completionItem/resolve failed:", e);
+        return item;
+      }
+    },
   });
 }
 
 /**
  * Create and register the signature help provider
+ *
+ * vendored-patch (этап 3.1): languageId — параметр, prependedData — геттер.
+ * Регистрируется только одним экземпляром на язык (LspClientManager отдаёт
+ * «право» первому серверу с signatureProvider по приоритету).
  */
 export function createSignatureHelpProvider(
+  languageId: string,
   getCurrentConnection: () => MessageConnection | null,
   isConnectionValid: (connection: MessageConnection | null) => boolean,
   prependModelData: (model: monaco.editor.ITextModel) => string,
-  prependedData: string | null,
+  getPrependedData: () => string | null,
   forceReconnect: () => void,
   onSignatureHelp: ((data: monaco.languages.SignatureHelp) => void) | null
 ): monaco.IDisposable {
-  return monaco.languages.registerSignatureHelpProvider("python", {
+  return monaco.languages.registerSignatureHelpProvider(languageId, {
     signatureHelpTriggerCharacters: ["(", ",", "="],
     provideSignatureHelp: async (model, position, _token, context): Promise<monaco.languages.SignatureHelpResult> => {
       // Always use the current connection, not a captured reference
@@ -149,6 +315,7 @@ export function createSignatureHelpProvider(
       const validConnection = connection!;
 
       // Adjust line for prepended data
+      const prependedData = getPrependedData();
       const line = adjustLineForPrependedData(position, prependedData);
       const character = position.column - 1;
 
@@ -221,15 +388,18 @@ export function createSignatureHelpProvider(
 
 /**
  * Create and register the hover provider
+ *
+ * vendored-patch (этап 3.1): languageId — параметр, prependedData — геттер.
  */
 export function createHoverProvider(
+  languageId: string,
   getCurrentConnection: () => MessageConnection | null,
   isConnectionValid: (connection: MessageConnection | null) => boolean,
   prependModelData: (model: monaco.editor.ITextModel) => string,
-  prependedData: string | null,
+  getPrependedData: () => string | null,
   forceReconnect: () => void
 ): monaco.IDisposable {
-  return monaco.languages.registerHoverProvider("python", {
+  return monaco.languages.registerHoverProvider(languageId, {
     provideHover: async (model: monaco.editor.ITextModel, position: monaco.Position) => {
       // Always use the current connection, not a captured reference
       const connection = getCurrentConnection();
@@ -242,6 +412,7 @@ export function createHoverProvider(
       const validConnection = connection!;
 
       // Adjust line for prepended data
+      const prependedData = getPrependedData();
       const line = adjustLineForPrependedData(position, prependedData);
       const character = position.column - 1;
 
@@ -273,6 +444,77 @@ export function createHoverProvider(
       }
 
       return null;
+    },
+  });
+}
+
+/**
+ * Create and register the definition provider
+ *
+ * vendored-patch (этап 4): переход textDocument/definition. Сервер отвечает
+ * Location, LocationLink (clangd объявляет linkSupport) или массивы; для
+ * целевой точки в текущей модели диапазон сдвигается на длину prependedData,
+ * для других файлов — берётся как есть. Регистрируется ровно один на язык
+ * (как signatureHelp — LspClientManager отдаёт «право» первому серверу с
+ * definitionProvider по приоритету, иначе Monaco показал бы дубли).
+ */
+export function createDefinitionProvider(
+  languageId: string,
+  getCurrentConnection: () => MessageConnection | null,
+  isConnectionValid: (connection: MessageConnection | null) => boolean,
+  prependModelData: (model: monaco.editor.ITextModel) => string,
+  getPrependedData: () => string | null,
+  forceReconnect: () => void
+): monaco.IDisposable {
+  return monaco.languages.registerDefinitionProvider(languageId, {
+    provideDefinition: async (model: monaco.editor.ITextModel, position: monaco.Position) => {
+      const connection = getCurrentConnection();
+      if (!isConnectionValid(connection)) {
+        console.warn("No valid LSP connection available for definition");
+        return null;
+      }
+
+      const validConnection = connection!;
+      const prependedData = getPrependedData();
+      const line = adjustLineForPrependedData(position, prependedData);
+      const character = position.column - 1;
+      const uri = prepareDocument(validConnection, model, prependModelData);
+      const modelUri = model.uri.toString();
+
+      try {
+        const result: any = await validConnection.sendRequest("textDocument/definition", {
+          textDocument: { uri },
+          position: { line, character },
+        });
+        if (!result) return null;
+
+        const items: any[] = Array.isArray(result) ? result : [result];
+        const locations: monaco.languages.Location[] = [];
+        for (const item of items) {
+          if (!item) continue;
+          const targetUri: string | undefined = item.targetUri ?? item.uri;
+          const targetRange: any = item.targetSelectionRange ?? item.targetRange ?? item.range;
+          if (!targetUri || !targetRange?.start || !targetRange?.end) continue;
+          const sameDocument = targetUri === modelUri;
+          const range = sameDocument
+            ? lspRangeToMonaco(targetRange, prependedData)
+            : {
+                startLineNumber: targetRange.start.line + 1,
+                startColumn: targetRange.start.character + 1,
+                endLineNumber: targetRange.end.line + 1,
+                endColumn: targetRange.end.character + 1,
+              };
+          locations.push({ uri: monaco.Uri.parse(targetUri), range });
+        }
+        return locations.length ? locations : null;
+      } catch (e) {
+        console.error("LSP definition failed:", e);
+        if (e instanceof Error && (e.message.includes("disposed") || e.message.includes("closed"))) {
+          console.warn("Connection was disposed during definition request, forcing reconnection");
+          forceReconnect();
+        }
+        return null;
+      }
     },
   });
 }

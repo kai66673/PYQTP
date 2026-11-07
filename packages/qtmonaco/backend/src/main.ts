@@ -1,5 +1,5 @@
 import * as monaco from "monaco-editor";
-import LspClient from "./lsp";
+import { LspClientManager, type LspStackEntry } from "./lsp";
 import { initVimMode, type CMAdapter } from "monaco-vim";
 
 const container = document.getElementById("container");
@@ -32,7 +32,9 @@ let qtmonaco = (window as any).qtmonaco;
 // Build qt bridge
 let bridge: any = null;
 
-let lspClient: LspClient | null = null;
+// vendored-patch (этап 3.1): вместо одиночного LspClient — менеджер стека
+// LSP-серверов (lsp_stack из Python или одиночный lsp_url ради совместимости)
+let lspManager: LspClientManager | null = null;
 let lspHeader: string | null = null;
 
 let decorationsCollection: monaco.editor.IEditorDecorationsCollection | null = null;
@@ -96,6 +98,7 @@ function switchToStandaloneEditor() {
 function switchToDiffEditor(data: any) {
   disposeVimMode();
   disposeContentChangeListener();
+  lspManager?.setModel(null); // vendored-patch: diff-режим вне LSP-жизни цикла документов
   if (diffEditor) {
     disposeDiffEditor();
   } else {
@@ -171,6 +174,25 @@ function sendToPython(name: string, value: any) {
   }
 }
 
+// vendored-patch (этап 3.1): общий поднятие стека LSP-клиентов из записей
+// (lsp_stack от хаба IDE или одиночный lsp_url ради обратной совместимости)
+function setupLspStack(entries: LspStackEntry[]) {
+  if (lspManager) {
+    lspManager.destroy();
+  }
+  if (!entries.length) {
+    lspManager = null;
+    return;
+  }
+  lspManager = new LspClientManager();
+  lspManager.prependedData = lspHeader || "";
+  lspManager.onSignatureHelp = (signatureHelp) => {
+    sendToPython("_signature_help", signatureHelp);
+  };
+  lspManager.setStack(entries);
+  lspManager.setModel(editor.getModel()); // подхватываем текущую модель
+}
+
 function updateFromPython(name: string, value: string) {
   const data = JSON.parse(value);
   console.log(`Received update from Python: ${name} =`, data);
@@ -185,12 +207,14 @@ function updateFromPython(name: string, value: string) {
           (data.language && model.getLanguageId() !== data.language)
         ) {
           // If the URI or language is changing, dispose the old model
+          lspManager?.setModel(null); // vendored-patch: didClose старой модели до её dispose
           model.dispose();
           let language = data.language ?? undefined;
           let uri = data.uri ? monaco.Uri.parse(data.uri) : undefined;
 
           const new_model = monaco.editor.createModel(data.data, language, uri);
           editor.setModel(new_model);
+          lspManager?.setModel(new_model); // vendored-patch: LSP должен знать текущую модель
           sendToPython("_current_uri", new_model.uri.toString());
           break;
         }
@@ -213,6 +237,7 @@ function updateFromPython(name: string, value: string) {
 
         const new_model = monaco.editor.createModel(data.data, language, uri);
         editor.setModel(new_model);
+        lspManager?.setModel(new_model); // vendored-patch: LSP должен знать текущую модель
         sendToPython("_current_uri", new_model.uri.toString());
         break;
       }
@@ -376,43 +401,35 @@ function updateFromPython(name: string, value: string) {
         sendToPython("_theme", "vs-dark");
       }
       break;
-    case "lsp_url":
-      // Destroy existing LSP client if it exists
-      if (lspClient) {
-        lspClient.destroy();
-        lspClient = null;
-      }
-      // Update LSP client with new URL
+    case "lsp_url": {
+      // Обратная совместимость: одиночный адрес -> стек из одного сервера
       if (data && typeof data === "string") {
-        const pylspUrl = data;
-        console.log(`Setting up LSP client with URL: ${pylspUrl}`);
-        lspClient = new LspClient(pylspUrl);
-        lspClient.prependedData = lspHeader || ""; // Set the LSP header if available
-
-        // Set up the signature help callback
-        lspClient.onSignatureHelp = (signatureHelp) => {
-          // Send the signature help data to Python
-          sendToPython("_signature_help", signatureHelp);
-        };
+        console.log(`Setting up LSP stack (single entry): ${data}`);
+        setupLspStack([{ url: data, owner: "pylsp", languageId: "python", priority: 0 }]);
+      } else {
+        lspManager?.destroy();
+        lspManager = null;
       }
       break;
+    }
+    case "lsp_stack": {
+      // vendored-patch (этап 3.1): стек LSP-серверов от хаба IDE
+      if (Array.isArray(data)) {
+        console.log(`Setting up LSP stack: ${data.map((e: LspStackEntry) => e.owner).join(", ")}`);
+        setupLspStack(data);
+      } else {
+        console.warn("Invalid data provided for lsp_stack");
+      }
+      break;
+    }
     case "set_lsp_header":
       // Set the LSP header for the client
       lspHeader = data; // Store the header for later use
-      if (lspClient) {
-        lspClient.prependedData = data;
-
-        // Make sure the signature help callback is still set
-        if (!lspClient.onSignatureHelp) {
-          lspClient.onSignatureHelp = (signatureHelp) => {
-            sendToPython("_signature_help", signatureHelp);
-          };
-        }
-      }
+      lspManager?.setPrependedData(data);
       break;
     case "get_lsp_header":
       // Get the current LSP header
-      const headerData = lspClient ? lspClient.prependedData : "";
+      const headerData = lspManager ? lspManager.prependedData : "";
       sendToPython("_lsp_header", headerData);
       break;
     case "vim_mode":
@@ -433,8 +450,7 @@ function updateFromPython(name: string, value: string) {
       break;
     case "update_workspace_config":
       // Update workspace configuration
-      if (!lspClient) {
-        console.log(lspClient);
+      if (!lspManager) {
         console.warn("LSP client not initialized, cannot update workspace config");
         sendToPython("_workspace_config_updated", { success: false, error: "LSP client not initialized" });
         break;
@@ -445,7 +461,7 @@ function updateFromPython(name: string, value: string) {
         break;
       }
 
-      lspClient.settings = data; // Store settings in the LSP client
+      lspManager.updateSettings(data); // Mirror settings to all stack clients
 
       break;
   }

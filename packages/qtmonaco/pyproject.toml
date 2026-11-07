@@ -30,7 +30,9 @@ dev = [
     "pytest-cov~=6.1.1",
 ]
 
-pyside6 = ["PySide6>=6.8"]
+# vendored-patch: нижняя граница PySide6 понижена до версии репозитория (6.6.2),
+# т.к. wheel build-kddw жёстко пинает pyside6==6.6.2 и конфликтует с upstream-extra.
+pyside6 = ["PySide6>=6.6.2"]
 
 pyqt6 = ["PyQt6", "PyQt6-WebEngine"]
 

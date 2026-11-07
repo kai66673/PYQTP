@@ -37,10 +37,15 @@ class Monaco(QWebEngineView):
     signature_help_triggered = Signal(dict)
     workspace_config_updated = Signal(bool, str)  # success, error_message
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, lsp_host: str | list | None = None):
         super().__init__(parent=parent)
 
-        self.pylsp_host = get_pylsp_host()
+        # vendored-patch: LSP-хост параметризуется извне (хаб LSP в IDE);
+        # eager-спавн штатного pylsp из конструктора убран — fallback в
+        # _resolve_lsp_host ленивый и срабатывает только если хост не задан.
+        # str — одиночный адрес (lsp_url), list[dict] — стек серверов
+        # этапа 3.1 (lsp_stack); пустой список означает «серверов нет».
+        self.pylsp_host = lsp_host
         self._connector = Connector(parent=self)
         self._value = ""
         self._language = ""
@@ -62,8 +67,26 @@ class Monaco(QWebEngineView):
         self._channel.registerObject("connector", self._connector)
         self._connector.javascript_data_received.connect(self.on_new_data_received)
 
-        self.initialized.connect(lambda: self._set_host(self.pylsp_host))
+        self.initialized.connect(lambda: self._set_host(self._resolve_lsp_host()))
         self._load_editor()
+
+    def _resolve_lsp_host(self) -> str | list:
+        """
+        Resolve the LSP host to hand to the JS side.
+
+        vendored-patch: uses the ``lsp_host`` passed to the constructor
+        (e.g. pyqtp IDE LSP hub address or server stack); falls back to
+        lazily starting qtmonaco's own pylsp provider when no host was
+        given (``None``). An empty list means "no LSP servers" and is
+        passed through as is.
+
+        Returns:
+            str | list: The 'host:port' address for a single WebSocket LSP
+            connection, or the list of stack entries for multi-server mode.
+        """
+        if self.pylsp_host is not None:
+            return self.pylsp_host
+        return get_pylsp_host()
 
     @property
     def bridge_initialized(self):
@@ -81,14 +104,21 @@ class Monaco(QWebEngineView):
         base_url = get_monaco_base_url()
         self.setHtml(raw_html, base_url)
 
-    def _set_host(self, host: str):
+    def _set_host(self, host: str | list):
         """
-        Set the LSP host once the bridge is initialized.
+        Set the LSP host (single address) or server stack once the bridge
+        is initialized.
+
+        vendored-patch: list form sends the ``lsp_stack`` message
+        (multi-server stage 3.1); string form keeps the legacy ``lsp_url``.
 
         Args:
-            host (str): The host URL for the editor.
+            host (str | list): The host URL, or the list of stack entries.
         """
-        self._connector.send("lsp_url", host)
+        if isinstance(host, list):
+            self._connector.send("lsp_stack", host)
+        else:
+            self._connector.send("lsp_url", host)
         for name, value in self._lsp_buffer:
             self._connector.send(name, value)
 
