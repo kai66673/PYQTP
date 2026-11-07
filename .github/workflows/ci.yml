@@ -1,0 +1,94 @@
+name: Full CI
+on:
+  push:
+  pull_request:
+
+permissions:
+  pull-requests: write
+
+jobs:
+  check_pr_status:
+    uses: ./.github/workflows/check_pr.yml
+
+  build:
+    runs-on: ubuntu-latest
+    needs: check_pr_status
+    if: needs.check_pr_status.outputs.branch-pr == ''
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Set up node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Install dependencies
+        run: |
+          cd backend
+          npm install
+
+      - name: Build JS resources
+        run: |
+          cd backend
+          npm run build
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+      - name: Install Python dependencies
+        run: |
+          pip install .[dev]
+      - name: Copy JS resources
+        run: |
+          mkdir -p ./qtmonaco/js_build
+          cp -r ./backend/dist/* ./qtmonaco/js_build
+      - name: Build python wheel
+        run: |
+          pip install wheel build
+          python -m build
+
+      - name: Upload js build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: qtmonaco-js
+          path: ./qtmonaco/js_build
+          retention-days: 1
+
+  pytest:
+    env:
+      QTWEBENGINE_DISABLE_SANDBOX: 1
+      QT_QPA_PLATFORM: "offscreen"
+      QTWEBENGINE_CHROMIUM_FLAGS: "--disable-gpu"
+    runs-on: ubuntu-latest
+    needs: build
+    strategy:
+      matrix:
+        qt-framework: [pyside6, pyqt6]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+      - name: Install os dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgl1 libegl1 x11-utils libxkbcommon-x11-0 libdbus-1-3 xvfb
+          sudo apt-get -y install libnss3 libxdamage1 libasound2t64 libatomic1 libxcursor1
+      - name: Download js build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: qtmonaco-js
+          path: ./qtmonaco/js_build
+      - name: Install Python dependencies
+        run: |
+          ls -la ./qtmonaco/js_build
+          pip install .[dev,${{ matrix.qt-framework }}]
+      - name: Run Pytest with Coverage (${{ matrix.qt-framework }})
+        id: coverage
+        run: pytest --random-order --cov=qtmonaco --cov-config=pyproject.toml --cov-branch --cov-report=xml --no-cov-on-fail tests/
