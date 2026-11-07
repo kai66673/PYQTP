@@ -20,11 +20,18 @@ const defaultEditorOptions: monaco.editor.IStandaloneEditorConstructionOptions =
   // singleton-configuration сервиса редактора, ключ editor.* см.
   // updateConfigurationService в monaco)
   "semanticHighlighting.enabled": true,
+  // vendored-patch (этап 7): IDE-поведение по умолчанию, как в VS Code:
+  // alt+клик добавляет множественные каретки (ctrl+клик тогда остаётся
+  // за переходом к определению), прокрутка не уходит за последнюю строку
+  multiCursorModifier: "alt",
+  scrollBeyondLastLine: false,
 };
 
 let editor = monaco.editor.create(editorContainer, defaultEditorOptions);
 let diffEditor: monaco.editor.IStandaloneDiffEditor | null = null;
 let contentChangeDisposable: monaco.IDisposable | null = null;
+// vendored-patch (этап 7): слушатель каретки для истории переходов
+let cursorChangeDisposable: monaco.IDisposable | null = null;
 
 (window as any).qtmonaco = {
   editor: editor,
@@ -127,18 +134,35 @@ function disposeDiffEditor() {
   qtmonaco.diffEditor = null;
 }
 
-function setActiveEditor(newEditor: monaco.editor.IStandaloneCodeEditor) {
-  disposeContentChangeListener();
-  clearPendingCursor(); // vendored-patch (этап 6): pending reveal старого редактора не нужен
-  decorationsCollection = null;
-  editor = newEditor;
-  qtmonaco.editor = editor;
-  contentChangeDisposable = editor.onDidChangeModelContent((_event) => {
-    const model = editor.getModel();
+// vendored-patch (этап 7): единая точка навешивания редакторских слушателей —
+// к исходному редактору они приходят через setActiveEditor(editor) в колбэке
+// QWebChannel, при замене редактора (diff-режим) — тоже через setActiveEditor.
+function attachEditorListeners(target: monaco.editor.IStandaloneCodeEditor) {
+  contentChangeDisposable = target.onDidChangeModelContent((_event) => {
+    const model = target.getModel();
     if (model) {
       sendToPython("_current_text", model.getValue());
     }
   });
+  // запись крупных прыжков каретки в историю переходов (этап 7)
+  cursorChangeDisposable = target.onDidChangeCursorPosition(onNavCursorPositionChanged);
+}
+
+function setActiveEditor(newEditor: monaco.editor.IStandaloneCodeEditor) {
+  disposeContentChangeListener();
+  // vendored-patch (этап 7): слушатель каретки привязан к конкретному
+  // редактору — при его замене старый disposable и старая история неактуальны
+  if (cursorChangeDisposable) {
+    cursorChangeDisposable.dispose();
+    cursorChangeDisposable = null;
+  }
+  resetNavHistory();
+  clearPendingCursor(); // vendored-patch (этап 6): pending reveal старого редактора не нужен
+  decorationsCollection = null;
+  editor = newEditor;
+  qtmonaco.editor = editor;
+  attachEditorListeners(editor);
+  seedNavHistory();
 }
 
 function switchToStandaloneEditor() {
@@ -264,6 +288,175 @@ monaco.editor.registerEditorOpener({
   },
 });
 
+// vendored-patch (этап 7): ключевые связки, которых в standalone-сборке Monaco
+// нет по умолчанию. find (ctrl+F/ctrl+H) и folding (ctrl+K-хорды) уже
+// зарегистрированы самими contrib'ами; fontZoom-команды (
+// editor.action.fontZoomIn/Out/Reset) есть, но без keybinding'ов;
+// smartSelect — только Shift+Alt+стрелки (у нас ctrl+shift+. / ctrl+shift+,
+// как в VS Code; alt+стрелки без shift при этом свободны).
+// monaco.editor.addKeybindingRules — глобальные правила, они переживают
+// пересоздание редактора (switchToStandaloneEditor).
+monaco.editor.addKeybindingRules([
+  {
+    keybinding: monaco.KeyMod.CtrlCmd | monaco.KeyCode.Equal,
+    command: "editor.action.fontZoomIn",
+    when: "editorFocus",
+  },
+  {
+    keybinding: monaco.KeyMod.CtrlCmd | monaco.KeyCode.Minus,
+    command: "editor.action.fontZoomOut",
+    when: "editorFocus",
+  },
+  {
+    keybinding: monaco.KeyMod.CtrlCmd | monaco.KeyCode.Digit0,
+    command: "editor.action.fontZoomReset",
+    when: "editorFocus",
+  },
+  {
+    keybinding: monaco.KeyMod.CtrlCmd | monaco.KeyMod.Shift | monaco.KeyCode.Period,
+    command: "editor.action.smartSelect.expand",
+    when: "editorFocus",
+  },
+  {
+    keybinding: monaco.KeyMod.CtrlCmd | monaco.KeyMod.Shift | monaco.KeyCode.Comma,
+    command: "editor.action.smartSelect.shrink",
+    when: "editorFocus",
+  },
+]);
+
+// vendored-patch (этап 7): собственная история переходов (go back / go forward).
+// В standalone-бандле Monaco нет workbench-механизма navigation history —
+// команд goBack/goForward нет вовсе (contrib/editorState — про отмену запросов,
+// не про историю). Поэтому заводим свой стек позиций per-editor (каждая
+// вкладка — отдельный QWebEngineView/JS-мир; кросс-документная история — на
+// python-слое, вне этого патча). Записываем позицию ПЕРЕД крупным прыжком
+// (дельта >= NAV_JUMP_MIN_LINES строк) — это отсекает обычное печатание и
+// ходы стрелками; события Undo/Redo не пишем. Ходы самих goBack/goForward
+// не должны порождать новых записей — флаг navNavigating.
+const NAV_HISTORY_LIMIT = 80;
+const NAV_JUMP_MIN_LINES = 4;
+
+interface NavPoint {
+  lineNumber: number;
+  column: number;
+}
+
+const navBack: NavPoint[] = [];
+const navForward: NavPoint[] = [];
+let navLastPos: NavPoint | null = null;
+let navNavigating = false;
+
+function resetNavHistory() {
+  navBack.length = 0;
+  navForward.length = 0;
+  navLastPos = null;
+}
+
+// vendored-patch (этап 7): стартовая позиция каретки (сразу после создания или
+// замены модели, либо подстановки редактора) событий смены позиции не порождает —
+// без отправной точки первый крупный переход (например LSP go-to-definition сразу
+// после открытия файла) не попал бы в историю и Alt+LeftArrow молчал бы
+function seedNavHistory() {
+  if (navNavigating) {
+    return;
+  }
+  const position = editor.getPosition();
+  navLastPos = position
+    ? { lineNumber: position.lineNumber, column: position.column }
+    : null;
+}
+
+function pushNavPoint(stack: NavPoint[], point: NavPoint) {
+  stack.push(point);
+  if (stack.length > NAV_HISTORY_LIMIT) {
+    stack.shift();
+  }
+}
+
+function onNavCursorPositionChanged(e: monaco.editor.ICursorPositionChangedEvent) {
+  const to = { lineNumber: e.position.lineNumber, column: e.position.column };
+  if (navNavigating) {
+    navLastPos = to;
+    return;
+  }
+  const from = navLastPos;
+  navLastPos = to;
+  if (!from) {
+    return;
+  }
+  if (from.lineNumber === to.lineNumber && from.column === to.column) {
+    return;
+  }
+  const reason = e.reason;
+  if (
+    reason === monaco.editor.CursorChangeReason.Undo ||
+    reason === monaco.editor.CursorChangeReason.Redo
+  ) {
+    return;
+  }
+  if (Math.abs(from.lineNumber - to.lineNumber) < NAV_JUMP_MIN_LINES) {
+    return;
+  }
+  pushNavPoint(navBack, from);
+  navForward.length = 0;
+}
+
+function navigateToNavPoint(point: NavPoint) {
+  const position = new monaco.Position(point.lineNumber, point.column);
+  navNavigating = true;
+  try {
+    editor.setPosition(position);
+    editor.setSelection(new monaco.Selection(point.lineNumber, point.column, point.lineNumber, point.column));
+    const layout = editor.getLayoutInfo();
+    if (layout.width > 0 && layout.height > 0) {
+      editor.revealPositionInCenterIfOutsideViewport(position);
+    }
+    editor.focus();
+  } finally {
+    navNavigating = false;
+  }
+  navLastPos = point;
+}
+
+function goNavBack() {
+  const target = navBack.pop();
+  if (!target) {
+    return;
+  }
+  const current = editor.getPosition();
+  if (current) {
+    pushNavPoint(navForward, { lineNumber: current.lineNumber, column: current.column });
+  }
+  navigateToNavPoint(target);
+}
+
+function goNavForward() {
+  const target = navForward.pop();
+  if (!target) {
+    return;
+  }
+  const current = editor.getPosition();
+  if (current) {
+    pushNavPoint(navBack, { lineNumber: current.lineNumber, column: current.column });
+  }
+  navigateToNavPoint(target);
+}
+
+monaco.editor.registerCommand("qtmonaco.editor.navigation.goBack", () => goNavBack());
+monaco.editor.registerCommand("qtmonaco.editor.navigation.goForward", () => goNavForward());
+monaco.editor.addKeybindingRules([
+  {
+    keybinding: monaco.KeyMod.Alt | monaco.KeyCode.LeftArrow,
+    command: "qtmonaco.editor.navigation.goBack",
+    when: "editorFocus",
+  },
+  {
+    keybinding: monaco.KeyMod.Alt | monaco.KeyCode.RightArrow,
+    command: "qtmonaco.editor.navigation.goForward",
+    when: "editorFocus",
+  },
+]);
+
 // vendored-patch (этап 3.1): общий поднятие стека LSP-клиентов из записей
 // (lsp_stack от хаба IDE или одиночный lsp_url ради обратной совместимости)
 function setupLspStack(entries: LspStackEntry[]) {
@@ -306,6 +499,8 @@ function updateFromPython(name: string, value: string) {
           const new_model = monaco.editor.createModel(data.data, language, uri);
           editor.setModel(new_model);
           lspManager?.setModel(new_model); // vendored-patch: LSP должен знать текущую модель
+          resetNavHistory(); // vendored-patch (этап 7): позиции старой модели неактуальны
+          seedNavHistory(); // vendored-patch (этап 7): старт истории от новой позиции
           sendToPython("_current_uri", new_model.uri.toString());
           break;
         }
@@ -320,6 +515,10 @@ function updateFromPython(name: string, value: string) {
           ],
           () => null,
         );
+        // vendored-patch (этап 7): текст подменён целиком — старые позиции
+        // модели неактуальны, историю отсчитываем от текущего курсора
+        resetNavHistory();
+        seedNavHistory();
         break;
       } else {
         // If no model exists, create a new one
@@ -329,6 +528,8 @@ function updateFromPython(name: string, value: string) {
         const new_model = monaco.editor.createModel(data.data, language, uri);
         editor.setModel(new_model);
         lspManager?.setModel(new_model); // vendored-patch: LSP должен знать текущую модель
+        resetNavHistory(); // vendored-patch (этап 7): новая модель — новая история переходов
+        seedNavHistory(); // vendored-patch (этап 7): старт истории от текущей позиции
         sendToPython("_current_uri", new_model.uri.toString());
         break;
       }
