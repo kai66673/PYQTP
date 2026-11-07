@@ -51,7 +51,14 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
 
     trylast — чтобы отработали pytest-cov и прочие плагины, выписывающие
     свои артефакты на sessionfinish.
+
+    Для отладки падений (нужен обычный терминальный отчёт с трейсеками,
+    который печатается уже ПОСЛЕ этого хука) можно задать
+    ``PYQTP_NO_OS_EXIT=1`` — тогда процесс завершается штатно и может
+    упасть уже в деструкторах Qt (результаты тестов при этом корректны).
     """
+    if os.environ.get('PYQTP_NO_OS_EXIT'):
+        return
     sys.stdout.flush()
     sys.stderr.flush()
     # осознанный обход уничтожения Qt-графа интерпретатором

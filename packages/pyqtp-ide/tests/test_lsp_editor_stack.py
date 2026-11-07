@@ -382,3 +382,59 @@ def test_clangd_diagnostics_goto_completion(editor_pair, qtbot) -> None:
 
     # пул процессов: clangd заведен
     assert any('clangd' in cmd for cmd in {key[0] for key in hub._instances})
+
+
+# --- semanticTokens (этап 5): full-токены basedpyright -> раскраска view DOM ---
+
+# стек из одного basedpyright — единственный претендент на единственный
+# semanticTokens-провайдер языка (claimProvider), без гонок с ruff
+BP_ONLY_REGISTRY = json.dumps({
+    'python': {
+        'extensions': ['.py', '.pyi'],
+        'servers': [{
+            'name': 'basedpyright',
+            'command': ['basedpyright-langserver', '--stdio'],
+        }],
+    },
+})
+
+SEM_SOURCE = 'si = []\nsi.apend(1)\nprint(si.lenght)\n'
+
+# 'si' как semantic-'variable' красится правилом 'variable' темы vs-dark
+# (#74B0DF); синтаксически идентификаторы в Monaco — дефолтный foreground
+# (#D4D4D4). Ищем span с текстом 'si', покрашенный именно в цвет переменной.
+JS_SEM_VARIABLE_BLUE = """
+(() => {
+  const lines = document.querySelectorAll('.view-lines .view-line');
+  if (!lines.length) return 'NO_LINES';
+  for (const line of lines) {
+    for (const span of line.querySelectorAll('span')) {
+      if (span.children.length || !span.textContent) continue;
+      if (span.textContent.trim() !== 'si') continue;
+      if (getComputedStyle(span).color === 'rgb(116, 176, 223)') return 'SEM_OK';
+    }
+  }
+  return 'NOT_YET';
+})()
+"""
+
+
+def test_semantic_tokens_highlighting(editor_pair, qtbot) -> None:
+    """Семантическая подсветка: capabilities хаба -> провайдер JS -> Monaco."""
+    hub, widget = editor_pair(
+        SEM_SOURCE, registry_json=BP_ONLY_REGISTRY,
+    )
+    wait_editor_ready(qtbot, widget)
+
+    wait_for(
+        qtbot,
+        lambda: run_js(widget, JS_SEM_VARIABLE_BLUE) == 'SEM_OK',
+        timeout=90.0,
+        poll=1.0,
+        message='семантическая раскраска basedpyright так и не появилась в DOM',
+    )
+
+    # пул процессов: basedpyright заведен (запрос full шёл через хаб)
+    assert any(
+        'basedpyright' in cmd for cmd in {key[0] for key in hub._instances}
+    )

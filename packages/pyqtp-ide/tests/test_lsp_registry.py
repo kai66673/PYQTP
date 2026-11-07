@@ -16,7 +16,7 @@ import pytest
 from PySide6.QtCore import QSettings
 from websockets.sync.client import connect
 
-from pyqtp.controls.lsp_control.lsp_hub import LspHub
+from pyqtp.controls.lsp_control.lsp_hub import HUB_CAPABILITIES, LspHub
 from pyqtp.controls.lsp_control.lsp_registry import LspRegistry
 
 
@@ -146,6 +146,30 @@ def test_hub_apply_and_reset(hub: LspHub, proj: Path) -> None:
     assert stack_names(hub, uri) == ['basedpyright', 'ruff']
 
 
+def test_hub_caps_semantic_tokens() -> None:
+    """Capabilities хаба: semanticTokens full (без delta), гибрид полей LSP.
+
+    Поля 3.17 (legend/tokenFormat) — по спецификации; черновик 3.16
+    (tokenTypes/tokenModifiers/formats) обязателен для ruff на tower-lsp,
+    который без них падает на initialize (regression-guard).
+    """
+    from pyqtp.controls.lsp_control.lsp_hub import (
+        STANDARD_SEMANTIC_TOKEN_MODIFIERS,
+        STANDARD_SEMANTIC_TOKEN_TYPES,
+    )
+
+    sem = HUB_CAPABILITIES['textDocument']['semanticTokens']
+    assert sem['tokenFormat'] == 'relative'
+    assert sem['requests']['range'] is False
+    assert sem['requests']['full'] == {'delta': False}
+    # легенда 3.17 и draft-поля согласованы
+    assert sem['legend']['tokenTypes'] == STANDARD_SEMANTIC_TOKEN_TYPES
+    assert sem['legend']['tokenModifiers'] == STANDARD_SEMANTIC_TOKEN_MODIFIERS
+    assert sem['tokenTypes'] == STANDARD_SEMANTIC_TOKEN_TYPES
+    assert sem['tokenModifiers'] == STANDARD_SEMANTIC_TOKEN_MODIFIERS
+    assert sem['formats'] == ['relative']
+
+
 # --- C. живые хендшейки через хаб ---
 
 
@@ -170,6 +194,62 @@ def test_live_handshakes(live_hub: LspHub, proj: Path) -> None:
     resp = ws_initialize(ruff_url)
     assert resp and (resp.get('result') or {}).get('capabilities') == {}
     live_hub.registry_reset()
+
+
+@pytest.mark.live
+def test_live_semantic_tokens(live_hub: LspHub, proj: Path) -> None:
+    """Хаб ретранслирует textDocument/semanticTokens/full (этап 5).
+
+    basedpyright (как и clangd) игнорирует клиентскую легенду и кодирует
+    токены собственным legend из InitializeResult — ответ прогоняем через
+    декодер относительной кодировки (5 чисел на токен) именно по ней.
+    """
+    sem_file = proj / 'sem.py'
+    sem_file.write_text('si = []\nsi.apend(1)\nprint(si.lenght)\n', encoding='utf-8')
+    uri = sem_file.as_uri()
+    bp_url = next(h for h in live_hub.ws_hosts_for(uri) if h.endswith('/basedpyright'))
+
+    with connect(f'ws://{bp_url}', open_timeout=10, close_timeout=2) as ws:
+        def rpc(msg_id: int, method: str, params: dict) -> dict:
+            ws.send(json.dumps({
+                'jsonrpc': '2.0', 'id': msg_id,
+                'method': method, 'params': params,
+            }))
+            for _ in range(50):
+                msg = json.loads(ws.recv(timeout=60))
+                if msg.get('id') == msg_id and 'method' not in msg:
+                    return msg
+            return {}
+
+        init = rpc(1, 'initialize', {
+            'processId': None, 'rootUri': proj.as_uri(), 'capabilities': {},
+        })
+        caps = (init.get('result') or {}).get('capabilities') or {}
+        sem_caps = caps.get('semanticTokensProvider') or {}
+        legend = sem_caps.get('legend') or {}
+        assert sem_caps.get('full'), f'basedpyright не объявил full: {sem_caps}'
+        assert legend.get('tokenTypes'), f'basedpyright без легенды: {legend}'
+
+        ws.send(json.dumps({'jsonrpc': '2.0', 'method': 'initialized', 'params': {}}))
+        ws.send(json.dumps({'jsonrpc': '2.0', 'method': 'textDocument/didOpen', 'params': {
+            'textDocument': {
+                'uri': uri, 'languageId': 'python', 'version': 1,
+                'text': sem_file.read_text(encoding='utf-8'),
+            },
+        }}))
+
+        full = rpc(2, 'textDocument/semanticTokens/full', {'textDocument': {'uri': uri}})
+        assert 'error' not in full, full.get('error')
+
+        data = (full.get('result') or {}).get('data') or []
+        assert data and len(data) % 5 == 0, f'странная data: {data[:10]}'
+        token_types: list[str] = legend['tokenTypes']
+        decoded: list[str] = []
+        for i in range(0, len(data), 5):
+            _dl, _dc, length, tidx, _mods = data[i:i + 5]
+            assert length > 0 and tidx < len(token_types), data[i:i + 5]
+            decoded.append(token_types[tidx])
+        assert 'variable' in decoded, decoded
 
 
 # --- D. правило поиска корня проекта из конфига ---

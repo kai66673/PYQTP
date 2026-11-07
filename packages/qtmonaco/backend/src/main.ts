@@ -13,6 +13,13 @@ const defaultEditorOptions: monaco.editor.IStandaloneEditorConstructionOptions =
   language: "python",
   automaticLayout: true,
   theme: "vs-dark",
+  // vendored-patch (этап 5): у встроенных standalone-тем Monaco флаг
+  // semanticHighlighting выключен, поэтому при значении по умолчанию
+  // («configuredByTheme») DocumentSemanticTokensFeature не запускается вовсе —
+  // включаем семантическую раскраску напрямую в настройке (она попадает в
+  // singleton-configuration сервиса редактора, ключ editor.* см.
+  // updateConfigurationService в monaco)
+  "semanticHighlighting.enabled": true,
 };
 
 let editor = monaco.editor.create(editorContainer, defaultEditorOptions);

@@ -218,6 +218,41 @@ completion `s.si` даёт `size()`/`max_size()` из `<string>`; регресс
 ruff/pyright на базовых уровнях. Живой IDE: initialize-хендшейк `.../main.cpp/clangd`
 возвращает реальные capabilities clangd.
 
+## Этап 5 — семантическая подсветка (semanticTokens)
+
+Пайплайн: хаб объявляет client capabilities `textDocument/semanticTokens` →
+сервер кодирует токены → JS регистрирует `DocumentSemanticTokensProvider` →
+Monaco перекрашивает модель.
+
+Ключевые решения:
+
+- Легенда — из InitializeResult **конкретного сервера** (`semanticTokensProvider.legend`):
+  и basedpyright, и clangd клиентскую легенду игнорируют, кодируют токены
+  собственным legend (проверено зондами). Клиентская легенда в
+  `HUB_CAPABILITIES` — формальность; набор полей — гибрид LSP 3.17
+  (`legend`/`tokenFormat`) и черновика 3.16 (`tokenTypes`/`tokenModifiers`/
+  `formats`) — без draft-полей ruff на tower-lsp падает на initialize
+  (`missing field tokenTypes`), это regression-guard в тестах.
+- Только `full` без delta (`requests.full.delta=false`); относительную
+  5-числовую кодировку разбирает сам Monaco — данные из ответа сервера
+  передаются как `Uint32Array` как есть, `resultId` эхом.
+- Провайдер — единственный на язык, `claimProvider("semanticTokens", ...)`
+  (обобщение этапа 4): в python-стеке за basedpyright как первым по приоритету,
+  без гонок с ruff.
+- У встроенных standalone-тем Monaco `semanticHighlighting` выключен — при
+  значении по умолчанию (`configuredByTheme`) фича не стартует вовсе; включён
+  явно в `defaultEditorOptions` (`"semanticHighlighting.enabled": true`).
+- При prepended-заголовке (`getPrependedData()`) подсветка отключается:
+  перекодировка относительных строк токенов под сдвиг не поддерживается.
+
+**Статус: выполнено.** Тесты: `test_hub_caps_semantic_tokens` (гибрид полей
+capabilities), `test_live_semantic_tokens` (retro-тест live-хаба: full-ответ
+basedpyright декодируется по легенде сервера, есть токен `variable`),
+`test_semantic_tokens_highlighting` (webengine, end-to-end: `si` в DOM красится
+правилом `variable` темы vs-dark `#74B0DF` вместо дефолтного `#D4D4D4`; стек
+из одного basedpyright через `registry_json` фабрики `editor_pair`).
+`ruff (13) → pyright (18) → pytest -m '' (23/23)` зелёные; `js_build` пересобран.
+
 ## Сквозная проверка каждого этапа
 
 `uv run ruff check --no-fix <изменённое>` (baseline 13) →

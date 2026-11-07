@@ -62,6 +62,25 @@ if TYPE_CHECKING:
 
 srv_log = logging.getLogger('bcad.lsp')
 
+# Легенда семантических токенов в client capabilities. Реально наши серверы
+# клиентскую легенду игнорируют: и basedpyright, и clangd кодируют токены
+# собственным legend, который объявляют в своём InitializeResult (проверено
+# зондами); его и использует JS-провайдер (этап 5). Набор полей ниже — гибрид
+# спецификаций LSP: поля 3.17 (legend/tokenFormat) нужны по спецификации, а
+# поля черновика 3.16 (tokenTypes/tokenModifiers/formats) требует ruff на
+# tower-lsp — без них он роняется на initialize ('missing field tokenTypes').
+STANDARD_SEMANTIC_TOKEN_TYPES = [
+    'namespace', 'type', 'class', 'enum', 'interface', 'struct', 'typeParameter',
+    'parameter', 'variable', 'property', 'enumMember', 'event', 'function',
+    'method', 'macro', 'keyword', 'modifier', 'comment', 'string', 'number',
+    'regexp', 'operator', 'decorator',
+]
+STANDARD_SEMANTIC_TOKEN_MODIFIERS = [
+    'documentation', 'declaration', 'definition', 'static', 'deprecated',
+    'abstract', 'async', 'modification', 'readonly', 'default', 'imported',
+    'public', 'private', 'protected',
+]
+
 # Статические capabilities хаба (без dynamic registration), по ним процесс
 # сервера получает всё нужное для диагностик/комплий/ховера.
 HUB_CAPABILITIES: dict[str, Any] = {
@@ -104,6 +123,25 @@ HUB_CAPABILITIES: dict[str, Any] = {
         'references': {},
         'documentSymbol': {'hierarchicalDocumentSymbolSupport': True},
         'documentHighlight': {},
+        # Семантическая подсветка (этап 5): набор полей — гибрид 3.17 и
+        # черновика 3.16 (см. комментарий у STANDARD_SEMANTIC_TOKEN_*);
+        # серверы кодируют токены собственным legend из InitializeResult —
+        # его же использует JS-провайдер (см. lsp.ts/providers.ts)
+        'semanticTokens': {
+            'dynamicRegistration': False,
+            'requests': {'range': False, 'full': {'delta': False}},
+            'multilineTokenSupport': False,
+            'overlappingTokenSupport': False,
+            'serverCancelSupport': False,
+            'tokenFormat': 'relative',
+            'legend': {
+                'tokenTypes': STANDARD_SEMANTIC_TOKEN_TYPES,
+                'tokenModifiers': STANDARD_SEMANTIC_TOKEN_MODIFIERS,
+            },
+            'tokenTypes': STANDARD_SEMANTIC_TOKEN_TYPES,
+            'tokenModifiers': STANDARD_SEMANTIC_TOKEN_MODIFIERS,
+            'formats': ['relative'],
+        },
         'codeAction': {
             'codeActionLiteralSupport': {
                 'codeActionKind': {'valueSet': ['quickfix', 'refactor']}

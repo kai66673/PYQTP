@@ -6,6 +6,7 @@ import {
   createSignatureHelpProvider,
   createHoverProvider,
   createDefinitionProvider,
+  createSemanticTokensProvider,
 } from "./providers";
 
 export type LspCompletionItem = {
@@ -48,6 +49,42 @@ function lspToMonacoSeverity(severity: number | undefined): monaco.MarkerSeverit
     default:
       return monaco.MarkerSeverity.Error; // 1 или отсутствует (по спецификации — Error)
   }
+}
+
+// vendored-patch (этап 5): стандартный набор типов/модификаторов семантических
+// токенов LSP — используется только в fallback capabilities.initialize (наш
+// хаб отправляет такой же гибрид полей 3.17 и черновика 3.16, см.
+// HUB_CAPABILITIES на python-стороне; реальные серверы клиентскую легенду
+// игнорируют и кодируют токены собственным legend из InitializeResult)
+const STANDARD_TOKEN_TYPES = [
+  "namespace", "type", "class", "enum", "interface", "struct", "typeParameter",
+  "parameter", "variable", "property", "enumMember", "event", "function",
+  "method", "macro", "keyword", "modifier", "comment", "string", "number",
+  "regexp", "operator", "decorator",
+];
+const STANDARD_TOKEN_MODIFIERS = [
+  "documentation", "declaration", "definition", "static", "deprecated",
+  "abstract", "async", "modification", "readonly", "default", "imported",
+  "public", "private", "protected",
+];
+
+// vendored-patch (этап 5): легенда семантических токенов из capabilities
+// сервера; Monaco обязан использовать ровно тот же список tokenTypes/
+// tokenModifiers, которым сервер кодирует индексы в data (basedpyright и
+// clangd игнорируют клиентскую легенду — используют свою из InitializeResult)
+function extractSemanticLegend(
+  provider: any
+): monaco.languages.SemanticTokensLegend | null {
+  const legend = provider?.legend;
+  if (!legend || !Array.isArray(legend.tokenTypes) || legend.tokenTypes.length === 0) {
+    return null;
+  }
+  return {
+    tokenTypes: legend.tokenTypes.filter((t: unknown) => typeof t === "string"),
+    tokenModifiers: Array.isArray(legend.tokenModifiers)
+      ? legend.tokenModifiers.filter((m: unknown) => typeof m === "string")
+      : [],
+  };
 }
 
 class LspClient {
@@ -179,6 +216,23 @@ class LspClient {
               hover: { contentFormat: ["markdown", "plaintext"] },
               signatureHelp: {
                 signatureInformation: { documentationFormat: ["markdown", "plaintext"] },
+              },
+              // vendored-patch (этап 5): семантическая подсветка. Набор полей —
+              // гибрид LSP 3.17 (legend/tokenFormat) и черновика 3.16
+              // (tokenTypes/tokenModifiers/formats — их требует ruff на
+              // tower-lsp); серверы всё равно кодируют токены собственным
+              // legend из InitializeResult, его и берёт JS-провайдер
+              semanticTokens: {
+                dynamicRegistration: false,
+                requests: { range: false, full: { delta: false } },
+                tokenFormat: "relative",
+                multilineTokenSupport: false,
+                overlappingTokenSupport: false,
+                serverCancelSupport: false,
+                legend: { tokenTypes: STANDARD_TOKEN_TYPES, tokenModifiers: STANDARD_TOKEN_MODIFIERS },
+                tokenTypes: STANDARD_TOKEN_TYPES,
+                tokenModifiers: STANDARD_TOKEN_MODIFIERS,
+                formats: ["relative"],
               },
             },
             workspace: { didChangeConfiguration: {} },
@@ -434,6 +488,27 @@ class LspClient {
         )
       );
     }
+    // vendored-patch (этап 5): семантическая подсветка — тоже единственный
+    // провайдер на язык (первый по приоритету сервер с full-поддержкой);
+    // легенда берётся из InitializeResult этого же сервера
+    const semanticLegend = caps.semanticTokensProvider?.full
+      ? extractSemanticLegend(caps.semanticTokensProvider)
+      : null;
+    if (
+      semanticLegend &&
+      (this.manager === null || this.manager.claimProvider("semanticTokens", this.languageId, this))
+    ) {
+      this.providerDisposables.push(
+        createSemanticTokensProvider(
+          this.languageId,
+          () => this.currentConnection,
+          this.isConnectionValid.bind(this),
+          () => semanticLegend,
+          () => this.prependedData,
+          this.forceReconnect.bind(this)
+        )
+      );
+    }
     console.log(
       `Monaco providers registered for LSP server '${this.owner}' (${this.languageId})`
     );
@@ -633,6 +708,7 @@ class LspClient {
     // vendored-patch: освобождаем «права» на единственные провайдеры этого языка
     this.manager?.releaseProvider("signatureHelp", this.languageId, this);
     this.manager?.releaseProvider("definition", this.languageId, this);
+    this.manager?.releaseProvider("semanticTokens", this.languageId, this);
 
     // Then dispose of the LSP connection
     if (this.currentConnection) {
@@ -713,9 +789,10 @@ export class LspClientManager {
     }
   }
 
-  /** Единственный провайдер на язык (signatureHelp, definition) — за первым
-   * по приоритету сервером, который его поддерживает (заявка делается при
-   * регистрации; vendored-patch этапа 4 — обобщение с signatureHelp). */
+  /** Единственный провайдер на язык (signatureHelp, definition, semanticTokens)
+   * — за первым по приоритету сервером, который его поддерживает (заявка
+   * делается при регистрации; vendored-patch этапа 4 — обобщение с
+   * signatureHelp). */
   public claimProvider(kind: string, languageId: string, client: LspClient): boolean {
     const key = `${kind}:${languageId}`;
     const claimant = this.providerClaims.get(key);

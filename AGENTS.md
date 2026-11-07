@@ -48,8 +48,8 @@ Verify in this order: **ruff → pyright → tests → run the app**.
   `[tool.pytest.ini_options]` is in the **root** pyproject; tests live in
   `packages/pyqtp-core/tests/` (settings window) and `packages/pyqtp-ide/tests/`
   (LSP registry + live editor). Markers `live` (real LSP server processes) and `webengine`
-  (real QWebEngineView/Monaco) are deselected by default via `addopts` → 16 passed / 4 deselected;
-  run them with `uv run pytest -m 'live or webengine'` (~30 s, they work offscreen) or all 20 in one
+  (real QWebEngineView/Monaco) are deselected by default via `addopts` → 17 passed / 6 deselected;
+  run them with `uv run pytest -m 'live or webengine'` (~30 s, they work offscreen) or all 23 in one
   process with `uv run pytest -m ''`. Test-suite gotchas:
   - root `conftest.py` sets `QT_QPA_PLATFORM=offscreen` + `QTWEBENGINE_DISABLE_SANDBOX=1` at import
     and overrides `qapp` as a **session-scoped** fixture (pytest-qt's DESTROY_ON_POLICY would kill
@@ -66,7 +66,9 @@ Verify in this order: **ruff → pyright → tests → run the app**.
     leftover widgets (main window + KDDockWidgets wrappers) run in the end-of-session garbage
     collector over already-invalid C++ pointers — heap-corruption abort (134/139) **after** all
     tests passed. Standalone harnesses with the same lifecycle exit fine, so don't "fix" the
-    lifecycle; keep the hook.
+    lifecycle; keep the hook. `PYQTP_NO_OS_EXIT=1` skips the hook — for debugging real test
+    failures whose traceback prints after the hook (results are the same, the process may then
+    abort in Qt destructors).
 - Run the IDE: `uv run python ide.py -v` (run from `packages/pyqtp-ide/pyqtp/`; cwd is irrelevant
   since all members are installed editable). Core smoke app: `uv run python launcher.py` from
   `packages/pyqtp-core/pyqtp/`. Examples: `packages/pyqtp-core/examples/{central_dock,kddw_docs}`.
@@ -223,7 +225,13 @@ Verify in this order: **ruff → pyright → tests → run the app**.
   `LspClientManager` + `lsp_stack` message for multi-server stacks (stage 3.1, `lsp.ts`/`main.ts`);
   `createDefinitionProvider` (Location/LocationLink mapping) and generalized `claimProvider`
   single-owner registration for signatureHelp+definition, snippets gate `priority==0 &&
-  languageId=='python'` (stage 4);
+  languageId=='python'` (stage 4); semantic highlighting (stage 5):
+  `createSemanticTokensProvider` (`semanticTokens/full` → `Uint32Array` data verbatim,
+  legend from the server's own InitializeResult — servers ignore the client legend;
+  `claimProvider("semanticTokens")` single-owner; disabled when the model has
+  prepended data) + `extractSemanticLegend`/draft-3.16 hybrid capabilities in `lsp.ts`,
+  and `"semanticHighlighting.enabled": true` in `main.ts` defaultEditorOptions (built-in
+  standalone themes have it off → the feature never starts otherwise);
   python patch in `monaco.py` —
   `Monaco.__init__` takes an `lsp_host` param and no longer eagerly spawns
   `get_pylsp_host()` (lazy `_resolve_lsp_host()` fallback keeps standalone

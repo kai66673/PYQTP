@@ -518,3 +518,73 @@ export function createDefinitionProvider(
     },
   });
 }
+
+/**
+ * vendored-patch (этап 5): семантическая подсветка через
+ * textDocument/semanticTokens/full.
+ *
+ * Monaco сам разбирает «относительную» LSP-кодировку токенов (5 чисел на
+ * токен: deltaLine, deltaStartChar, length, tokenType, tokenModifiers) —
+ * данные из ответа сервера передаются как есть. Легенда берётся из
+ * InitializeResult конкретного сервера: basedpyright/clangd клиентскую
+ * легенду игнорируют и кодируют токены собственным legend (в HUB_CAPABILITIES
+ * на python-стороне — формальный гибрид полей 3.17 и черновика 3.16, его
+ * требует ruff на tower-lsp).
+ */
+export function createSemanticTokensProvider(
+  languageId: string,
+  getCurrentConnection: () => MessageConnection | null,
+  isConnectionValid: (connection: MessageConnection | null) => boolean,
+  getLegend: () => monaco.languages.SemanticTokensLegend,
+  getPrependedData: () => string | null,
+  forceReconnect: () => void
+): monaco.IDisposable {
+  return monaco.languages.registerDocumentSemanticTokensProvider(languageId, {
+    getLegend,
+    provideDocumentSemanticTokens: async (
+      model: monaco.editor.ITextModel,
+      _lastResultId: string | null,
+      token: { isCancellationRequested: boolean }
+    ) => {
+      const connection = getCurrentConnection();
+      if (!isConnectionValid(connection)) {
+        return null;
+      }
+      if (getPrependedData()) {
+        // префикс-заголоку соответствует сдвиг всех строк токенов; перекодировка
+        // относительных строк не поддерживается (этап 5) — подсветку отключаем
+        return null;
+      }
+
+      const validConnection = connection!;
+      try {
+        const result: any = await validConnection.sendRequest("textDocument/semanticTokens/full", {
+          textDocument: { uri: model.uri.toString() },
+        });
+        if (token.isCancellationRequested) {
+          return null;
+        }
+        if (!result || !Array.isArray(result.data) || result.data.length === 0) {
+          return null;
+        }
+        // результат отдаём целиком (delta-протокол клиентом не запрошен);
+        // resultId эхом возвращаем — Monaco использует его для инкрементальных
+        // перерисовок собственного кэша
+        return {
+          resultId: typeof result.resultId === "string" ? result.resultId : undefined,
+          data: new Uint32Array(result.data),
+        };
+      } catch (e) {
+        console.error("LSP semanticTokens/full failed:", e);
+        if (e instanceof Error && (e.message.includes("disposed") || e.message.includes("closed"))) {
+          console.warn("Connection was disposed during semanticTokens request, forcing reconnection");
+          forceReconnect();
+        }
+        return null;
+      }
+    },
+    releaseDocumentSemanticTokens: () => {
+      // серверного кэша по resultId у нас нет — освобождать нечего
+    },
+  });
+}
