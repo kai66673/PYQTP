@@ -173,6 +173,9 @@ function mapCompletionItem(
  * значение заголовка), addSnippets — добавлять наши python-сниппеты
  * (только приоритетный сервер python-стека: Monaco дублирует их в списке,
  * а в стеках других языков сниппеты python вообще не нужны — этап 4).
+ * vendored-patch (фикс авокомплита): flushDocumentChanges — сбросить
+ * дебаунс didChange перед запросом (Monaco дёргает провайдера по '.'
+ * быстрее дебаунса, иначе completion считается по устаревшему тексту).
  */
 export function createCompletionProvider(
   languageId: string,
@@ -181,6 +184,7 @@ export function createCompletionProvider(
   prependModelData: (model: monaco.editor.ITextModel) => string,
   getPrependedData: () => string | null,
   forceReconnect: () => void,
+  flushDocumentChanges: () => void,
   addSnippets: boolean = true
 ): monaco.IDisposable {
   return monaco.languages.registerCompletionItemProvider(languageId, {
@@ -195,6 +199,11 @@ export function createCompletionProvider(
 
       // At this point, connection is guaranteed to be valid and non-null
       const validConnection = connection!;
+
+      // vendored-patch (фикс авокомплита): сервер обязан получить напечатанный
+      // текст (включая '.' или начало слова) ДО completion-запроса — иначе
+      // basedpyright считает позиции по устаревшему документу
+      flushDocumentChanges();
 
       // Extract the current word being typed
       const wordAtPosition = model.getWordUntilPosition(position);
@@ -291,6 +300,8 @@ export function createCompletionProvider(
  * vendored-patch (этап 3.1): languageId — параметр, prependedData — геттер.
  * Регистрируется только одним экземпляром на язык (LspClientManager отдаёт
  * «право» первому серверу с signatureProvider по приоритету).
+ * vendored-patch (фикс авокомплита): flushDocumentChanges — сброс дебаунса
+ * didChange перед запросом (триггеры '(' ',' '=' — та же гонка, что у completion).
  */
 export function createSignatureHelpProvider(
   languageId: string,
@@ -299,6 +310,7 @@ export function createSignatureHelpProvider(
   prependModelData: (model: monaco.editor.ITextModel) => string,
   getPrependedData: () => string | null,
   forceReconnect: () => void,
+  flushDocumentChanges: () => void,
   onSignatureHelp: ((data: monaco.languages.SignatureHelp) => void) | null
 ): monaco.IDisposable {
   return monaco.languages.registerSignatureHelpProvider(languageId, {
@@ -313,6 +325,8 @@ export function createSignatureHelpProvider(
 
       // At this point, connection is guaranteed to be valid and non-null
       const validConnection = connection!;
+
+      flushDocumentChanges();
 
       // Adjust line for prepended data
       const prependedData = getPrependedData();
@@ -397,7 +411,8 @@ export function createHoverProvider(
   isConnectionValid: (connection: MessageConnection | null) => boolean,
   prependModelData: (model: monaco.editor.ITextModel) => string,
   getPrependedData: () => string | null,
-  forceReconnect: () => void
+  forceReconnect: () => void,
+  flushDocumentChanges: () => void
 ): monaco.IDisposable {
   return monaco.languages.registerHoverProvider(languageId, {
     provideHover: async (model: monaco.editor.ITextModel, position: monaco.Position) => {
@@ -410,6 +425,10 @@ export function createHoverProvider(
 
       // At this point, connection is guaranteed to be valid and non-null
       const validConnection = connection!;
+
+      // vendored-patch (фикс авокомплита): hover по свежаку после правки — без
+      // сброса дебаунса didChange сервер бы наводился на устаревший текст
+      flushDocumentChanges();
 
       // Adjust line for prepended data
       const prependedData = getPrependedData();
@@ -457,6 +476,8 @@ export function createHoverProvider(
  * для других файлов — берётся как есть. Регистрируется ровно один на язык
  * (как signatureHelp — LspClientManager отдаёт «право» первому серверу с
  * definitionProvider по приоритету, иначе Monaco показал бы дубли).
+ * vendored-patch (фикс авокомплита): flushDocumentChanges — сброс дебаунса
+ * didChange перед запросом (F12 сразу после набора текста).
  */
 export function createDefinitionProvider(
   languageId: string,
@@ -464,7 +485,8 @@ export function createDefinitionProvider(
   isConnectionValid: (connection: MessageConnection | null) => boolean,
   prependModelData: (model: monaco.editor.ITextModel) => string,
   getPrependedData: () => string | null,
-  forceReconnect: () => void
+  forceReconnect: () => void,
+  flushDocumentChanges: () => void
 ): monaco.IDisposable {
   return monaco.languages.registerDefinitionProvider(languageId, {
     provideDefinition: async (model: monaco.editor.ITextModel, position: monaco.Position) => {
@@ -475,6 +497,9 @@ export function createDefinitionProvider(
       }
 
       const validConnection = connection!;
+
+      flushDocumentChanges();
+
       const prependedData = getPrependedData();
       const line = adjustLineForPrependedData(position, prependedData);
       const character = position.column - 1;

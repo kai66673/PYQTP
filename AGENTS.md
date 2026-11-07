@@ -268,6 +268,14 @@ Verify in this order: **ruff → pyright → tests → run the app**.
   tab / fresh dock), reveal is deferred to the first `onDidLayoutChange` with a real
   viewport; pending is cleared by `set_text`/`setActiveEditor`; `editor.focus()` on
   every set_cursor (caret of the activated document must be visible);
+  autocomplete fix (stage 6.2) — `LspClient.flushDocumentChanges()` in `lsp.ts`
+  (clear the didChange debounce timer and send immediately), wired as a required
+  param into the 4 provider factories in `providers.ts`
+  (completion/signatureHelp/hover/definition) and called before every
+  `sendRequest`: Monaco fires providers on trigger chars ('.' '(') faster than
+  the 300 ms didChange debounce, so the server completed over stale text (no '.'
+  yet → no member suggestions); hub routing is sequential so the flushed
+  didChange always precedes the request;
   python patch in `monaco.py` —
   `Monaco.__init__` takes an `lsp_host` param and no longer eagerly spawns
   `get_pylsp_host()` (lazy `_resolve_lsp_host()` fallback keeps standalone

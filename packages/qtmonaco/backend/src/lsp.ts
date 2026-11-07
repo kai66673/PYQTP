@@ -357,6 +357,21 @@ class LspClient {
     }, DID_CHANGE_DEBOUNCE_MS);
   }
 
+  /**
+   * vendored-patch (фикс авокомплита): немедленная отправка накопленного
+   * didChange. Monaco реагирует на триггерные символы ('.', '(' ...) почти
+   * мгновенно, а дебаунс didChange — 300 мс: сервер получал устаревший текст,
+   * и completion/signatureHelp считались по документу без только что
+   * напечатанного символа («obj.» без точки → списка членов нет).
+   */
+  flushDocumentChanges() {
+    if (this.changeTimerId !== null) {
+      clearTimeout(this.changeTimerId);
+      this.changeTimerId = null;
+      this.sendDidChange();
+    }
+  }
+
   private sendDidChange() {
     if (!this.trackedModel || !this.initialized || !this.isConnectionValid(this.currentConnection)) {
       return;
@@ -439,6 +454,9 @@ class LspClient {
           this.prependModelData.bind(this),
           () => this.prependedData,
           this.forceReconnect.bind(this),
+          // vendored-patch (фикс авокомплита): сброс дебаунса didChange перед
+          // запросом — сервер обязан увидеть напечатанный '.' до completion
+          this.flushDocumentChanges.bind(this),
           // vendored-patch (этап 4): наши python-сниппеты подмешивает только
           // приоритетный сервер python-стека (в cpp-стеке их быть не должно)
           this.priority === 0 && this.languageId === "python"
@@ -457,6 +475,7 @@ class LspClient {
           this.prependModelData.bind(this),
           () => this.prependedData,
           this.forceReconnect.bind(this),
+          this.flushDocumentChanges.bind(this),
           this.onSignatureHelp
         )
       );
@@ -469,7 +488,8 @@ class LspClient {
           this.isConnectionValid.bind(this),
           this.prependModelData.bind(this),
           () => this.prependedData,
-          this.forceReconnect.bind(this)
+          this.forceReconnect.bind(this),
+          this.flushDocumentChanges.bind(this)
         )
       );
     }
@@ -484,7 +504,8 @@ class LspClient {
           this.isConnectionValid.bind(this),
           this.prependModelData.bind(this),
           () => this.prependedData,
-          this.forceReconnect.bind(this)
+          this.forceReconnect.bind(this),
+          this.flushDocumentChanges.bind(this)
         )
       );
     }

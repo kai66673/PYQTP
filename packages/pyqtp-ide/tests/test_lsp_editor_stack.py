@@ -129,7 +129,8 @@ JS_SUGGEST = """
   const items = model ? model.items : [];
   return JSON.stringify({
     items: items.length,
-    labels: items.slice(0, 120).map((s) => String(s.completion.label)),
+    // slice: members 'os.' — ~417 пунктов, срез должен покрывать полный список
+    labels: items.slice(0, 500).map((s) => String(s.completion.label)),
   });
 })()
 """
@@ -382,6 +383,68 @@ def test_clangd_diagnostics_goto_completion(editor_pair, qtbot) -> None:
 
     # пул процессов: clangd заведен
     assert any('clangd' in cmd for cmd in {key[0] for key in hub._instances})
+
+
+# --- completion по триггерному символу '.' (фикс гонки didChange) ---
+
+JS_DOT_SYNC = """
+(() => {
+  const ed = window.qtmonaco.editor;
+  ed.getModel().setValue('import os\\nos');
+  ed.focus();
+  ed.setPosition({ lineNumber: 2, column: 3 });
+  return 'SYNCED';
+})()
+"""
+
+JS_DOT_TYPE = """
+(() => {
+  // source='keyboard' принципиален: codeEditorWidget._type() fire'ит
+  // onDidType только при source==='keyboard' (Monaco 0.55), а SuggestModel
+  // перезапускает completion по триггерному символу '.' именно по onDidType;
+  // trigger('type') с произвольным source реальную клавиатуру НЕ имитирует
+  window.qtmonaco.editor.trigger('keyboard', 'type', { text: '.' });
+  return 'TYPED';
+})()
+"""
+
+
+def test_completion_member_after_typing_dot(editor_pair, qtbot) -> None:
+    """Атрибуты модуля при вводе '.': 'os' + набор '.' -> members os.
+
+    Регресс на гонку: Monaco дёргает completion по триггеру '.' быстрее
+    дебаунса didChange (300 мс). Без сброса дебаунса (flushDocumentChanges в
+    LspClient) запрос уходит серверу с текстом БЕЗ точки — basedpyright
+    считает позиции по устаревшему документу и members не отдаёт; больше
+    пересобрать список нечему (новых нажатий нет), список остаётся неверным.
+    """
+    _hub, widget = editor_pair(  # noqa: RUF059 — hub живёт в fixture до конца теста
+        'import os\nos\n', registry_json=BP_ONLY_REGISTRY,
+    )
+    wait_editor_ready(qtbot, widget)
+
+    assert run_js(widget, JS_DOT_SYNC) == 'SYNCED'
+    qtbot.wait(3000)  # сервер уже получил 'os' (дебаунс сработал в тишине)
+
+    assert run_js(widget, JS_DOT_TYPE) == 'TYPED'
+
+    def _member_list_ready() -> bool:
+        data = _suggest_labels(widget)
+        labels = [str(label) for label in data.get('labels', [])]
+        return data.get('items', 0) > 0 and any(
+            lab.lower().startswith('listdir') for lab in labels
+        )
+
+    wait_for(
+        qtbot,
+        _member_list_ready,
+        timeout=45.0,
+        poll=1.5,
+        message='basedpyright не дал os.listdir при вводе точки (гонка didChange)',
+    )
+    # список именно members: среди лейблов есть listdir и нет имени модуля os
+    labels = [str(label) for label in _suggest_labels(widget).get('labels', [])]
+    assert 'os' not in labels, f'похоже на completion не по точке: {labels[:20]}'
 
 
 # --- semanticTokens (этап 5): full-токены basedpyright -> раскраска view DOM ---
