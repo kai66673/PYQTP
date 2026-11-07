@@ -10,7 +10,13 @@ uv workspace of three `pyqtp`-namespace packages plus one vendored library:
   Monaco `QWebEngineView` + its own LSP-over-WebSocket stack; it is a workspace member installed
   editable as `qtmonaco`.
 
-Root is **not a git repository** (only `packages/qtmonaco` has a `.git`). There is no CI.
+The git repository is at the **root** (branch `main`, no CI). `packages/qtmonaco` is vendored as a
+**squash-subtree**: base = upstream tag `v0.11.0` (commit `5b21da6`, one squashed commit), local
+patches = the next commit; there is no nested `.git` anymore. Pull upstream updates with
+`git subtree pull --prefix=packages/qtmonaco https://github.com/bec-project/qtmonaco.git <vX.Y.Z> --squash`
+(upstream tags are `v`-prefixed). Gotcha: `git apply` run **inside** `packages/qtmonaco` silently
+prints "Skipped patch" for every file (subdirectory prefix scoping) — apply patches from the repo
+root with `git apply --directory=packages/qtmonaco <patch>`.
 
 ## Commands
 
@@ -21,8 +27,9 @@ Python is pinned to 3.11 (`.python-version`); core/ide require `~=3.11.0` and th
 `; sys_platform == 'linux'` marker so win32 (listed in `[tool.uv] environments`) can re-resolve —
 the wheel has no Windows build.
 
-qtmonaco's JS frontend is **prebuilt into `packages/qtmonaco/qtmonaco/js_build/`** (31 MB, required
-at runtime; not in uv). Rebuild after touching `backend/` TS:
+qtmonaco's JS frontend lives in `packages/qtmonaco/qtmonaco/js_build/` (31 MB, required at
+runtime; not in uv, **not in git** — `**/js_build/` is gitignored, so build it once after a fresh
+clone). Rebuild after cloning or touching `backend/` TS:
 `cd packages/qtmonaco/backend && npm install && npm run build && mkdir -p ../qtmonaco/js_build && cp -r dist/* ../qtmonaco/js_build/`
 (same steps as upstream CI; node ≥ 20 works, tested on mise node 26 + vite 6).
 
@@ -173,8 +180,10 @@ Verify in this order: **ruff → pyright → run the app** (no test suite exists
   different implementation (ws-hub), not a restoration of that stack. The extension→Monaco-language
   mapping the old stack shared now lives (slimmed to
   a flat dict) in `pyqtp/web/monaco_languages.py`.
-- `packages/qtmonaco/` is a vendored workspace member (own upstream `.git` — repo-root changes are
-  not committed there). Local patches so far: `pyside6` extra in its pyproject relaxed to
+- `packages/qtmonaco/` is a vendored workspace member (squash-subtree of upstream — see the git
+  note at the top; there is no nested `.git`, so its changes are committed in the main repo
+  normally, and the local patches below are already committed there). Local patches so far:
+  `pyside6` extra in its pyproject relaxed to
   `PySide6>=6.6.2` (upstream `>=6.8` conflicts with `build_kddw` pin `pyside6==6.6.2`); TS LSP
   patches (marked `vendored-patch` in code) — document lifecycle `didOpen`/debounced `didChange`/
   `didClose` moved into `LspClient` (`lsp.ts`, incl. real initialize capabilities and `setModel()`
