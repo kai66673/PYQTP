@@ -15,6 +15,7 @@ dependencies = [
 dev = [
     "pytest",
     "pytest-cov",
+    "pytest-qt",
     "sphinx",
     "sphinx-pyproject",
     "sphinx-rtd-theme",

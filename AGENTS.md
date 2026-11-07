@@ -33,15 +33,40 @@ clone). Rebuild after cloning or touching `backend/` TS:
 `cd packages/qtmonaco/backend && npm install && npm run build && mkdir -p ../qtmonaco/js_build && cp -r dist/* ../qtmonaco/js_build/`
 (same steps as upstream CI; node ≥ 20 works, tested on mise node 26 + vite 6).
 
-Verify in this order: **ruff → pyright → run the app** (no test suite exists; pytest is only a dev dep).
+Verify in this order: **ruff → pyright → tests → run the app**.
 
 - `uv run ruff check <path>` — configs live per package (`[tool.ruff]` in each package's pyproject).
   **`fix = true` is set, so a plain `ruff check` rewrites files**; use `--no-fix` to only report.
   Baseline failure is expected: 13 errors repo-wide (10 in the pyqtp packages, 3 in `qtmonaco`).
-  Ruff only lints `pyqtp/**/*.py` — `examples/` are not linted.
+  Ruff only lints `pyqtp/**/*.py` — `examples/` and `tests/` are not linted.
 - `cd packages && uv run pyright` — uses `packages/pyrightconfig.json` (`venvPath: ".."`), so run it
   from `packages/`. Baseline: 18 pre-existing errors (stale `bcad.*` imports + missing `PySide6QtAds`).
+  The `tests/` dirs sit inside the checked package dirs, so they must stay type-clean (helper modules
+  importable as top-level modules only from their own dir — keep shared helpers inside one test file).
   Single file: `uv run pyright pyqtp-common/pyqtp/theme/theme.py`.
+- Tests: `uv run pytest` (`pytest` + `pytest-qt` are dev deps of core/ide). Config
+  `[tool.pytest.ini_options]` is in the **root** pyproject; tests live in
+  `packages/pyqtp-core/tests/` (settings window) and `packages/pyqtp-ide/tests/`
+  (LSP registry + live editor). Markers `live` (real LSP server processes) and `webengine`
+  (real QWebEngineView/Monaco) are deselected by default via `addopts` → 16 passed / 4 deselected;
+  run them with `uv run pytest -m 'live or webengine'` (~30 s, they work offscreen) or all 20 in one
+  process with `uv run pytest -m ''`. Test-suite gotchas:
+  - root `conftest.py` sets `QT_QPA_PLATFORM=offscreen` + `QTWEBENGINE_DISABLE_SANDBOX=1` at import
+    and overrides `qapp` as a **session-scoped** fixture (pytest-qt's DESTROY_ON_POLICY would kill
+    QApplication between tests). GUI fixtures must depend on `qapp`, else `QMainWindow.__init__`
+    qFatal-aborts the process with no Python exception to catch.
+  - PySide6 6.6 returns JS booleans from `runJavaScript` as `''` (both `true` and `false`!) — every
+    JS predicate in tests must return a string marker (`'READY'`) and compare on the Python side.
+  - pytest-qt 4.5 `waitUntil` has no `retry_interval` — expensive predicates use the local
+    `wait_for(...)` polling helper.
+  - pytest 8 applies `testpaths` only when the invocation dir == rootdir, so `addopts` also carries
+    `--ignore-glob=*/qtmonaco/tests/*` and `--ignore-glob=qtmonaco/tests/*`; the vendored qtmonaco
+    tests must never be collected (they error at import).
+  - `pytest_sessionfinish` in the root conftest does `os._exit(exitstatus)`: Qt/C++ destructors of
+    leftover widgets (main window + KDDockWidgets wrappers) run in the end-of-session garbage
+    collector over already-invalid C++ pointers — heap-corruption abort (134/139) **after** all
+    tests passed. Standalone harnesses with the same lifecycle exit fine, so don't "fix" the
+    lifecycle; keep the hook.
 - Run the IDE: `uv run python ide.py -v` (run from `packages/pyqtp-ide/pyqtp/`; cwd is irrelevant
   since all members are installed editable). Core smoke app: `uv run python launcher.py` from
   `packages/pyqtp-core/pyqtp/`. Examples: `packages/pyqtp-core/examples/{central_dock,kddw_docs}`.

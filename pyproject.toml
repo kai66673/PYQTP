@@ -25,6 +25,26 @@ reportUnusedCallResult = false
 reportIncompatibleVariableOverride = false
 typeCheckingMode = "standard"
 
+[tool.pytest.ini_options]
+# Тесты — в каталогах tests пакетов; vendored packages/qtmonaco/tests не собираем.
+testpaths = [
+    "packages/pyqtp-core/tests",
+    "packages/pyqtp-ide/tests",
+]
+markers = [
+    "live: требует живых внешних процессов (LSP-серверы), по умолчанию выключен",
+    "webengine: требует QWebEngineView (реальный редактор Monaco), по умолчанию выключен",
+]
+addopts = [
+    "-m", "not live and not webengine",
+    # testpaths применяются только при запуске из корня репозитория; эти маски
+    # отсекают тесты вендоренного qtmonaco при запуске из любой директории
+    # (--ignore-glob сопоставляется с относительным путём, поэтому нужно
+    # и «глубокий», и «верхнеуровневый» варианты)
+    "--ignore-glob=*/qtmonaco/tests/*",
+    "--ignore-glob=qtmonaco/tests/*",
+]
+
 [tool.uv.workspace]
 members = [
   "packages/pyqtp-common",
