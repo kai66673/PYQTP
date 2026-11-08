@@ -55,11 +55,12 @@ Verify in this order: **ruff → pyright → tests → run the app**.
    + stage-9.3 project search (test_project_search.py: argv/парсер юниты без GUI и без бинаря rg + live offscreen с живым rg, skipif без rg)
    + stage-9.4 workspace/symbol (test_workspace_symbol.py: юниты разбора ответа/гейтов/`sample_file_for` без GUI + live hub с basedpyright + live offscreen диалог)
    + stage-9.5 project fileops (test_project_fileops.py: юниты fileops/file_rename без GUI + offscreen меню/обработчики с фейковым хабом + live basedpyright end-to-end rename)
-   + stage-9.6 project session (test_project_session.py: юниты project_session без GUI + offscreen вкладки/сессия с фейковой вьюхой без WebEngine)). Markers `live`
+   + stage-9.6 project session (test_project_session.py: юниты project_session без GUI + offscreen вкладки/сессия с фейковой вьюхой без WebEngine)
+   + stage-9.6B project settings (test_project_settings.py: юниты project_settings/coerce/merge без GUI + offscreen двухслойность темы/редактора/LSP с фейковым edit_widget-рекордером без WebEngine)). Markers `live`
   (real LSP server processes) and
-  `webengine` (real QWebEngineView/Monaco) are deselected by default via `addopts` → 126 passed / 34
+  `webengine` (real QWebEngineView/Monaco) are deselected by default via `addopts` → 147 passed / 34
   deselected; run them with `uv run pytest -m 'live or webengine'` (~2 min, they work offscreen) or
-  all 160 in one
+  all 181 in one
   process with `uv run pytest -m ''` (~2 min, full run keeps passing despite `os._exit` in
   `pytest_sessionfinish` eating the summary line — count the dots; NB the stage81
   document-symbols/document-highlight webengine tests are cold-start flaky under full-suite
@@ -335,6 +336,43 @@ Verify in this order: **ruff → pyright → tests → run the app**.
    сужается хелпером `fake_view()` (`document_view()` возвращает Optional).
    Per-project раскладка дока отложена (глобальная уже в
    `MainWindowKDD/dockState`).
+   Настройки проекта (этап 9.6B1): чистый `project_control/project_settings.py`
+   — оверлей `{секция: {ключ: значение}}` в `<root>/.pyqtp/settings.json`
+   (секции `appearance`/`editor`/`lsp`, ключи `theme_name`/`EditorOptions`-ключи/
+   `registry_json`); `parse_overlay` недоедливый (не-словари и пустые секции
+   вычищаются, неизвестные секции сохраняются при правках), запись атомарная,
+   пустой оверлей снимает файл и пустой `.pyqtp/` (не трогая `session.json`),
+   `overlay_set(None)` снимает ключ. Проектное перекрытие СТАРШЕ настроек
+   приложения, но правки приложения его НЕ «пробивают», а `settings_write`
+   НЕ «утаскивает» проектные значения в QSettings (общее правило двухслойности):
+   тема — `ThemeMainWindow.theme_app_name` + хуки `handle_theme_switch`
+   (уголковый комбик: при активном проектном перекрытии пишет в слой проекта —
+   `IdeMainWindow` переопределяет; core-версия = `theme_set_app`) и
+   `theme_on_app_changed` (IDE пропускает apply, пока тему держит проект;
+   `theme_settings_write` пишет `theme_app_name`); редактор —
+   `DocumentManager.editor_ux_options()` = effective (QSettings +
+   `merge_editor_ux_options` секции `editor`, битые значения молча игнорируются
+   через `coerce_editor_ux_value`) vs `editor_ux_options_app()`, широкое
+   переприменение — `broadcast_effective_editor_ux_options()`; LSP-реестр —
+   `LspHub._registry_app_json/_registry_project_json` + `_effective_registry`
+   (проект > приложение > дефолт, битый слой раскрывается в нижележащий),
+   `registry_app_json()` для страницы, `registry_apply_json/reset` трогают
+   только слой приложения, `registry_set_project_overlay(text|None)` — от
+   ProjectControl. Страницы настроек грузят СЛОЙ ПРИЛОЖЕНИЯ (`theme_app_name`/
+   `editor_ux_options_app`/`registry_app_json`) — 9.6B2 (селектор области в
+   окне) ещё нет. Запись строгая: `ProjectControl.project_settings_set/reset`
+   валидируют секцию/ключ/значение (`ValueError`/`TypeError`; `font_size`-не
+   строка -> TypeError, вне диапазона -> ValueError), затем файл -> состояние
+   -> `_apply_project_layers()` (тема override-или-откат -> broadcast опций ->
+   LSP overlay) -> emit `project_settings_changed`; применение при старте — в
+   `setup_views()` ДО restore сессии, в рантайме — в `open_project()` до эмита
+   корня, снятие — в `close_project()` после сохранения сессии (файл на диске
+   при закрытии не трогается). Console-API `project_settings_show/set/reset`.
+   В offscreen-тестах редактор фейкается атрибутом `edit_widget` вьюхи
+   (`_apply_editor_ux_options` берёт его через getattr) с рекордерами
+   `options_calls`/`theme_calls`; у PySide6 6.6-стабов `findChild` НЕ generic —
+   тип сужать `isinstance`, а не `is not None` (в core-тестах это не видно —
+   там `wnd` без аннотации -> Any).
 
 ## Runtime gotchas
 

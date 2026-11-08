@@ -25,11 +25,13 @@ from pyqtp.controls.doc_control.workspace_edit import (
     rename_file,
 )
 from pyqtp.controls.project_control.project_session import SessionData
+from pyqtp.controls.project_control.project_settings import SECTION_EDITOR
 from pyqtp.utils.action import Action
 from pyqtp.utils.priority_menu import PriorityMenu
 from pyqtp.views.monaco_document_view import MonacoDocumentView
 from pyqtp.web.editor_options import (
     DEFAULT_EDITOR_UX_OPTIONS,
+    merge_editor_ux_options,
     read_editor_ux_options,
     resolve_monaco_theme,
     to_monaco_options,
@@ -38,8 +40,8 @@ from pyqtp.web.editor_options import (
 )
 
 if TYPE_CHECKING:
-    from pyqtp.base.base_main_window import BaseMainWindow
     from pyqtp.base.docking_system.base_dock_widget import BaseDockWidget
+    from pyqtp.main_wnd.ide_main_window import IdeMainWindow
     from pyqtp.theme.theme import Theme
 
 
@@ -51,7 +53,7 @@ med_log = logging.getLogger('bcad.med')
 
 
 class DocumentManager(BaseControl):
-    _main_wnd: BaseMainWindow
+    _main_wnd: IdeMainWindow
     toolbar: QToolBar
 
     _last_open_dir: Path
@@ -143,22 +145,46 @@ class DocumentManager(BaseControl):
         self.file_menu.addAction(self.action_open_doc, priority=5)
         self.file_menu.addAction(self.action_save_doc, priority=6)
 
-    # --- UX-настройки редактора (этап 7, страница «Редактор») ---
+    # --- UX-настройки редактора (этап 7, страница «Редактор»; два слоя
+    #     с этапом 9.6B: QSettings приложения + проектное перекрытие
+    #     .pyqtp/settings.json) ---
 
-    def editor_ux_options(self) -> dict[str, Any]:
-        """Текущие логические UX-настройки редактора (источник — QSettings)."""
+    def editor_ux_options_app(self) -> dict[str, Any]:
+        """UX-настройки редактора в СЛОЕ НАСТРОЕК ПРИЛОЖЕНИЯ (QSettings,
+        без проектных перекрытий) — для страницы «Редактор».
+        """
         return read_editor_ux_options(self._main_wnd.settings)
 
+    def editor_ux_options(self) -> dict[str, Any]:
+        """ЭФФЕКТИВНЫЕ UX-настройки редактора: слой приложения + поключевой
+        merge проектного перекрытия (этап 9.6B, для открытий/применений).
+        """
+        options = read_editor_ux_options(self._main_wnd.settings)
+        merge_editor_ux_options(
+            options,
+            self._main_wnd.project_ctrl.project_settings_section(SECTION_EDITOR),
+        )
+        return options
+
     def apply_editor_ux_options(self, options: dict[str, Any]) -> None:
-        """Валидирует, сохраняет в QSettings и применяет к всем открытым
-        редакторам.
+        """Валидирует, сохраняет в слой приложения (QSettings) и применяет
+        к открытым редакторам.
 
         При некорректных значениях бросает ValueError/TypeError (окно
-        настроек покажет ошибку, источник не будет тронут).
+        настроек покажет ошибку, источник не будет тронут). Открытым
+        редакторам доводятся ЭФФЕКТИВНЫЕ значения — правка слоя приложения
+        не «пробивает» проектное перекрытие (этап 9.6B).
         """
         validate_editor_ux_options(options)  # ValueError/TypeError до записи
         write_editor_ux_options(self._main_wnd.settings, options)
         self._main_wnd.settings.sync()
+        self.broadcast_effective_editor_ux_options()
+
+    def broadcast_effective_editor_ux_options(self) -> None:
+        """Переприменяет ЭФФЕКТИВНЫЕ UX-настройки всем открытым редакторам
+        (смена/снятие проектного перекрытия в рантайме, этап 9.6B).
+        """
+        options = self.editor_ux_options()
         monaco_payload = to_monaco_options(options)
         monaco_theme = resolve_monaco_theme(
             options, app_is_dark=self._main_wnd.theme_manager.current_theme.is_dark

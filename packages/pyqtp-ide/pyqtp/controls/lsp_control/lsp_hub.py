@@ -489,6 +489,13 @@ class LspHub(BaseControl):
         self._instances: dict[tuple[str, str], _ServerInstance] = {}
         self._conn_seq = itertools.count(1)
         self._registry: LspRegistry = LspRegistry.default()
+        # два слоя реестра (этап 9.6B): _registry_app_json — значение из
+        # настроек приложения (QSettings, '' — дефолт), _registry_project_json —
+        # проектное перекрытие из .pyqtp/settings.json (None — нет);
+        # _registry — эффективный. settings_write пишет слой приложения, а не
+        # эффективный реестр, чтобы перекрытие проекта не «утекало» в QSettings
+        self._registry_app_json = ''
+        self._registry_project_json: str | None = None
         # workspace/symbol (остаток этапа 8): поколение запроса — запоздалые
         # ответы старых запросов не доходят до колбэка; кэш образцовых файлов
         # root_uri -> [(spec, sample_uri)] (сбрасывается при смене реестра)
@@ -500,19 +507,10 @@ class LspHub(BaseControl):
 
     def settings_read(self, **kwargs: Any) -> None:
         super().settings_read(**kwargs)
-        raw = cast('str', self._main_wnd.settings.value(
+        self._registry_app_json = cast('str', self._main_wnd.settings.value(
             f'{self.key}/registry_json', '', str
         ))
-        if not raw:
-            return
-        try:
-            self._registry = LspRegistry.from_json(raw)
-        except (TypeError, ValueError) as exc:
-            srv_log.error(
-                'Некорректная конфигурация LSP-реестра в настройках — '
-                'используются значения по умолчанию: %s', exc,
-            )
-            return
+        self._reapply_effective_registry()
         summary = '; '.join(
             f'{language}: '
             + (
@@ -527,14 +525,55 @@ class LspHub(BaseControl):
 
     def settings_write(self) -> None:
         super().settings_write()
-        # Пишем конфиг только если он отличается от дефолтного (не мусорить
-        # в настройках); при сбросе на дефолт — чистим ключ.
-        if self._registry.to_dict() != LspRegistry.default().to_dict():
-            self._main_wnd.settings.setValue(
-                f'{self.key}/registry_json', self._registry.to_json()
-            )
-        else:
+        # Пишем слой настроек приложения, а НЕ эффективный реестр: проектное
+        # перекрытие (.pyqtp/settings.json) не должно «утекать» в QSettings.
+        # Чистим ключ, если слой пуст/равен дефолту/битый (не мусорить).
+        text = self._registry_app_json
+        if not text:
             self._main_wnd.settings.remove(f'{self.key}/registry_json')
+            return
+        try:
+            parsed = LspRegistry.from_json(text)
+        except (TypeError, ValueError):
+            self._main_wnd.settings.remove(f'{self.key}/registry_json')
+            return
+        if parsed.to_dict() == LspRegistry.default().to_dict():
+            self._main_wnd.settings.remove(f'{self.key}/registry_json')
+        else:
+            self._main_wnd.settings.setValue(
+                f'{self.key}/registry_json', text
+            )
+
+    ###############################
+    # Реестр серверов: два слоя (этап 9.6B) #
+
+    def _effective_registry(self) -> LspRegistry:
+        """Эффективный реестр: проектное перекрытие > слой приложения > дефолт.
+
+        Битый JSON слоя логируется и раскрывается в слой ниже (применение
+        настроек проекта не должно ронять IDE).
+        """
+        for source, label in (
+            (self._registry_project_json, 'проектное перекрытие'),
+            (self._registry_app_json, 'настройки приложения'),
+        ):
+            if not source:
+                continue
+            try:
+                return LspRegistry.from_json(source)
+            except (TypeError, ValueError) as exc:
+                srv_log.error(
+                    'Некорректная конфигурация LSP-реестра (%s) — '
+                    'используем слой ниже: %s', label, exc,
+                )
+        return LspRegistry.default()
+
+    def _reapply_effective_registry(self) -> None:
+        """Пересобирает эффективный реестр из слоёв (кэш образцовых файлов
+        workspace/symbol держит ссылки на старые специ — сбрасываем).
+        """
+        self._registry = self._effective_registry()
+        self._wsym_samples.clear()
 
     def setup_relations(self) -> None:
         super().setup_relations()
@@ -563,26 +602,58 @@ class LspHub(BaseControl):
     # Публичный API для контролов/вью #
 
     def registry_json(self) -> str:
-        """Текущая конфигурация реестра серверов (JSON в формате ``lsp_registry``,
-        он же лежит в QSettings по ключу ``<key>/registry_json``).
+        """ЭФФЕКТИВНАЯ конфигурация реестра серверов (с учётом проектного
+        перекрытия; JSON в формате ``lsp_registry``). Для редактирования
+        слоя приложения используй ``registry_app_json``.
         """
         return self._registry.to_json()
 
-    def registry_apply_json(self, text: str) -> None:
-        """Заменить реестр серверов из JSON-строки (``ValueError`` при битом
-        конфиге, реестр при этом не меняется). Применяется к новым
-        подключениям редакторов; уже поднятые процессы серверов живут до
-        ``shutdown`` IDE.
+    def registry_app_json(self) -> str:
+        """Конфигурация реестра в СЛОЕ НАСТРОЕК ПРИЛОЖЕНИЯ (без проектных
+        перекрытий; пустой ключ раскрывается в дефолтный JSON).
         """
-        self._registry = LspRegistry.from_json(text)
-        self._wsym_samples.clear()
-        srv_log.info('LSP реестр применён: %s', ', '.join(self._registry.languages))
+        if self._registry_app_json:
+            return self._registry_app_json
+        return LspRegistry.default().to_json()
+
+    def registry_apply_json(self, text: str) -> None:
+        """Заменить реестр серверов в СЛОЕ ПРИЛОЖЕНИЯ из JSON-строки
+        (``ValueError`` при битом конфиге, слой при этом не меняется).
+        Проектное перекрытие, если оно задано, остаётся старше. Применяется
+        к новым подключениям редакторов; уже поднятые процессы серверов
+        живут до ``shutdown`` IDE.
+        """
+        LspRegistry.from_json(text)  # валидация до мутации состояния
+        self._registry_app_json = text
+        self._reapply_effective_registry()
+        srv_log.info(
+            'LSP реестр применён (слой приложения): %s',
+            ', '.join(self._registry.languages),
+        )
 
     def registry_reset(self) -> None:
-        """Вернуть реестр серверов по умолчанию."""
-        self._registry = LspRegistry.default()
-        self._wsym_samples.clear()
-        srv_log.info('LSP реестр сброшен на значения по умолчанию')
+        """Вернуть реестр серверов по умолчанию в СЛОЕ ПРИЛОЖЕНИЯ
+        (проектное перекрытие, если оно есть, остаётся в силе).
+        """
+        self._registry_app_json = ''
+        self._reapply_effective_registry()
+        srv_log.info(
+            'LSP реестр сброшен на значения по умолчанию (слой приложения)'
+        )
+
+    def registry_set_project_overlay(self, text: str | None) -> None:
+        """Проектное перекрытие реестра из ``.pyqtp/settings.json``
+        (``None`` — перекрытия нет, эффективный реестр = слой приложения).
+        Битое значение логируется, используется слой ниже.
+        """
+        if text is not None and not isinstance(text, str):
+            srv_log.error(
+                'Проектное перекрытие LSP-реестра должно быть JSON-строкой — '
+                'игнорируем'
+            )
+            text = None
+        self._registry_project_json = text
+        self._reapply_effective_registry()
 
     def ws_host_for(self, file_uri: str) -> str:
         """Хост+путь для WebSocket-подключения к хабу по uri файла (первый

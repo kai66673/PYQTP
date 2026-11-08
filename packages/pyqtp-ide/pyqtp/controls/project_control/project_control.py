@@ -11,6 +11,7 @@ from PySide6.QtGui import QIcon, QKeySequence
 from PySide6.QtWidgets import QFileDialog, QInputDialog, QLineEdit, QMessageBox
 
 from pyqtp.controls.base_control import BaseControl
+from pyqtp.controls.lsp_control.lsp_registry import LspRegistry
 from pyqtp.controls.project_control.project_fileops import (
     ProjectOpError,
     create_entry,
@@ -23,6 +24,17 @@ from pyqtp.controls.project_control.project_session import (
     read_session,
     write_session,
 )
+from pyqtp.controls.project_control.project_settings import (
+    KEY_REGISTRY_JSON,
+    KEY_THEME_NAME,
+    KNOWN_SECTIONS,
+    SECTION_APPEARANCE,
+    SECTION_EDITOR,
+    SECTION_LSP,
+    overlay_set,
+    read_project_settings,
+    write_project_settings,
+)
 from pyqtp.controls.project_control.quick_open import iter_project_files
 from pyqtp.controls.project_control.quick_open_dialog import QuickOpenDialog
 from pyqtp.controls.project_control.workspace_symbol_dialog import (
@@ -32,6 +44,10 @@ from pyqtp.utils.action import Action
 from pyqtp.utils.priority_menu import PriorityMenu
 from pyqtp.views.project_search_view import ProjectSearchView
 from pyqtp.views.project_tree_view import ProjectTreeView
+from pyqtp.web.editor_options import (
+    DEFAULT_EDITOR_UX_OPTIONS,
+    coerce_editor_ux_value,
+)
 
 if TYPE_CHECKING:
     from pyqtp.controls.project_control.project_search import SearchMatch
@@ -74,10 +90,16 @@ class ProjectControl(BaseControl):
     search_view: ProjectSearchView | None
 
     project_root_changed = Signal(object)  # Path | None
+    # настройки проекта (этап 9.6B): оверлей был загружен/сменён/снят и
+    # слои уже переприменены
+    project_settings_changed = Signal()
 
     def __init__(self) -> None:
         super().__init__()
         self._project_root: Path | None = None
+        # загруженный оверлей настроек проекта {секция: {ключ: значение}}
+        # (пустой — проект без .pyqtp/settings.json или проект не открыт)
+        self._project_settings: dict[str, dict[str, Any]] = {}
         self.tree_view = None
 
         self.action_open_folder = Action(
@@ -194,6 +216,10 @@ class ProjectControl(BaseControl):
                 'workspace_symbols_show': self._show_workspace_symbols,
                 # снимок сессии (пустой, если проект не открыт) — этап 9.6
                 'project_session_show': self.session_snapshot,
+                # настройки проекта (слой перекрытий, этап 9.6B)
+                'project_settings_show': self.project_settings_get,
+                'project_settings_set': self.project_settings_set,
+                'project_settings_reset': self.project_settings_reset,
             }
         )
 
@@ -239,6 +265,11 @@ class ProjectControl(BaseControl):
             search_view.set_project_root(self._project_root)
             self.action_close_folder.setEnabled(True)
             self._start_scan()
+            # настройки проекта (этап 9.6B): поднимаем оверлей ДО restore
+            # сессии и до эмита корня — тема/опции редакторов должны быть
+            # уже эффективными к моменту открытия вкладок
+            self._load_project_settings(self._project_root)
+            self._apply_project_layers()
             # сессия проекта (этап 9.6): восстанавливаем вкладки, сохранённые
             # при последнем закрытии этого проекта
             self._restore_project_session(self._project_root)
@@ -287,6 +318,11 @@ class ProjectControl(BaseControl):
         self._project_root = resolved
         self.action_close_folder.setEnabled(True)
         self._persist_root()
+        # настройки проекта (этап 9.6B): читаем оверлей и переприменяем слои
+        # до эмита корня — restore сессии в _on_root_for_scan откроет вкладки
+        # уже с проектными настройками
+        self._load_project_settings(resolved)
+        self._apply_project_layers()
         self.project_root_changed.emit(resolved)
         prj_log.info('Открыт проект: %s', resolved)
         return True
@@ -297,6 +333,11 @@ class ProjectControl(BaseControl):
             return False
         # сначала сохраняем сессию уходящего проекта (этап 9.6)
         self._save_project_session()
+        # настройки проекта (этап 9.6B): снимаем оверлей и откатываем слои
+        # к настройкам приложения (файл .pyqtp/settings.json на диске живёт
+        # с проектом и не трогается)
+        self._project_settings = {}
+        self._apply_project_layers()
         root = self._project_root
         self._project_root = None
         self.action_close_folder.setEnabled(False)
@@ -499,6 +540,164 @@ class ProjectControl(BaseControl):
         prj_log.info(
             'Сессия проекта восстановлена: %d документ(ов), активный: %s',
             len(session.docs), session.active or '—',
+        )
+
+    ######################################################
+    # Настройки проекта (этап 9.6B, .pyqtp/settings.json) #
+
+    def project_settings_get(self) -> dict[str, dict[str, Any]]:
+        """Копия текущего загруженного оверлея проекта (пустой — нет слоя)."""
+        return {
+            name: dict(values) for name, values in self._project_settings.items()
+        }
+
+    def project_settings_section(self, name: str) -> dict[str, Any]:
+        """Копия перекрытий одной секции (пустой — нет перекрытий).
+
+        Точка входа для владельцев настроек: опции редактора читают
+        секцию ``editor`` из DocumentManager, тема и LSP-реестр применяются
+        централизованно в ``_apply_project_layers``.
+        """
+        values = self._project_settings.get(name)
+        return dict(values) if values else {}
+
+    def theme_provided_by_project(self) -> bool:
+        """Держит ли проектный оверлей эффективную тему приложения."""
+        values = self._project_settings.get(SECTION_APPEARANCE)
+        if not values:
+            return False
+        theme_name = values.get(KEY_THEME_NAME)
+        return (
+            isinstance(theme_name, str)
+            and theme_name in self._main_wnd.theme_manager.theme_names
+        )
+
+    def project_settings_set(
+        self, section: str, key: str, value: Any
+    ) -> None:
+        """Задаёт (``value is None`` — снимает) один ключ проектного оверлея.
+
+        ``ValueError``/``TypeError`` при открытом отсутствии проекта,
+        неизвестной секции/ключе и испорченном значении (запись строгая,
+        чтение недоедливое); после успеха — запись файла, перечитывание
+        состояния, переприменение всех слоёв и emit
+        ``project_settings_changed``.
+        """
+        if self._project_root is None:
+            error_message = 'Проект не открыт — настройки проекта недоступны'
+            raise ValueError(error_message)
+        self._validate_project_setting(section, key, value)
+        updated = overlay_set(self._project_settings, section, key, value)
+        try:
+            write_project_settings(self._project_root, updated)
+        except OSError as exc:
+            error_message = f'Не удалось записать настройки проекта: {exc}'
+            raise ValueError(error_message) from exc
+        self._project_settings = updated
+        self._apply_project_layers()
+        self.project_settings_changed.emit()
+
+    def project_settings_reset(self, section: str | None = None) -> None:
+        """Снимает оверлей проекта целиком или одну секцию.
+
+        ``ValueError`` при незакрытом проекте/неизвестной секции; файл на
+        диске при пустом результате удаляется (см. ``write_project_settings``).
+        """
+        if self._project_root is None:
+            error_message = 'Проект не открыт — настройки проекта недоступны'
+            raise ValueError(error_message)
+        if section is not None and section not in KNOWN_SECTIONS:
+            error_message = f'Неизвестная секция настроек: {section}'
+            raise ValueError(error_message)
+        updated: dict[str, dict[str, Any]] = {
+            name: dict(values)
+            for name, values in self._project_settings.items()
+            if section is None or name != section
+        }
+        try:
+            write_project_settings(self._project_root, updated)
+        except OSError as exc:
+            error_message = f'Не удалось записать настройки проекта: {exc}'
+            raise ValueError(error_message) from exc
+        self._project_settings = updated
+        self._apply_project_layers()
+        self.project_settings_changed.emit()
+
+    def _validate_project_setting(
+        self, section: str, key: str, value: Any
+    ) -> None:
+        """Валидация записываемого значения (для console-API/окна настроек).
+
+        Бросает ``ValueError``/``TypeError`` с человекочитаемым текстом.
+        """
+        if section not in KNOWN_SECTIONS:
+            error_message = f'Неизвестная секция настроек: {section}'
+            raise ValueError(error_message)
+        if value is None:  # снятие перекрытия — значение любое
+            return
+        if section == SECTION_APPEARANCE:
+            if key != KEY_THEME_NAME:
+                error_message = f'Неизвестный ключ секции «{section}»: {key}'
+                raise ValueError(error_message)
+            names = self._main_wnd.theme_manager.theme_names
+            if not (isinstance(value, str) and value in names):
+                error_message = 'Тема должна быть одной из: ' + ', '.join(names)
+                raise ValueError(error_message)
+        elif section == SECTION_EDITOR:
+            if key not in DEFAULT_EDITOR_UX_OPTIONS:
+                error_message = f'Неизвестный ключ секции «{section}»: {key}'
+                raise ValueError(error_message)
+            coerce_editor_ux_value(key, value)  # ValueError/TypeError с текстом
+        else:  # SECTION_LSP
+            if key != KEY_REGISTRY_JSON:
+                error_message = f'Неизвестный ключ секции «{section}»: {key}'
+                raise ValueError(error_message)
+            if not isinstance(value, str):
+                error_message = 'LSP-реестр задаётся JSON-строкой'
+                raise ValueError(error_message)
+            try:
+                LspRegistry.from_json(value)
+            except (TypeError, ValueError) as exc:
+                error_message = f'Некорректный JSON LSP-реестра: {exc}'
+                raise ValueError(error_message) from exc
+
+    def _load_project_settings(self, root: Path) -> None:
+        """Читает оверлей ``<root>/.pyqtp/settings.json`` в память.
+
+        Нет файла/битый JSON — пустой оверлей (проект без настроек живёт на
+        настройках приложения); ошибки ФС — только лог.
+        """
+        try:
+            self._project_settings = read_project_settings(root)
+        except OSError as exc:
+            prj_log.warning('Не удалось прочитать настройки проекта: %s', exc)
+            self._project_settings = {}
+
+    def _apply_project_layers(self) -> None:
+        """Делает текущий оверлей эффективным для всех владельцев настроек.
+
+        - тема: проектный ``theme_name``, если он известен, иначе — слой
+          приложения (откат при смене/закрытии проекта);
+        - редактор: широкое переприменение ЭФФЕКТИВНЫХ UX-опций открытым
+          редакторам (новые подхватят их при открытии сами);
+        - LSP: секция ``lsp.registry_json`` как проектное перекрытие
+          реестра (``None`` — слой приложения).
+        """
+        wnd = self._main_wnd
+        appearance = self._project_settings.get(SECTION_APPEARANCE) or {}
+        theme_name = appearance.get(KEY_THEME_NAME)
+        if (
+            isinstance(theme_name, str)
+            and theme_name in wnd.theme_manager.theme_names
+        ):
+            wnd.theme_apply(theme_name)
+        else:
+            wnd.theme_apply(wnd.theme_app_name)
+        wnd.doc_ctrl.broadcast_effective_editor_ux_options()
+        lsp_values = self._project_settings.get(SECTION_LSP) or {}
+        raw_registry = lsp_values.get(KEY_REGISTRY_JSON)
+        wnd.lsp_hub.registry_set_project_overlay(
+            raw_registry if isinstance(raw_registry, str) else None
         )
 
     ############################################

@@ -6,6 +6,10 @@ from pyqtp.base.base_main_window import BaseMainWindow
 from pyqtp.controls.doc_control.document_manager import DocumentManager
 from pyqtp.controls.lsp_control.lsp_hub import LspHub
 from pyqtp.controls.project_control.project_control import ProjectControl
+from pyqtp.controls.project_control.project_settings import (
+    KEY_THEME_NAME,
+    SECTION_APPEARANCE,
+)
 
 if TYPE_CHECKING:
     from pyqtp.base.docking_system.base_views_manager import ViewsManagerType
@@ -33,4 +37,28 @@ class IdeMainWindow(BaseMainWindow):
         self.lsp_hub = self.plug_register(LspHub())
         self.doc_ctrl = self.plug_register(DocumentManager())
         self.project_ctrl = self.plug_register(ProjectControl())
+
+    #############################################
+    # Тема: два слоя (этап 9.6B, см. ThemeMainWindow) #
+
+    def handle_theme_switch(self, theme_name: str) -> None:
+        """Комбик темы в углу меню: пока проектное перекрытие темы держит
+        эффективное значение — правим слой проекта (``.pyqtp/settings.json``),
+        иначе — слой настроек приложения (маршрутизация по источнику
+        текущего значения).
+        """
+        if self.project_ctrl.theme_provided_by_project():
+            self.project_ctrl.project_settings_set(
+                SECTION_APPEARANCE, KEY_THEME_NAME, theme_name
+            )
+        else:
+            self.theme_set_app(theme_name)
+
+    def theme_on_app_changed(self, theme_name: str) -> None:
+        """Смена темы в слое приложения не «пробивает» проектное перекрытие:
+        эффективной она станет только когда перекрытия нет.
+        """
+        if self.project_ctrl.theme_provided_by_project():
+            return
+        self.theme_apply(theme_name)
 

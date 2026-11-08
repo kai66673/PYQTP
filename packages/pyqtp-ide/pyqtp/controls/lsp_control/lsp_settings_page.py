@@ -22,9 +22,11 @@ class LspRegistrySettingsPage(SettingsPage):
 
     Редактирование стека LSP-серверов целиком в JSON-виде. Конфигурация
     валидируется ``LspRegistry.from_json``: при битом JSON ``apply()``
-    бросает ошибку, действующий реестр не меняется. Применённый реестр
-    используется новыми подключениями редакторов; уже поднятые процессы
-    серверов живут до завершения IDE.
+    бросает ошибку, действующий реестр не меняется. Страница редактирует
+    слой НАСТРОЕК ПРИЛОЖЕНИЯ; если открытый проект перекрывает реестр
+    (``.pyqtp/settings.json``), перекрытие остаётся старше. Применённый
+    реестр используется новыми подключениями редакторов; уже поднятые
+    процессы серверов живут до завершения IDE.
     """
 
     title = 'Языковые серверы (LSP)'
@@ -61,7 +63,9 @@ class LspRegistrySettingsPage(SettingsPage):
 
     def load(self) -> None:
         assert self._editor is not None
-        self._editor.setPlainText(self._hub.registry_json())
+        # слой настроек приложения, а не эффективный реестр: страница не
+        # должна копировать проектное перекрытие в настройки приложения
+        self._editor.setPlainText(self._hub.registry_app_json())
 
     def apply(self) -> None:
         assert self._editor is not None

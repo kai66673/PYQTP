@@ -100,6 +100,68 @@ def to_monaco_options(options: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def coerce_editor_ux_value(key: str, raw: object) -> Any:
+    """Приводит сырое значение одной настройки к её типу.
+
+    ``ValueError`` — значение недопустимо (не тот тип/вне диапазона/вне
+    списка допустимых); вызывающий решает, чем его заменить (дефолтом или
+    значением нижнего слоя). Используется и для QSettings, и для
+    проектного JSON-оверлея (этап 9.6B).
+    """
+    default = DEFAULT_EDITOR_UX_OPTIONS[key]
+    if isinstance(default, bool):
+        if isinstance(raw, bool):
+            return raw
+        if isinstance(raw, str):
+            return raw.strip().lower() in ('true', '1', 'yes', 'on')
+        msg = f'Настройка «{key}» должна быть флагом'
+        raise TypeError(msg)
+    if key == 'theme':
+        if isinstance(raw, str) and raw in EDITOR_THEME_CHOICES:
+            return raw
+        msg = (
+            'Тема редактора должна быть одной из: '
+            + ', '.join(EDITOR_THEME_CHOICES)
+        )
+        raise ValueError(msg)
+    # font_size
+    if isinstance(raw, bool) or not isinstance(raw, (int, float, str, bytes)):
+        msg = 'Размер шрифта должен быть целым числом'
+        raise TypeError(msg)
+    try:
+        value = int(raw)  # type: ignore[arg-type]
+    except (TypeError, ValueError) as exc:
+        msg = 'Размер шрифта должен быть целым числом'
+        raise TypeError(msg) from exc
+    if not FONT_SIZE_RANGE[0] <= value <= FONT_SIZE_RANGE[1]:
+        msg = (
+            'Размер шрифта должен быть в диапазоне '
+            f'{FONT_SIZE_RANGE[0]}..{FONT_SIZE_RANGE[1]}'
+        )
+        raise ValueError(msg)
+    return value
+
+
+def merge_editor_ux_options(
+    options: dict[str, Any], overlay: dict[str, Any]
+) -> None:
+    """Поключевой merge проектного оверлея поверх уже собранных настроек.
+
+    Мутирует ``options``; секция оверлея может содержать произвольный набор
+    известных ключей — перекрытие работает поштучно. Мусорные/неизвестные
+    значения секции молча игнорируются (применение не должно падать из-за
+    руки пользователя в JSON), известная настройка с испорченным значением
+    просто не перекрывается.
+    """
+    for key, raw in overlay.items():
+        if key not in DEFAULT_EDITOR_UX_OPTIONS:
+            continue
+        try:
+            options[key] = coerce_editor_ux_value(key, raw)
+        except (TypeError, ValueError):
+            continue
+
+
 def read_editor_ux_options(settings: QSettings) -> dict[str, Any]:
     """Читает настройки из QSettings с приведением типов и дефолтами."""
     result: dict[str, Any] = {}
@@ -107,27 +169,10 @@ def read_editor_ux_options(settings: QSettings) -> dict[str, Any]:
     try:
         for key, default in DEFAULT_EDITOR_UX_OPTIONS.items():
             raw = settings.value(key, default)
-            if isinstance(default, bool):
-                if isinstance(raw, str):
-                    result[key] = raw.strip().lower() in ('true', '1', 'yes', 'on')
-                else:
-                    result[key] = bool(raw)
-            elif key == 'theme':
-                # строковое значение из списка допустимых, иначе — дефолт
-                result[key] = (
-                    raw if isinstance(raw, str) and raw in EDITOR_THEME_CHOICES
-                    else default
-                )
-            else:
-                if isinstance(raw, (int, float, str, bytes)):
-                    try:
-                        result[key] = int(raw)
-                    except (TypeError, ValueError):
-                        result[key] = default
-                else:
-                    result[key] = default
-                if not FONT_SIZE_RANGE[0] <= result[key] <= FONT_SIZE_RANGE[1]:
-                    result[key] = default
+            try:
+                result[key] = coerce_editor_ux_value(key, raw)
+            except (TypeError, ValueError):
+                result[key] = default
     finally:
         settings.endGroup()
     return result

@@ -36,7 +36,9 @@ class AppearanceSettingsPage(SettingsPage):
 
         hint = QLabel(
             'Тема оформления применяется после нажатия «Применить» и '
-            'сохраняется при закрытии приложения.',
+            'сохраняется при закрытии приложения. Это настройка '
+            'приложения: если для открытого проекта задана тема в его '
+            'настройках (.pyqtp/settings.json), она перекрывает эту.',
             widget,
         )
         hint.setWordWrap(True)
@@ -54,9 +56,9 @@ class AppearanceSettingsPage(SettingsPage):
 
     def load(self) -> None:
         assert self._theme_combo is not None
-        self._theme_combo.setCurrentText(
-            self.main_wnd.theme_manager.current_theme.name
-        )
+        # слой настроек приложения, а не эффективная тема: страница не должна
+        # копировать проектное перекрытие в настройки приложения (этап 9.6B)
+        self._theme_combo.setCurrentText(self.main_wnd.theme_app_name)
 
     def apply(self) -> None:
         assert self._theme_combo is not None
@@ -64,12 +66,9 @@ class AppearanceSettingsPage(SettingsPage):
         if theme_name not in self.main_wnd.theme_manager.theme_names:
             error_message = f'Тема «{theme_name}» не найдена'
             raise ValueError(error_message)
-        self.main_wnd.theme_manager.switch_to(theme_name)
-        # Синхронизируем комбикос переключения темы в углу меню
-        corner_combo = self.main_wnd.theme_switch_toolbar.theme_combo_box
-        corner_combo.blockSignals(True)  # noqa: FBT003
-        corner_combo.setCurrentText(theme_name)
-        corner_combo.blockSignals(False)  # noqa: FBT003
+        # правка слоя приложения; эффективную тему перекрытие проекта не
+        # пробивает (хук theme_on_app_changed в IDE)
+        self.main_wnd.theme_set_app(theme_name)
 
     def reset_defaults(self) -> None:
         if DEFAULT_THEME_NAME not in self.main_wnd.theme_manager.theme_names:

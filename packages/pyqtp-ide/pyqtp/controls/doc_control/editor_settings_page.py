@@ -30,10 +30,12 @@ class EditorSettingsPage(SettingsPage):
 
     UX-настройки Monaco: мини-карта, сворачивание блоков, зум колесом с
     ctrl, размер шрифта, тема редактора (следовать теме приложения /
-    светлая / тёмная). Значения живут в QSettings (группа
-    ``EditorOptions``); «Применить» пишет их и мгновенно доводит до всех
-    открытых редакторов (``update_editor_options``), новые редакторы
-    подхватывают их при создании.
+    светлая / тёмная). Страница редактирует слой настроек ПРИЛОЖЕНИЯ
+    (QSettings, группа ``EditorOptions``); «Применить» пишет его и мгновенно
+    доводит эффективные значения до всех открытых редакторов
+    (``update_editor_options``), новые редакторы подхватывают их при
+    создании. Если открытый проект перекрывает какие-то из этих значений
+    (``.pyqtp/settings.json``), перекрытие остаётся старше.
     """
 
     title = 'Редактор'
@@ -96,7 +98,9 @@ class EditorSettingsPage(SettingsPage):
         assert self._font_size_spin is not None
         assert self._theme_combo is not None
 
-        options = self._doc_ctrl.editor_ux_options()
+        # слой настроек приложения, а не эффективные значения: страница не
+        # должна копировать проектное перекрытие в настройки приложения (9.6B)
+        options = self._doc_ctrl.editor_ux_options_app()
         self._minimap_check.setChecked(bool(options['minimap']))
         self._folding_check.setChecked(bool(options['folding']))
         self._wheel_zoom_check.setChecked(bool(options['mouse_wheel_zoom']))
