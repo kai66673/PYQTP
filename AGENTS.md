@@ -51,11 +51,12 @@ Verify in this order: **ruff → pyright → tests → run the app**.
    + stage-8.2 rename/formatting/codeAction live tests
    + editor-options/theme + workspace-edit-apply (test_workspace_edit_apply.py) unit tests
    + stage-9.1 project tree panel (test_project_tree.py, offscreen GUI без LSP/WebEngine, без маркеров)
-   + stage-9.2 quick open (test_quick_open.py: scorer/scan unit без GUI + live offscreen диалог)). Markers `live`
+   + stage-9.2 quick open (test_quick_open.py: scorer/scan unit без GUI + live offscreen диалог)
+   + stage-9.3 project search (test_project_search.py: argv/парсер юниты без GUI и без бинаря rg + live offscreen с живым rg, skipif без rg)). Markers `live`
   (real LSP server processes) and
-  `webengine` (real QWebEngineView/Monaco) are deselected by default via `addopts` → 67 passed / 27
+  `webengine` (real QWebEngineView/Monaco) are deselected by default via `addopts` → 82 passed / 27
   deselected; run them with `uv run pytest -m 'live or webengine'` (~2 min, they work offscreen) or
-  all 94 in one
+  all 109 in one
   process with `uv run pytest -m ''` (~2 min, full run keeps passing despite `os._exit` in
   `pytest_sessionfinish` eating the summary line — count the dots). Test-suite gotchas:
   - root `conftest.py` sets `QT_QPA_PLATFORM=offscreen` + `QTWEBENGINE_DISABLE_SANDBOX=1` at import
@@ -215,7 +216,8 @@ Verify in this order: **ruff → pyright → tests → run the app**.
   `DocumentManager`) хранит корень проекта (QSettings ключ
   `ProjectControl/root_path`, при закрытии снимается), даёт console-API
   `project_root/project_open/project_close` и пункты меню «Файл»:
-  «Открыть папку...» (Ctrl+Shift+O, priority=4) / «Закрыть папку» (priority=8).
+  «Открыть папку...» (Ctrl+Shift+O, priority=4) / «Поиск по проекту...»
+  (Ctrl+Shift+F, priority=8) / «Закрыть папку» (priority=9, была 8).
   Панель — `ProjectTreeView` (`pyqtp/views/project_tree_view.py`, key
   `ProjectControl_tree_view`, `widget_area='left'`): ленивый
   `QFileSystemModel` + `_TreePruneProxy` (точечные записи + `__pycache__`/
@@ -240,6 +242,20 @@ Verify in this order: **ruff → pyright → tests → run the app**.
    границы даётся только ПЕРВОМУ символу query (иначе «p после точки» в
    `deep.py` обгонял бы цепочку «подряд» в `dp.py`), итог считается по
    `best_any[-1]` — совпасть должна вся query, а не префикс.
+   Поиск по проекту (этап 9.3): чистый `project_search.py` (argv
+   `build_rg_args` + инкрементный парсер `rg --json`; байтовые смещения rg
+   конвертируются в UTF-16-колонки Monaco той же схемой, что `workspace_edit.py`
+   — кириллица/эмодзи!) + вьюха `ProjectSearchView` (key
+   `ProjectControl_search_view`, `widget_area='bottom'`), которая ДЕРЖИТ
+   `QProcess` с rg у себя (паттерн 9.1 — источник в вьюхе): cwd=корень,
+   аргумент `.` (пути в выводе с `./`), скрытые/gitignored rg не отдаёт;
+   перезапуск/смена корня/teardown — `stop_search()` (gen-гейт `_search_gen`
+   отбрасывает чужие сигналы процесса), срезка `MAX_MATCHES=2000` с kill,
+   exit≥2 = «Ошибка: ...» (битый regex идёт в stderr даже с `--no-messages`),
+   FailedToStart = «rg не найден». Клик по совпадению → `match_activated` →
+   `doc_ctrl.open_definition_uri` (тот же путь, что LSP-переходы этапа 6);
+   экшен `action_project_search` активируется вместе с quick-open в
+   `_start_scan`, гаснет в `_on_root_for_scan(None)`.
 
 ## Runtime gotchas
 

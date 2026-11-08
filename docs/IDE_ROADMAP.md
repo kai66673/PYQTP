@@ -258,18 +258,42 @@ LSP/WebEngine: заполнение панели/фильтр мусора, дв
 Enter открывает документ, набор fuzzy-строк, обнуление кэша и сброс
 диалога при закрытии проекта + отброс запоздалого скана по поколению).
 
+#### 9.3 — поиск по проекту (Ctrl+Shift+F) — ГОТОВО
+- `project_search.py` (`pyqtp/controls/project_control/`): сборка argv ripgrep
+  (`build_rg_args`: `--json --line-number --no-messages`, `-i` по умолчанию
+  снимается галкой «Регистр», `-w` — «Слово целиком», `--fixed-strings`
+  снимается галкой «Regex»; поиск из корня с аргументом `.`) + инкрементный
+  парсер `--json` (`split_complete_lines` — хвост незавершённой JSON-строки
+  остаётся в буфере; `match_from_event` — пути rg со `./` → абсолютные,
+  байтовые смещения UTF-8 → UTF-16-колонки Monaco как в этапе 8.2, см.
+  `workspace_edit.py`);
+- панель `ProjectSearchView` (`pyqtp/views/project_search_view.py`, снизу):
+  `QProcess` с `rg` держит сама вьюха (паттерн 9.1 — источник в вьюхе),
+  перезапуск/смена корня/teardown снимают процесс, чужие сигналы отбрасываются
+  поколением `_search_gen`; дерево «файл → строки» (галки Регистр/Слово
+  целиком/Regex, статус-лейбл); срезка на `MAX_MATCHES=2000` c kill процесса;
+  exit≥2 — «Ошибка: <последняя строка stderr>» (битый regex), rg не найден —
+  FailedToStart;
+- `ProjectControl`: экшен «Поиск по проекту...» (Ctrl+Shift+F, «Файл»
+  priority=8 — «Закрыть папку» переехал на 9, активен только с проектом),
+  console-API `project_search_show`; клик по совпадению →
+  `DocumentManager.open_definition_uri` (тот же путь, что переходы LSP этапа 6).
+**Приёмка:** `tests/test_project_search.py` (15: 2 юнита argv + 5 юнитов
+парсера без GUI и без бинаря rg (записанные JSON-ивенты; кириллица и эмодзи
+UTF-16-колонки) + 7 offscreen-GUI с живым rg (гейт экшена, группировка и
+статус, UTF-16-колонка в payload открытия, regex/слово-целиком, пустой
+результат/сброс при закрытии проекта, битый regex → «Ошибка»; плюс
+гейт `skipif` при отсутствии rg).
+
 #### Остаток этапа 9
 - `workspace/symbol` (остаток этапа 8) — в меню/палитре по корню проекта;
 - контекстное меню дерева (create/rename/delete в корзину с подтверждением;
   rename — через **LSP `willRenameFiles`/`didRenameFiles`** — у хаба пока
   нет, добавим сообщение DocumentManager→LspHub);
-- поиск по проекту (Ctrl+Shift+F): субпроцесс **ripgrep** (`--json`) →
-  results-панель → клик = `open_definition_uri` + reveal (regex/case/include
-  бесплатно с rg; собственный fuzzy-движок как в iide не пишем);
 - сессия проекта (вкладки/активная/раскладка; хранение — каталог `.pyqtp/`
   проекта или QSettings по пути);
 - закладки: Monaco decorations + `.pyqtp/bookmarks.json` + панель закладок.
-**Приёмка:** юнит-тесты scorer'а и rg-парсера (без GUI); webengine-тест закладок.
+**Приёмка:** webengine-тест закладок (юниты rg-парсера — уже закрыты в 9.3).
 
 ### Этап 10 — Problems-панель, статус-бар, монитор LSP
 - агрегация маркеров всех документов (модель маркеров Monaco читается из

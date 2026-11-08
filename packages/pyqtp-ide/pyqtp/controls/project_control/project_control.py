@@ -5,7 +5,7 @@ import threading
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from PySide6.QtCore import QObject, Signal
+from PySide6.QtCore import QObject, QUrl, Signal
 from PySide6.QtGui import QIcon, QKeySequence
 from PySide6.QtWidgets import QFileDialog
 
@@ -14,9 +14,11 @@ from pyqtp.controls.project_control.quick_open import iter_project_files
 from pyqtp.controls.project_control.quick_open_dialog import QuickOpenDialog
 from pyqtp.utils.action import Action
 from pyqtp.utils.priority_menu import PriorityMenu
+from pyqtp.views.project_search_view import ProjectSearchView
 from pyqtp.views.project_tree_view import ProjectTreeView
 
 if TYPE_CHECKING:
+    from pyqtp.controls.project_control.project_search import SearchMatch
     from pyqtp.main_wnd.ide_main_window import IdeMainWindow
 
 prj_log = logging.getLogger('bcad.project')
@@ -29,13 +31,15 @@ class _ScanSignals(QObject):
 
 
 class ProjectControl(BaseControl):
-    """Контрол проекта (этапы 9.1–9.2): папка-корень, панель «Проводник», quick open.
+    """Контрол проекта (этапы 9.1–9.3): папка-корень, панель «Проводник», quick open, поиск.
 
     Хранит текущий корень проекта, сохраняет его в QSettings
     (``<key>/root_path``), создаёт докируемую панель дерева слева
     (``widget_area='left'``), прокидывает двойной клик по файлу в
     ``DocumentManager.open_document`` и держит фоновый кэш файлов проекта
-    для диалога «Быстрый переход» (Ctrl+P).
+    для диалога «Быстрый переход» (Ctrl+P). Панель «Поиск» (Ctrl+Shift+F,
+    ``widget_area='bottom'``) запускает ripgrep и открывает совпадения
+    через ``DocumentManager.open_definition_uri``.
     """
 
     # аннотация ради plug_compatibility_check и типизированного доступа
@@ -44,6 +48,7 @@ class ProjectControl(BaseControl):
     _main_wnd: IdeMainWindow
 
     tree_view: ProjectTreeView | None
+    search_view: ProjectSearchView | None
 
     project_root_changed = Signal(object)  # Path | None
 
@@ -72,11 +77,20 @@ class ProjectControl(BaseControl):
             description='Поиск файла проекта по имени (fuzzy)',
             shortcut=QKeySequence('Ctrl+P'),
         )
+        self.action_project_search = Action(
+            icon=QIcon(),
+            title='Поиск по проекту...',
+            parent=self,
+            description='Полнотекстовый поиск по файлам проекта (ripgrep)',
+            shortcut=QKeySequence('Ctrl+Shift+F'),
+        )
         self.action_open_folder.triggered.connect(self._choose_folder)
         self.action_close_folder.triggered.connect(self.close_project)
         self.action_quick_open.triggered.connect(self._show_quick_open)
+        self.action_project_search.triggered.connect(self._show_project_search)
         self.action_close_folder.setEnabled(False)
         self.action_quick_open.setEnabled(False)
+        self.action_project_search.setEnabled(False)
 
         # кэш файлов проекта (быстрый переход) и фоновый скан
         self._scan_signals = _ScanSignals()
@@ -121,6 +135,7 @@ class ProjectControl(BaseControl):
                 'project_open': self.open_project,
                 'project_close': self.close_project,
                 'quick_open_show': self._show_quick_open,
+                'project_search_show': self._show_project_search,
             }
         )
 
@@ -137,7 +152,8 @@ class ProjectControl(BaseControl):
 
         file_menu.addAction(self.action_open_folder, priority=4)
         file_menu.addAction(self.action_quick_open, priority=7)
-        file_menu.addAction(self.action_close_folder, priority=8)
+        file_menu.addAction(self.action_project_search, priority=8)
+        file_menu.addAction(self.action_close_folder, priority=9)
 
     def setup_views(self) -> None:
         self.tree_view = view = ProjectTreeView(
@@ -147,8 +163,17 @@ class ProjectControl(BaseControl):
 
         view.file_open_requested.connect(self._open_file_from_tree)
         self.project_root_changed.connect(view.set_project_root)
+
+        self.search_view = search_view = ProjectSearchView(
+            self._main_wnd, key=f'{self.key}_search_view'
+        )
+        self._main_wnd.view_register(search_view, widget_area='bottom')
+        search_view.match_activated.connect(self._open_search_match)
+        self.project_root_changed.connect(search_view.set_project_root)
+
         if self._project_root is not None:
             view.set_project_root(self._project_root)
+            search_view.set_project_root(self._project_root)
             self.action_close_folder.setEnabled(True)
             self._start_scan()
 
@@ -161,6 +186,10 @@ class ProjectControl(BaseControl):
     def teardown_views(self) -> None:
         super().teardown_views()
         self._scan_gen += 1  # сброс: запоздалые результаты скана не нужны
+        if self.search_view is not None:
+            self.search_view.stop_search()
+            self._main_wnd.view_deregister(self.search_view.key)
+            self.search_view = None
         if self.tree_view is not None:
             self._main_wnd.view_deregister(self.tree_view.key)
             self.tree_view = None
@@ -221,11 +250,12 @@ class ProjectControl(BaseControl):
     # Quick open (9.2)  #
 
     def _on_root_for_scan(self, root: Path | None) -> None:
-        """Смена корня проекта: старт/сброс фонового кэша файлов."""
+        """Смена корня проекта: старт/сброс фонового кэша файлов + экшен поиска."""
         if root is None:
             self._scan_gen += 1
             self._quick_files = []
             self.action_quick_open.setEnabled(False)
+            self.action_project_search.setEnabled(False)
             if self._quick_dialog is not None:
                 self._quick_dialog.set_index(None, [])
             return
@@ -238,6 +268,7 @@ class ProjectControl(BaseControl):
         self._scan_gen += 1
         gen = self._scan_gen
         self.action_quick_open.setEnabled(True)
+        self.action_project_search.setEnabled(True)
         root = self._project_root
         signals = self._scan_signals
 
@@ -269,6 +300,30 @@ class ProjectControl(BaseControl):
             self._quick_dialog.file_selected.connect(self._open_file_from_tree)
         self._quick_dialog.set_index(self._project_root, self._quick_files)
         self._quick_dialog.show_for_use()
+
+    #####################
+    # Поиск             #
+
+    def _show_project_search(self) -> None:
+        if self._project_root is None:
+            prj_log.info('Поиск по проекту: проект не открыт')
+            return
+        if self.search_view is None:
+            return
+        self._main_wnd.view_show(self.search_view.key)
+        self.search_view.focus_query()
+
+    def _open_search_match(self, match: SearchMatch) -> None:
+        """Совпадение из панели «Поиск» -> открыть файл и каретка на месте."""
+        self._main_wnd.doc_ctrl.open_definition_uri(
+            {
+                'uri': QUrl.fromLocalFile(str(match.path)).toString(),
+                'range': {
+                    'startLineNumber': match.line,
+                    'startColumn': match.column,
+                },
+            }
+        )
 
     def _persist_root(self) -> None:
         settings = self._main_wnd.settings
