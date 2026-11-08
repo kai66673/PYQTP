@@ -25,7 +25,16 @@ const defaultEditorOptions: monaco.editor.IStandaloneEditorConstructionOptions =
   // за переходом к определению), прокрутка не уходит за последнюю строку
   multiCursorModifier: "alt",
   scrollBeyondLastLine: false,
+  // vendored-patch (тема редактора): авто-детект высоко-контрастной темы по
+  // настройкам ОС перехватывает управление темой (vs/vs-dark молча меняются
+  // на hc-*) — выключаем, темой управляет только явная настройка из Python
+  autoDetectHighContrast: false,
 };
+
+// vendored-patch (тема редактора): запоминаем применённую тему — setTheme
+// глобален для theme-сервиса, но пересоздание редактора (standalone после
+// diff-режима) конструкторскими опциями откатил бы её обратно к vs-dark
+let appliedTheme: string = defaultEditorOptions.theme ?? "vs-dark";
 
 let editor = monaco.editor.create(editorContainer, defaultEditorOptions);
 let diffEditor: monaco.editor.IStandaloneDiffEditor | null = null;
@@ -172,7 +181,10 @@ function switchToStandaloneEditor() {
   disposeVimMode();
   disposeContentChangeListener();
   disposeDiffEditor();
-  setActiveEditor(monaco.editor.create(editorContainer, defaultEditorOptions));
+  setActiveEditor(
+    // vendored-patch (тема редактора): тема переживает пересоздание редактора
+    monaco.editor.create(editorContainer, { ...defaultEditorOptions, theme: appliedTheme }),
+  );
 }
 
 function switchToDiffEditor(data: any) {
@@ -188,7 +200,8 @@ function switchToDiffEditor(data: any) {
 
   const options: monaco.editor.IStandaloneDiffEditorConstructionOptions = {
     automaticLayout: true,
-    theme: "vs-dark",
+    // vendored-patch (тема редактора): diff наследует текущую тему
+    theme: appliedTheme,
     ...(data.options || {}),
   };
   diffEditor = monaco.editor.createDiffEditor(editorContainer, options);
@@ -686,12 +699,14 @@ function updateFromPython(name: string, value: string) {
       // Set the theme - Monaco will use a fallback if the theme doesn't exist
       try {
         monaco.editor.setTheme(data);
+        appliedTheme = data; // vendored-patch (тема редактора)
         console.log(`Applied theme: ${data}`);
         sendToPython("_theme", data); // Send back the theme name
       } catch (error) {
         console.warn(`Failed to apply theme "${data}":`, error);
         // Fallback to default theme
         monaco.editor.setTheme("vs-dark");
+        appliedTheme = "vs-dark"; // vendored-patch (тема редактора)
         sendToPython("_theme", "vs-dark");
       }
       break;
