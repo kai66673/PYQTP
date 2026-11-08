@@ -47,10 +47,11 @@ Verify in this order: **ruff → pyright → tests → run the app**.
 - Tests: `uv run pytest` (`pytest` + `pytest-qt` are dev deps of core/ide). Config
   `[tool.pytest.ini_options]` is in the **root** pyproject; tests live in
   `packages/pyqtp-core/tests/` (settings window) and `packages/pyqtp-ide/tests/`
-  (LSP registry + live editor + stage-7 editor UX). Markers `live` (real LSP server processes) and
-  `webengine` (real QWebEngineView/Monaco) are deselected by default via `addopts` → 17 passed / 17
+  (LSP registry + live editor + stage-7 editor UX + editor-options/theme unit tests). Markers `live`
+  (real LSP server processes) and
+  `webengine` (real QWebEngineView/Monaco) are deselected by default via `addopts` → 30 passed / 19
   deselected; run them with `uv run pytest -m 'live or webengine'` (~1 min, they work offscreen) or
-  all 34 in one
+  all 49 in one
   process with `uv run pytest -m ''`. Test-suite gotchas:
   - root `conftest.py` sets `QT_QPA_PLATFORM=offscreen` + `QTWEBENGINE_DISABLE_SANDBOX=1` at import
     and overrides `qapp` as a **session-scoped** fixture (pytest-qt's DESTROY_ON_POLICY would kill
@@ -62,6 +63,13 @@ Verify in this order: **ruff → pyright → tests → run the app**.
     `model.regions.getStartLineNumber/getEndLineNumber/isCollapsed(i)`), and in this Monaco build
     `EditorOption.effectiveFontSize` is missing (use `EditorOption.fontInfo` → `.fontSize` +
     `.zoomLevel`, or `getOption(monaco.editor.EditorOption.multiCursorModifier)` = `'altKey'`).
+  - The active Monaco theme is **not readable via JS** in this bundle (monaco-editor 0.55):
+    `monaco.editor.getActiveTheme`/`onDidThemeChange` and `EditorOption.theme` don't exist
+    (`autoDetectHighContrast` is absent from the public `EditorOption` enum too — don't try to
+    assert it). Probe the computed background of `.monaco-editor .monaco-editor-background` instead:
+    `rgb(30, 30, 30)` = `vs-dark`, `rgb(255, 255, 254)` = `vs`. NB `test_lsp_editor_stack`
+    semantic-token tests depend on the default `vs-dark` (bare editors never get the app theme) —
+    light theme must not leak into them.
   - Offscreen WebEngine delivers real `QTest` key presses only to the DOM, **not** to Monaco
     (Monaco has no `inputarea` there) — and neither synthetic keydowns nor
     `monaco.editor.trigger(...)` reach the editor's actions; only
@@ -172,11 +180,13 @@ Verify in this order: **ruff → pyright → tests → run the app**.
     reset = «Светлая», persistence — общим `theme_settings_write`), ide
     «Редактор» (`doc_control/editor_settings_page.EditorSettingsPage`, key
     `editor`, order 10 — UX-опции Monaco (`pyqtp/web/editor_options.py`:
-    minimap/сворачивание/колесо+Ctrl/размер шрифта), владелец — `DocumentManager`
+    minimap/сворачивание/колесо+Ctrl/размер шрифта/тема редактора), владелец —
+    `DocumentManager`
     (`editor_ux_options/apply_editor_ux_options/reset_editor_ux_options`,
     персистентность — ключи QSettings `EditorOptions/*`, применение —
-    широковещательный `update_editor_options()` по всем открытым редакторам;
-    опции шлёт и `open_document`, т.к. `QtMonacoEditorWidget` появляется позже
+    широковещательный `update_editor_options()` + отдельный `set_theme()` по
+    всем открытым редакторам; опции шлёт и `open_document`, т.к.
+    `QtMonacoEditorWidget` появляется позже
     поздних вьюх),
     «Языковые серверы (LSP)» (`lsp_settings_page.LspRegistrySettingsPage`, key
     `lsp`, order 50) — её `LspHub` регистрирует в `setup()`; кнопок применения
@@ -319,6 +329,21 @@ Verify in this order: **ruff → pyright → tests → run the app**.
   "go to definition") and `scrollBeyondLastLine: false` — the rest of the Monaco UX
   options (minimap/folding/font zoom/smart select/…) come from Python:
   `pyqtp-ide/pyqtp/web/editor_options.py` + `QtMonacoEditorWidget.update_editor_options()`;
+  editor theme setting (stage 7): in `main.ts` —
+  `appliedTheme` module var remembers the theme applied via the existing
+  `case "theme"` message (vendored `Monaco.set_theme` API, unchanged), so
+  `switchToStandaloneEditor` recreates the editor with the remembered theme
+  instead of the hardcoded `vs-dark` (and `switchToDiffEditor` inherits it,
+  still overridable by `open_diffs(options=...)`); `defaultEditorOptions` also
+  sets `autoDetectHighContrast: false` — otherwise the OS high-contrast probe
+  silently overrides the chosen theme with `hc-*`. Python side: the `theme` key
+  (auto/light/dark) lives in the same `EditorOptions` QSettings dict but is
+  NOT part of the `update_editor_options` payload — it resolves via pure
+  `resolve_monaco_theme(options, app_is_dark=)` (`editor_options.py`) and is
+  sent as `Monaco.set_theme('vs'|'vs-dark')`; `DocumentManager` applies it on
+  `open_document`/broadcast and re-applies to open docs on
+  `theme_manager.theme_changed` (auto mode follows `Theme.is_dark`, like the
+  IPython console colors);
   python patch in `monaco.py` —
   `Monaco.__init__` takes an `lsp_host` param and no longer eagerly spawns
   `get_pylsp_host()` (lazy `_resolve_lsp_host()` fallback keeps standalone

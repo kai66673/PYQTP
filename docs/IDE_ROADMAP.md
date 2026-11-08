@@ -72,9 +72,25 @@ multi-cursor, expand selection, zoom, jump history Alt+←/→.
 рассылка в открытые редакторы через `DocumentManager.apply_editor_ux_options`
 (`update_editor_options`, буферизуется коннектором до инициализации моста).
 Связки Ctrl+F/H и Ctrl+K- chords folding уже были встроены в Monaco.
+Дополнение — **тема редактора**: ключ `theme` (auto/light/dark) в том же словаре
+`EditorOptions`; `auto` (по умолчанию) следует теме приложения (`Theme.is_dark`,
+как с цветами IPython-консоли), light/dark — фиксированные встроенные темы Monaco
+`vs`/`vs-dark` (своя тема из палитры приложения через `defineTheme` сознательно
+отложена). Тема НЕ входит в payload `update_editor_options` — разрешается чистой
+функцией `resolve_monaco_theme(options, app_is_dark=)` и уходит отдельным
+сообщением `theme` (`Monaco.set_theme`); `DocumentManager` применяет её при
+открытии документа и широковещании, а также переприменяет открытым документам по
+сигналу `theme_manager.theme_changed`. В `main.ts` — патч `appliedTheme`
+(запоминание темы, чтобы пересоздание standalone-редактора после diff-режима и
+сам diff-режим не откатывали тему к `vs-dark`) и `autoDetectHighContrast: false`
+(иначе ОС с high-contrast молча подменяет выбранную тему на `hc-*`).
+Комбик «Тема редактора» — на странице «Редактор».
 **Приёмка:** webengine-тесты `tests/test_editor_ux_stage7.py` (опции из
 Python, find/replace, folding, smart select, история переходов, зум,
-регистрация связок); живая проверка.
+регистрация связок; тема: переключение из Python и сохранение темы после
+возврата из diff-режима), безмаркерные `tests/test_editor_options_theme.py`
+(`resolve_monaco_theme`, валидация, roundtrip QSettings); живая проверка
+смены темы приложения.
 
 ### Этап 8 — завершение LSP-клиента
 По образцу существующих фабрик провайдеров (`claimProvider`,

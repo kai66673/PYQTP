@@ -139,6 +139,18 @@ def editor_position_line(widget: QtMonacoEditorWidget) -> Any:
     return position.get('lineNumber')
 
 
+# Вычисляемый фон холста — надёжный маркер активной темы Monaco: в бандле
+# 0.55 нет getActiveTheme/onDidThemeChange/EditorOption.theme (пробовано),
+# а цвета тем фиксированы: vs-dark #1e1e1e, vs #fffffe
+JS_EDITOR_BG = (
+    "(function(){var el=document.querySelector('.monaco-editor "
+    ".monaco-editor-background');"
+    "return el?getComputedStyle(el).backgroundColor:'NO_EL';})()"
+)
+BG_VS_DARK = 'rgb(30, 30, 30)'
+BG_VS = 'rgb(255, 255, 254)'
+
+
 # ------------------------------- фикстура ----------------------------------
 
 
@@ -173,6 +185,8 @@ def test_stage7_defaults_in_js(bare_editor, qtbot) -> None:
     # MultiCursorModifier — строковый enum Monaco ('ctrlKey' | 'altKey'),
     # ждём alt (как в VS Code)
     assert editor_option(bare_editor, 'multiCursorModifier') == 'altKey'
+    # NB: autoDetectHighContrast:false (тема редактора) в рантайме не
+    # проверяем — ключа нет в публичном enum EditorOption (monaco 0.55)
 
 
 def test_stage7_keybindings_registered(bare_editor, qtbot) -> None:
@@ -523,3 +537,53 @@ def test_stage7_font_zoom_commands(bare_editor, qtbot) -> None:
 
     trigger_command(bare_editor, 'editor.action.fontZoomReset')
     assert float(font_size()) == pytest.approx(base)
+
+
+def test_editor_theme_light_dark(bare_editor, qtbot) -> None:
+    """Тема Monaco из Python (``set_theme`` = путь DocumentManager): старт
+    с vs-dark, переключение в светлую и обратно меняет фон холста."""
+    wait_editor_ready(qtbot, bare_editor)
+
+    # JS-дефолт defaultEditorOptions — vs-dark (Python тему ещё не применял)
+    assert run_js(bare_editor, JS_EDITOR_BG) == BG_VS_DARK
+
+    bare_editor.set_theme('vs')
+    wait_for(
+        qtbot,
+        lambda: run_js(bare_editor, JS_EDITOR_BG) == BG_VS,
+        message='светлая тема vs не применилась живым сообщением theme',
+    )
+    assert bare_editor.get_theme() == 'vs'
+
+    bare_editor.set_theme('vs-dark')
+    wait_for(
+        qtbot,
+        lambda: run_js(bare_editor, JS_EDITOR_BG) == BG_VS_DARK,
+        message='тема vs-dark не вернулась',
+    )
+
+
+def test_editor_theme_survives_diff_mode(bare_editor, qtbot) -> None:
+    """vendored-патч appliedTheme: тема не теряется при пересоздании
+    редактора — diff-режим наследует её, возврат к standalone (set_text)
+    сохраняет."""
+    wait_editor_ready(qtbot, bare_editor)
+
+    bare_editor.set_theme('vs')
+    wait_for(
+        qtbot,
+        lambda: run_js(bare_editor, JS_EDITOR_BG) == BG_VS,
+        message='светлая тема не стала базовой для теста diff',
+    )
+
+    bare_editor.open_diffs(original='a = 1\n', modified='a = 2\n')
+    qtbot.wait(500)
+
+    # возврат к standalone: case set_text -> switchToStandaloneEditor,
+    # редактор пересоздаётся — без патча тема откатилась бы к vs-dark
+    bare_editor.set_text('def foo():\n    return 1\n')
+    wait_for(
+        qtbot,
+        lambda: run_js(bare_editor, JS_EDITOR_BG) == BG_VS,
+        message='тема потерялась после возврата из diff-режима',
+    )

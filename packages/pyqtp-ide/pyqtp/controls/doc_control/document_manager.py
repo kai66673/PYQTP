@@ -18,6 +18,7 @@ from pyqtp.views.monaco_document_view import MonacoDocumentView
 from pyqtp.web.editor_options import (
     DEFAULT_EDITOR_UX_OPTIONS,
     read_editor_ux_options,
+    resolve_monaco_theme,
     to_monaco_options,
     validate_editor_ux_options,
     write_editor_ux_options,
@@ -26,6 +27,7 @@ from pyqtp.web.editor_options import (
 if TYPE_CHECKING:
     from pyqtp.base.base_main_window import BaseMainWindow
     from pyqtp.base.docking_system.base_dock_widget import BaseDockWidget
+    from pyqtp.theme.theme import Theme
 
 
 def _document_view_cls_from_identity(_identity: str) -> type[BaseDocumentView]:
@@ -85,6 +87,13 @@ class DocumentManager(BaseControl):
             name='qtmonaco', group='Редактор'
         )
 
+        # тема редактора (этап 7): подписка на смену темы приложения — в
+        # режиме «Как в приложении» тема Monaco реально меняется, при явной
+        # светлой/тёмной остаётся прежней (переприменение идемпотентно)
+        self._main_wnd.theme_manager.theme_changed.connect(
+            self._on_app_theme_changed
+        )
+
     def setup(self) -> None:
         super().setup()
 
@@ -136,21 +145,41 @@ class DocumentManager(BaseControl):
         write_editor_ux_options(self._main_wnd.settings, options)
         self._main_wnd.settings.sync()
         monaco_payload = to_monaco_options(options)
+        monaco_theme = resolve_monaco_theme(
+            options, app_is_dark=self._main_wnd.theme_manager.current_theme.is_dark
+        )
         for view in self._opened_docs.values():
-            self._apply_editor_ux_options(view, monaco_payload)
+            self._apply_editor_ux_options(view, monaco_payload, monaco_theme)
 
     def reset_editor_ux_options(self) -> None:
         """Сбрасывает настройки редактора к значениям по умолчанию."""
         self.apply_editor_ux_options(dict(DEFAULT_EDITOR_UX_OPTIONS))
 
+    def _on_app_theme_changed(self, theme: Theme) -> None:
+        """Смена темы приложения -> переприменяем тему Monaco открытым
+        документам (нужно для режима «Как в приложении»).
+        """
+        monaco_theme = resolve_monaco_theme(
+            self.editor_ux_options(), app_is_dark=theme.is_dark
+        )
+        for view in self._opened_docs.values():
+            edit_widget = getattr(view, 'edit_widget', None)
+            if edit_widget is not None:
+                edit_widget.set_theme(monaco_theme)
+
     def _apply_editor_ux_options(
-        self, view: BaseDocumentView, payload: dict[str, Any] | None = None
+        self,
+        view: BaseDocumentView,
+        payload: dict[str, Any] | None = None,
+        monaco_theme: str | None = None,
     ) -> None:
         """Доводит UX-настройки Monaco до редактора конкретной вьюхи (этап 7).
 
         ``payload`` — уже готовые опции Monaco (чтобы не перечитывать QSettings
         на каждую вьюху при массовом применении); по умолчанию — текущие
-        сохранённые настройки. Вьюхи без Monaco (plain text) пропускаются.
+        сохранённые настройки. ``monaco_theme`` — имя темы Monaco (те же
+        соображения при массовом применении). Вьюхи без Monaco (plain text)
+        пропускаются.
 
         Сообщения, посланные до инициализации моста, буферизуются
         ``qtmonaco.Connector`` и уходят в JS сразу после неё, поэтому настройки
@@ -162,6 +191,12 @@ class DocumentManager(BaseControl):
         if payload is None:
             payload = to_monaco_options(self.editor_ux_options())
         edit_widget.update_editor_options(payload)
+        if monaco_theme is None:
+            monaco_theme = resolve_monaco_theme(
+                self.editor_ux_options(),
+                app_is_dark=self._main_wnd.theme_manager.current_theme.is_dark,
+            )
+        edit_widget.set_theme(monaco_theme)
 
     def _open_document(self):
         # Выбираем файл
