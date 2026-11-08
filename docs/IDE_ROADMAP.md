@@ -311,7 +311,8 @@ UTF-16-колонки) + 7 offscreen-GUI с живым rg (гейт экшена
   процесс на тот же ключ; холодный старт: pyright/clangd во время первичной
   индексации после хендшейка отвечают пустым списком (замер на basedpyright
   — индекс готов ~через 2 с), поэтому первый пустой ответ повторяется один
-  раз на процесс (`wsym_answered` + `_WSYM_COLD_RETRY_DELAY`); поколение
+  раз на процесс+метод (механизм `request_local_warm` + `_COLD_RETRY_DELAY`,
+  обобщён этапом 9.5); поколение
   `_wsym_gen` — запоздалые ответы устаревших запросов не доходят до cb;
 - `WorkspaceSymbolDialog` (`pyqtp/controls/project_control/`): немодальный
   в стиле quick open (QLineEdit + QListWidget + статус), дебаунс 400 мс,
@@ -331,10 +332,66 @@ UTF-16-колонки) + 7 offscreen-GUI с живым rg (гейт экшена
 поколению, пустой проект (понятная ошибка без зависания), offscreen-
 диалог: запрос → дебаунс → список → payload открытия).
 
+#### 9.5 — контекстное меню дерева: создать/переименовать/удалить в корзину — ГОТОВО
+- контекстное меню — у `ProjectTreeView`: она только строит QMenu и сопоставляет
+  позицию с путём (`indexAt`) и эмитит сигналы намерений
+  `create_file_requested/create_folder_requested/rename_requested/delete_requested`;
+  пустая область — только создание в корень проекта; диалогов и дисковой
+  логики во вьюхе нет (всё в `ProjectControl`);
+- `project_fileops.py` (`pyqtp/controls/project_control/`): чистые хелперы —
+  валидация имени (без `/`, `\`, `.`, `..`), `create_entry` (файл/папка, без
+  перезаписи), `renamed_path` (отказ при том же имени/занятом), `move_to_trash`
+  через `QFile.moveToTrash()` — при недоступной корзине отказ с предупреждением,
+  без незаметного безвозвратного удаления (квирка: рантайм PySide6 6.6
+  возвращает `bool`, а стабы объявляют пару `(bool, путь_в_корзине)` —
+  нормализованы обе формы);
+- flow переименования (`ProjectControl._on_rename_requested`): диалог ->
+  валидация -> при открытом документе с правками отказ (пусть сохранит),
+  чистая вкладка закрывается молча заранее -> `LspHub.will_rename_files_async
+  (root, old_uri, new_uri, cb)` -> cb через queued-мост `_RenameSignals` и
+  токен-карту `_pending_renames` (чистится при смене корня/teardown) ->
+  слитая правка через ту же точку входа этапа 8.2
+  (`DocumentManager.on_workspace_edit_requested`) -> повторная проверка цели
+  (пока ждали ответ сервера, имя мог занять кто-то другой) -> `Path.rename` ->
+  `did_rename_files` (fire-and-forget — серверам надо обновить индекс) ->
+  переоткрытие вкладки + `reveal_path`; **сбой LSP никогда не блокирует дисковое
+  переименование** — только предупреждение;
+- хаб: `will_rename_files_async`/`did_rename_files` (секция «Файловые
+  операции»); серверы — стек языка переименовываемого файла
+  (`servers_for_uri(old_uri)`), процессы — общий пул `(command, root_uri)`;
+  в отличие от `workspace/symbol` здесь сливаются ответы ВСЕХ объявивших
+  поддержку серверов (каждый правит «своё»: pyright — импорты, clangd —
+  inclusion'ы); чистый разбор/мердж — `file_rename.py`
+  (`pyqtp/controls/lsp_control/`); поддержку принимаем в обеих записи —
+  спеки `workspace.willRenameFiles` и расширенной pyright'овской
+  `workspace.fileOperations.willRename`; хаб обязан заявить
+  `workspace.willRenameFiles` у себя (иначе basedpyright правки импортов не
+  шлёт — regression-guard тест);
+- холодный прогрев обобщён: `_ServerInstance.request_local_warm(method,
+  params, reply_timeout, is_empty)` вместо wsym-специфичного `wsym_answered`;
+  прогрев один на пару (процесс, метод) — `cold_checked`, а параллельные
+  пустые ответы того же метода ждут чужой прогрев и переспрашивают
+  (`cold_inflight`): иначе вот-вот устаревший запрос «сжёг» бы бюджет, а
+  актуальный остался бы с пустым ответом (regression на
+  `test_live_workspace_symbols_cb_and_stale`);
+- `DocumentManager`: программные операции с документами — `has_document`,
+  `document_is_modified`, `documents_under` (под удаляемым каталогом) и
+  `close_document` (без диалогов, с отказом при правках); хвост закрытия
+  central-дока вынесен в общий `_force_close_doc_dock`.
+
+**Приёмка:** `tests/test_project_fileops.py` (20: 6 юнитов fileops — имя/
+создание/переименование/корзина, включая реальный `move_to_trash`, + 6 юнитов
+file_rename — обе записи возможности, форма params, пустой ответ, мердж,
+regression хаба + 5 offscreen — набор меню (файл/каталог/пустая область/без
+проекта) и пути сигналов, создание файла/папки + коллизия + отмена, rename
+без LSP: дисковая правка импорта + переезд файла + didRenameFiles + отброс
+устаревшего ответа, guard'ы rename: отказ при правках / закрыть-переоткрыть
+/ сбой хаба не блокирует / занятое имя, delete: отказ No / отказ при
+правках под путём / закрытие чистых документов перед корзиной + 3 live с
+реальным basedpyright — willRenameFiles приносит правку импорта, cb всегда
+приходит при пустом стеке серверов, сквозная приёмка переименования).
+
 #### Остаток этапа 9
-- контекстное меню дерева (create/rename/delete в корзину с подтверждением;
-  rename — через **LSP `willRenameFiles`/`didRenameFiles`** — у хаба пока
-  нет, добавим сообщение DocumentManager→LspHub);
 - сессия проекта (вкладки/активная/раскладка; хранение — каталог `.pyqtp/`
   проекта или QSettings по пути);
 - закладки: Monaco decorations + `.pyqtp/bookmarks.json` + панель закладок.

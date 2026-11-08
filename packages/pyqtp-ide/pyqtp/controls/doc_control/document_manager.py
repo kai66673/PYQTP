@@ -439,9 +439,60 @@ class DocumentManager(BaseControl):
         # нет ads-совместимого closeDockWidget, есть только forceClose
         # (закрывает core-состояние дока без повторного QCloseEvent —
         # рекурсии в фильтр закрытия из view_central_register не будет)
+        self._force_close_doc_dock(view, dock, view_key)
+
+    def _force_close_doc_dock(
+        self, view: BaseDocumentView, dock: BaseDockWidget, view_key: str
+    ) -> None:
+        """Хвост закрытия документа: forceClose дока + снятие учёта."""
         # getattr, а не прямой вызов: у «голых» kdd.DockWidget метода
         # closeDockWidget нет (ruff B009 / pyright об Protocol)
         close_dock = getattr(dock, 'closeDockWidget', None) or getattr(dock, 'forceClose')  # noqa: B009
         close_dock()
         self.document_closed.emit(view)
         del self._opened_docs[view_key]
+
+    # --- программные операции с открытыми документами (этап 9.5) ---
+
+    def has_document(self, identity: str | Path) -> bool:
+        """Открыт ли документ с таким путём-ключом."""
+        return str(Path(identity)) in self._opened_docs
+
+    def document_is_modified(self, identity: str | Path) -> bool:
+        """Есть ли несохранённые правки (для закрытого — False)."""
+        view = self._opened_docs.get(str(Path(identity)))
+        return bool(view is not None and view.document().is_modified())
+
+    def documents_under(self, path: str | Path) -> list[Path]:
+        """Открытые документы, совпадающие с ``path`` или лежащие внутри."""
+        base = Path(path)
+        return [
+            Path(key)
+            for key in self._opened_docs
+            if Path(key) == base or base in Path(key).parents
+        ]
+
+    def close_document(self, identity: str | Path) -> bool:
+        """Закрыть документ без диалогов (этап 9.5, переименование).
+
+        True — закрыт или уже не открыт; False — есть несохранённые правки
+        (молча отказываем: диалог сохранения — задача инициатора, как и в
+        ``_handle_doc_view_close_requested``).
+        """
+        view_key = str(Path(identity))
+        view = self._opened_docs.get(view_key)
+        if view is None:
+            return True
+        if view.document().is_modified():
+            return False
+        # central-доки живут в documents_dock у KDD-менеджера (в _docks их
+        # нет — view_close на них KeyError); нет атрибута — закрываем только
+        # учёт, чтобы операция над диском не встала из-за доковой тонкости
+        docks = getattr(self._main_wnd.views_manager, 'documents_dock', None)
+        dock = docks.get(view_key) if isinstance(docks, dict) else None
+        if dock is None:
+            self.document_closed.emit(view)
+            del self._opened_docs[view_key]
+            return True
+        self._force_close_doc_dock(view, dock, view_key)
+        return True

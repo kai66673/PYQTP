@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import itertools
 import logging
 import threading
 from pathlib import Path
@@ -7,9 +8,15 @@ from typing import TYPE_CHECKING, Any
 
 from PySide6.QtCore import QObject, QUrl, Signal
 from PySide6.QtGui import QIcon, QKeySequence
-from PySide6.QtWidgets import QFileDialog
+from PySide6.QtWidgets import QFileDialog, QInputDialog, QLineEdit, QMessageBox
 
 from pyqtp.controls.base_control import BaseControl
+from pyqtp.controls.project_control.project_fileops import (
+    ProjectOpError,
+    create_entry,
+    move_to_trash,
+    renamed_path,
+)
 from pyqtp.controls.project_control.quick_open import iter_project_files
 from pyqtp.controls.project_control.quick_open_dialog import QuickOpenDialog
 from pyqtp.controls.project_control.workspace_symbol_dialog import (
@@ -31,6 +38,12 @@ class _ScanSignals(QObject):
     """Мост «фоновый поток -> поток GUI» для результатов скана файлов."""
 
     finished = Signal(int, list)  # поколение скана + относительные пути
+
+
+class _RenameSignals(QObject):
+    """Мост «поток event-loop хаба -> поток GUI» для ответа willRenameFiles."""
+
+    answered = Signal(int, object, object)  # токен + edit dict|None + err str|None
 
 
 class ProjectControl(BaseControl):
@@ -115,6 +128,14 @@ class ProjectControl(BaseControl):
         self._quick_dialog: QuickOpenDialog | None = None
         self._symbol_dialog: WorkspaceSymbolDialog | None = None
 
+        # файловые операции «Проводника» (этап 9.5): переименование ждёт
+        # ответа willRenameFiles в потоке GUI по токену; устаревшие ответы
+        # (смена корня/teardown) отбрасываются очисткой карты
+        self._rename_signals = _RenameSignals()
+        self._rename_signals.answered.connect(self._on_rename_answered)
+        self._rename_seq = itertools.count(1)
+        self._pending_renames: dict[int, dict[str, Any]] = {}
+
     ###############
     # Настройки #
 
@@ -180,6 +201,10 @@ class ProjectControl(BaseControl):
         self._main_wnd.view_register(view, widget_area='left')
 
         view.file_open_requested.connect(self._open_file_from_tree)
+        view.create_file_requested.connect(self._on_create_file_requested)
+        view.create_folder_requested.connect(self._on_create_folder_requested)
+        view.rename_requested.connect(self._on_rename_requested)
+        view.delete_requested.connect(self._on_delete_requested)
         self.project_root_changed.connect(view.set_project_root)
 
         self.search_view = search_view = ProjectSearchView(
@@ -204,6 +229,7 @@ class ProjectControl(BaseControl):
     def teardown_views(self) -> None:
         super().teardown_views()
         self._scan_gen += 1  # сброс: запоздалые результаты скана не нужны
+        self._pending_renames.clear()  # чужие ответы willRenameFiles не нужны
         if self._symbol_dialog is not None:
             self._symbol_dialog.drop_pending()
         if self.search_view is not None:
@@ -273,6 +299,7 @@ class ProjectControl(BaseControl):
         """Смена корня проекта: старт/сброс фонового кэша файлов + экшен поиска."""
         if root is None:
             self._scan_gen += 1
+            self._pending_renames.clear()  # чужие ответы willRenameFiles не нужны
             self._quick_files = []
             self.action_quick_open.setEnabled(False)
             self.action_project_search.setEnabled(False)
@@ -371,6 +398,192 @@ class ProjectControl(BaseControl):
     def _open_symbol_payload(self, payload: dict) -> None:
         """Символ из диалога -> открыть файл и каретка на месте определения."""
         self._main_wnd.doc_ctrl.open_definition_uri(payload)
+
+    ############################################
+    # Файловые операции «Проводника» (этап 9.5) #
+
+    def _on_create_file_requested(self, dir_str: str) -> None:
+        self._create_entry(dir_str, is_dir=False)
+
+    def _on_create_folder_requested(self, dir_str: str) -> None:
+        self._create_entry(dir_str, is_dir=True)
+
+    def _create_entry(self, dir_str: str, *, is_dir: bool) -> None:
+        """Диалог имени -> ``project_fileops.create_entry`` -> reveal в дереве."""
+        if self._project_root is None:
+            return
+        title = 'Новая папка' if is_dir else 'Новый файл'
+        name, ok = QInputDialog.getText(self._main_wnd, title, 'Имя:')
+        if not ok:
+            return
+        try:
+            created = create_entry(Path(dir_str), name, is_dir=is_dir)
+        except ProjectOpError as exc:
+            self._file_op_warning(str(exc))
+            return
+        prj_log.info('%s создан(а): %s', title, created)
+        if self.tree_view is not None:
+            # QFileSystemModel замечает изменение каталога сам через watcher;
+            # reveal дождётся наполнения строками шагами (как в 9.1)
+            self.tree_view.reveal_path(created)
+
+    def _on_rename_requested(self, path_str: str) -> None:
+        """Диалог имени -> willRenameFiles -> правки -> дисковый rename.
+
+        Документ открыт c правками — отказ (пусть пользователь сохранит);
+        открытый чистый закрываем заранее, чтобы сервер правил диск, а
+        каретка/вкладка вернулись уже на новый путь. LSP-сбой не блокирует
+        переименование — только предупреждение в журнал.
+        """
+        if self._project_root is None:
+            return
+        target = Path(path_str)
+        new_name, ok = QInputDialog.getText(
+            self._main_wnd,
+            'Переименовать',
+            'Новое имя:',
+            QLineEdit.EchoMode.Normal,
+            target.name,
+        )
+        if not ok:
+            return
+        try:
+            new_path = renamed_path(target, new_name)
+        except ProjectOpError as exc:
+            self._file_op_warning(str(exc))
+            return
+        doc_ctrl = self._main_wnd.doc_ctrl
+        was_open = doc_ctrl.has_document(target)
+        if was_open and doc_ctrl.document_is_modified(target):
+            self._file_op_warning(
+                'Файл открыт в редакторе с несохранёнными правками — '
+                'сначала сохраните его (Ctrl+S).'
+            )
+            return
+        if was_open and not doc_ctrl.close_document(target):
+            self._file_op_warning('Не удалось закрыть документ — повторите позже.')
+            return
+        token = next(self._rename_seq)
+        self._pending_renames[token] = {
+            'old': target,
+            'new': new_path,
+            'was_open': was_open,
+        }
+        root = self._project_root
+        signals = self._rename_signals
+
+        def _cb(edit: Any, error: Any) -> None:
+            # хаб зовёт колбэк из своего потока — в GUI доставляем queued
+            signals.answered.emit(token, edit, error)
+
+        try:
+            self._main_wnd.lsp_hub.will_rename_files_async(
+                root, target.as_uri(), new_path.as_uri(), cb=_cb,
+            )
+        except (RuntimeError, OSError) as exc:
+            # хаб не поднялся — обходимся без LSP-правок
+            prj_log.warning('willRenameFiles недоступен: %s', exc)
+            self._pending_renames.pop(token, None)
+            self._finish_rename(target, new_path, None, None, was_open=was_open)
+
+    def _on_rename_answered(self, token: int, edit: object, error: object) -> None:
+        """Ответ willRenameFiles из потока хаба (queued-мост ``_RenameSignals``)."""
+        ctx = self._pending_renames.pop(token, None)
+        if ctx is None:
+            return  # проект уже сменился/закрыт — запоздалый ответ
+        self._finish_rename(
+            ctx['old'], ctx['new'], edit, error, was_open=ctx['was_open']
+        )
+
+    def _finish_rename(
+        self,
+        old: Path,
+        new: Path,
+        edit: object,
+        error: object,
+        *,
+        was_open: bool,
+    ) -> None:
+        """Применить LSP-правки, переименовать на диске, вернуть вкладку."""
+        doc_ctrl = self._main_wnd.doc_ctrl
+        if isinstance(edit, dict) and edit:
+            try:
+                doc_ctrl.on_workspace_edit_requested(
+                    {'origin': 'rename', 'workspaceEdit': edit}
+                )
+            except OSError as exc:
+                # правки чужих файлов могли не лечь (диск/конкурентная правка) —
+                # само переименование это не отменяет
+                prj_log.warning('Применение LSP-правок переименования: %s', exc)
+        if error:
+            prj_log.warning('LSP не сопроводил переименование: %s', error)
+        if new.exists():
+            # пока ждали ответ сервера, имя мог занять кто-то другой
+            self._file_op_warning(
+                f'«{new.name}» уже существует — переименование отменено.'
+            )
+            if was_open:
+                doc_ctrl.open_document(old)
+            return
+        try:
+            old.rename(new)
+        except OSError as exc:
+            self._file_op_warning(f'Не удалось переименовать: {exc}')
+            if was_open:
+                doc_ctrl.open_document(old)
+            return
+        prj_log.info('Переименовано: %s -> %s', old, new)
+        if self._project_root is not None:
+            try:
+                self._main_wnd.lsp_hub.did_rename_files(
+                    self._project_root, old.as_uri(), new.as_uri()
+                )
+            except RuntimeError as exc:
+                prj_log.debug('didRenameFiles пропущен: %s', exc)
+        if was_open:
+            doc_ctrl.open_document(new)
+        if self.tree_view is not None:
+            self.tree_view.reveal_path(new)
+
+    def _on_delete_requested(self, path_str: str) -> None:
+        """Подтверждение -> закрытие связанных документов -> корзина (QFile)."""
+        if self._project_root is None:
+            return
+        target = Path(path_str)
+        if not target.exists():
+            self._file_op_warning('Запись уже пропала с диска.')
+            return
+        answer = QMessageBox.question(
+            self._main_wnd,
+            'Удаление',
+            f'Переместить «{target.name}» в корзину?',
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        doc_ctrl = self._main_wnd.doc_ctrl
+        affected = doc_ctrl.documents_under(target)
+        if any(doc_ctrl.document_is_modified(path) for path in affected):
+            self._file_op_warning(
+                'Среди удаляемых файлов есть открытые с несохранёнными '
+                'правками — сначала сохраните их (Ctrl+S).'
+            )
+            return
+        for path in affected:
+            doc_ctrl.close_document(path)
+        if not move_to_trash(target):
+            self._file_op_warning(
+                f'Не удалось переместить «{target.name}» в корзину '
+                '(возможно, на этом томе корзины нет).'
+            )
+            return
+        prj_log.info('Перемещено в корзину: %s', target)
+
+    def _file_op_warning(self, text: str) -> None:
+        """Предупреждение об отказе файловой операции (журнал + диалог)."""
+        prj_log.warning('Операция с файлом: %s', text)
+        QMessageBox.warning(self._main_wnd, 'Операция с файлом', text)
 
     def _persist_root(self) -> None:
         settings = self._main_wnd.settings

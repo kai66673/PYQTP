@@ -6,12 +6,13 @@ from typing import TYPE_CHECKING
 from PySide6.QtCore import (
     QModelIndex,
     QPersistentModelIndex,
+    QPoint,
     QSortFilterProxyModel,
     Qt,
     QTimer,
     Signal,
 )
-from PySide6.QtWidgets import QFileSystemModel, QTreeView
+from PySide6.QtWidgets import QFileSystemModel, QMenu, QTreeView
 
 from pyqtp.views.base_main_window_view import BaseMainWindowView
 
@@ -69,6 +70,15 @@ class ProjectTreeView(BaseMainWindowView):
 
     file_open_requested = Signal(str)
 
+    # Контекстное меню (этап 9.5): вьюха только строит меню и сопоставляет
+    # позицию с путём — сами операции (диалоги, диск, LSP-обход) принадлежат
+    # ProjectControl. create_* несут каталог-родитель, rename/delete — путь
+    # цели операции.
+    create_file_requested = Signal(str)
+    create_folder_requested = Signal(str)
+    rename_requested = Signal(str)
+    delete_requested = Signal(str)
+
     def __init__(
         self,
         main_wnd: PluggableMainWindow,
@@ -100,6 +110,8 @@ class ProjectTreeView(BaseMainWindowView):
         self._tree.setSortingEnabled(True)
         self._tree.sortByColumn(0, Qt.SortOrder.AscendingOrder)
         self._tree.activated.connect(self._on_activated)
+        self._tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._tree.customContextMenuRequested.connect(self._on_context_menu)
         self.set_widget(self._tree)
 
     # --- корень проекта ---
@@ -136,6 +148,62 @@ class ProjectTreeView(BaseMainWindowView):
         if not source.isValid() or self._model.isDir(source):
             return
         self.file_open_requested.emit(self._model.filePath(source))
+
+    # --- контекстное меню (этап 9.5) ---
+
+    def _on_context_menu(self, pos: QPoint) -> None:
+        """Позиция правого клика -> меню; выбор эмитит сигнал намерения."""
+        menu = self._build_context_menu(pos)
+        if menu is None:
+            return
+        menu.exec(self._tree.viewport().mapToGlobal(pos))
+
+    def _build_context_menu(self, pos: QPoint) -> QMenu | None:
+        """Меню для позиции ``pos`` в координатах дерева (``None`` — меню нет).
+
+        Пустая область — только «создать» в корне проекта; каталог — создание
+        + переименование/удаление; файл — открытие + переименование/удаление.
+        """
+        if self._root_path is None:
+            return None
+        index = self._tree.indexAt(pos)
+        if not index.isValid():
+            menu = QMenu(self._tree)
+            self._add_create_actions(menu, self._root_path)
+            return menu
+        source = self._proxy.mapToSource(index)
+        if not source.isValid():
+            return None
+        path = self._model.filePath(source)
+        menu = QMenu(self._tree)
+        if self._model.isDir(source):
+            self._add_create_actions(menu, Path(path))
+            menu.addSeparator()
+        else:
+            action = menu.addAction('Открыть')
+            action.triggered.connect(
+                lambda: self.file_open_requested.emit(path)
+            )
+            menu.addSeparator()
+        self._add_rename_delete_actions(menu, path)
+        return menu
+
+    def _add_create_actions(self, menu: QMenu, directory: Path) -> None:
+        target = str(directory)
+        action = menu.addAction('Новый файл')
+        action.triggered.connect(
+            lambda: self.create_file_requested.emit(target)
+        )
+        action = menu.addAction('Новая папка')
+        action.triggered.connect(
+            lambda: self.create_folder_requested.emit(target)
+        )
+
+    def _add_rename_delete_actions(self, menu: QMenu, path: str) -> None:
+        action = menu.addAction('Переименовать')
+        action.triggered.connect(lambda: self.rename_requested.emit(path))
+        action = menu.addAction('Удалить в корзину')
+        action.triggered.connect(lambda: self.delete_requested.emit(path))
 
     # --- раскрытие к файлу (reveal) ---
 

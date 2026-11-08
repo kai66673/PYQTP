@@ -45,6 +45,12 @@ from websockets.asyncio.server import serve
 from websockets.exceptions import ConnectionClosed
 
 from pyqtp.controls.base_control import BaseControl
+from pyqtp.controls.lsp_control.file_rename import (
+    is_empty_rename_result,
+    merge_will_rename_results,
+    rename_files_params,
+    supports_will_rename,
+)
 from pyqtp.controls.lsp_control.lsp_process_wrapper import StdioLspProcess
 from pyqtp.controls.lsp_control.lsp_registry import (
     LspRegistry,
@@ -185,6 +191,10 @@ HUB_CAPABILITIES: dict[str, Any] = {
         # поиск символов по корню проекта (остаток этапа 8): запрос исходит
         # от хаба, динамическая регистрация не нужна
         'workspaceSymbol': {'dynamicRegistration': False},
+        # переименование файлов из панели проекта (этап 9.5): запрос тоже
+        # исходит от хаба; без этой возможности basedpyright правки импортов
+        # не шлёт
+        'willRenameFiles': {'dynamicRegistration': False},
         # чужие WorkspaceEdit применяем сами (doc_control/workspace_edit.py):
         # серверу отвечаем, что applyEdit у клиента нет, чтобы он не присылал
         # workspace/applyEdit и включал documentChanges/ресурсные операции
@@ -208,10 +218,11 @@ SERVER_NOTIFICATIONS_SWALLOW = frozenset({
 # Нотификации клиента, которые не пересылаются процессу (хендшейк делает хаб)
 CLIENT_NOTIFICATIONS_SWALLOW = frozenset({'initialized', 'exit', '$/setTrace'})
 
-# Повторная пауза для «холодного» пустого ответа workspace/symbol
+# Повторная пауза для «холодного» пустого ответа локальных запросов хаба
 # (первичная индексация проекта сервером; измерено на basedpyright — индекс
-# готов примерно через 2 с после handshake на маленьком проекте)
-_WSYM_COLD_RETRY_DELAY = 2.0
+# готов примерно через 2 с после handshake на маленьком проекте; одинаково
+# для workspace/symbol и workspace/willRenameFiles)
+_COLD_RETRY_DELAY = 2.0
 
 
 @dataclass
@@ -250,9 +261,13 @@ class _ServerInstance:
         # хендшейк (initialize) завершён — событие ставим в finally start();
         # параллельные _ensure_instance ждут его, а не плодят второй процесс
         self._ready = asyncio.Event()
-        # первый ответ workspace/symbol по этому процессу уже был (прогрев
-        # холодного индекса сервера делается один раз на процесс)
-        self.wsym_answered = False
+        # методы «холодого» прогрева (см. request_local_warm) уже проверены
+        # на этом процессе: повторный пустой ответ — это ответ, а не недогрев
+        self.cold_checked: set[str] = set()
+        # методы, чей прогрев прямо сейчас исполняет другой запрос: параллельные
+        # пустые ответы не должны «съедать» общий бюджет — второй ждёт чужой
+        # прогрев и переспрашивает сам (гонка из test_live_workspace_symbols_cb)
+        self.cold_inflight: set[str] = set()
 
     async def start(self) -> None:
         try:
@@ -317,6 +332,49 @@ class _ServerInstance:
             return await fut
         finally:
             self._local_futures.pop(mid, None)
+
+    async def request_local_warm(
+        self,
+        method: str,
+        params: Any,
+        reply_timeout: float,
+        is_empty: Callable[[Any], bool],
+    ) -> dict:
+        """``request_local`` + один «холодный» прогрев на пару (метод, процесс).
+
+        Холодные basedpyright/clangd во время построения первичного индекса
+        отвечают пусто (а не ждут) — пустой ответ до прогрева получает второй
+        шанс через ``_COLD_RETRY_DELAY``; прогрев — один раз на метод, но
+        параллельные запросы того же метода тоже дожидаются чужого прогрева и
+        переспрашивают (иначе запрос, который вот-вот станет устаревшим,
+        «сжигает» бюджет, а актуальный остаётся с пустым ответом).
+        Непустой ответ — индекс уже прогрет, метод сразу считается тёплым.
+        Таймауты самого запроса здесь не глотаются — решает вызывающий код.
+        """
+        response = await asyncio.wait_for(
+            self.request_local(method, params), reply_timeout
+        )
+        if 'error' in response:
+            return response
+        if not is_empty(response.get('result')):
+            self.cold_checked.add(method)
+            return response
+        if method in self.cold_checked:
+            return response  # прогрев уже был — пустой ответ это ответ
+        first = method not in self.cold_inflight
+        self.cold_inflight.add(method)
+        try:
+            await asyncio.sleep(_COLD_RETRY_DELAY)
+            return await asyncio.wait_for(
+                self.request_local(method, params), reply_timeout
+            )
+        except (TimeoutError, ConnectionError, OSError):
+            # прогрев сорвался — отдаём исходный (пустой, но валидный) ответ
+            return response
+        finally:
+            if first:
+                self.cold_inflight.discard(method)
+                self.cold_checked.add(method)
 
     def client_request_id(self, conn: _ClientConnection, original: Any) -> str:
         return f'c{conn.seq}:{original}'
@@ -844,11 +902,11 @@ class LspHub(BaseControl):
             if not spec_supports_workspace_symbol(inst.init_result):
                 continue
             try:
-                response = await asyncio.wait_for(
-                    inst.request_local(
-                        'workspace/symbol', {'query': query}
-                    ),
+                response = await inst.request_local_warm(
+                    'workspace/symbol',
+                    {'query': query},
                     reply_timeout,
+                    lambda res: not parse_workspace_symbols(res),
                 )
             except (TimeoutError, ConnectionError, OSError):
                 last_error = (
@@ -861,23 +919,6 @@ class LspHub(BaseControl):
                 last_error = f'{spec.name}: {message or "ошибка запроса"}'
                 continue
             symbols = parse_workspace_symbols(response.get('result'))
-            if not symbols and not inst.wsym_answered:
-                # холодный старт: pyright/clangd во время построения
-                # первичного индекса отвечают пустым списком, а не ждут —
-                # даём запросу второй шанс (один раз на процесс)
-                await asyncio.sleep(_WSYM_COLD_RETRY_DELAY)
-                try:
-                    response = await asyncio.wait_for(
-                        inst.request_local(
-                            'workspace/symbol', {'query': query}
-                        ),
-                        reply_timeout,
-                    )
-                except (TimeoutError, ConnectionError, OSError):
-                    response = {}
-                if 'result' in response:
-                    symbols = parse_workspace_symbols(response['result'])
-            inst.wsym_answered = True
             srv_log.info(
                 '%s: workspace/symbol %r -> %d символов',
                 spec.name, query, len(symbols),
@@ -907,6 +948,174 @@ class LspHub(BaseControl):
                 for spec in self._registry.servers_for_uri(sample_uri)
             )
         return samples
+
+    ################################
+    # Файловые операции (этап 9.5) #
+
+    def will_rename_files_async(
+        self,
+        project_root: Path,
+        old_uri: str,
+        new_uri: str,
+        cb: Callable[[dict[str, Any] | None, str | None], None] | None = None,
+        timeout: float = 5.0,
+    ) -> Future[tuple[dict[str, Any] | None, str | None]]:
+        """``workspace/willRenameFiles`` перед переименованием файла на диске.
+
+        Вызывается из GUI-потока; запрос исполняется в event-loop потока
+        хаба. Серверы берутся из стека языка переименовываемого файла
+        (``servers_for_uri(old_uri)``), процессы — из общего пула
+        ``(command, root_uri)``. В отличие от ``workspace/symbol`` здесь
+        сливаются ответы ВСЕХ серверов, объявивших поддержку: каждый правит
+        «свои» ссылки (pyright — импорты, clangd — inclusion'ы).
+
+        ``cb(edit, error)`` вызывается в потоке хаба (GUI-стороне цеплять
+        queued-сигнал) ВСЕГДА — порождённые ответы не гасятся (поколение
+        фильтрует сама вызвавшая сторона, см. ProjectControl). ``edit`` —
+        слитый WorkspaceEdit (форма ``documentChanges``) или ``None``, если
+        правок нет ни у кого; ``error`` — информационное: переименование
+        из-за сбоя LSP не отменяется. Тот же результат возвращает
+        ``concurrent.futures.Future``.
+        """
+        self.ensure_started()
+        loop = self._loop
+        if loop is None:  # ensure_started уже кинул, но loop гаснет на shutdown
+            msg = 'LSP hub остановлен'
+            raise RuntimeError(msg)
+        root_uri = Path(project_root).resolve().as_uri()
+        fut = asyncio.run_coroutine_threadsafe(
+            self._gather_will_rename(root_uri, old_uri, new_uri, timeout),
+            loop,
+        )
+        if cb is None:
+            return fut
+
+        def _done(
+            fut_: Future[tuple[dict[str, Any] | None, str | None]],
+        ) -> None:
+            if fut_.cancelled():
+                return
+            try:
+                edit, error = fut_.result()
+            except (Exception, asyncio.CancelledError):  # noqa: BLE001
+                srv_log.exception(
+                    'workspace/willRenameFiles упал в потоке хаба',
+                )
+                edit, error = None, (
+                    'внутренняя ошибка хаба (подробности в журнале LSP)'
+                )
+            with contextlib.suppress(Exception):
+                cb(edit, error)
+
+        fut.add_done_callback(_done)
+        return fut
+
+    def did_rename_files(
+        self, project_root: Path, old_uri: str, new_uri: str
+    ) -> None:
+        """Нотификация ``workspace/didRenameFiles`` всем живым процессам корня.
+
+        После дискового переименования серверам (basedpyright/clangd) нужно
+        обновить индекс; ответа не ждём — fire-and-forget. Если хаба нет
+        (ещё не стартовал или уже гаснет) — молча уходим, поднимать хаб
+        ради нотификации не за чем.
+        """
+        loop = self._loop
+        if loop is None:
+            return
+        root_uri = Path(project_root).resolve().as_uri()
+        params = rename_files_params(old_uri, new_uri)
+
+        async def _notify() -> None:
+            for inst in list(self._instances.values()):
+                if (
+                    inst.root_uri != root_uri
+                    or inst.dying
+                    or not inst.init_result
+                ):
+                    continue
+                try:
+                    await inst.proc.send({
+                        'jsonrpc': '2.0',
+                        'method': 'workspace/didRenameFiles',
+                        'params': params,
+                    })
+                except (ConnectionResetError, BrokenPipeError, OSError):
+                    continue
+
+        fut = asyncio.run_coroutine_threadsafe(_notify(), loop)
+
+        def _done(fut_: Future[None]) -> None:
+            if fut_.cancelled():
+                return
+            with contextlib.suppress(Exception):
+                fut_.result()
+
+        fut.add_done_callback(_done)
+
+    async def _gather_will_rename(
+        self, root_uri: str, old_uri: str, new_uri: str, reply_timeout: float
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        """Рабочая лошадка запроса; живёт в потоке event-loop хаба."""
+        try:
+            return await self._will_rename(root_uri, old_uri, new_uri, reply_timeout)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            srv_log.exception(
+                'workspace/willRenameFiles (%s -> %s) упал', old_uri, new_uri,
+            )
+            return None, 'внутренняя ошибка хаба (подробности в журнале LSP)'
+
+    async def _will_rename(
+        self, root_uri: str, old_uri: str, new_uri: str, reply_timeout: float
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        """Опрос стека серверов языка файла; ответы сливаются.
+
+        ``error`` — последняя неудача, если правок не принесли, но не
+        отказ: переименование всё равно исполняется без правок LSP.
+        """
+        params = rename_files_params(old_uri, new_uri)
+        results: list[Any] = []
+        last_error: str | None = None
+        for spec in self._registry.servers_for_uri(old_uri):
+            try:
+                inst = await self._ensure_instance(spec, root_uri)
+            except (OSError, RuntimeError) as exc:
+                last_error = str(exc)
+                continue
+            if inst.dying:
+                last_error = f'{spec.name}: процесс завершается'
+                continue
+            if not supports_will_rename(inst.init_result):
+                continue
+            try:
+                response = await inst.request_local_warm(
+                    'workspace/willRenameFiles',
+                    params,
+                    reply_timeout,
+                    is_empty_rename_result,
+                )
+            except (TimeoutError, ConnectionError, OSError):
+                last_error = (
+                    f'{spec.name}: ответ не получен (сервер не готов или '
+                    'процесс завершился)'
+                )
+                continue
+            if 'error' in response:
+                message = (response.get('error') or {}).get('message')
+                last_error = f'{spec.name}: {message or "ошибка запроса"}'
+                continue
+            results.append(response.get('result'))
+        edit = merge_will_rename_results(results)
+        count = sum(len(c) for c in (edit or {}).get('documentChanges', []))
+        srv_log.info(
+            'willRenameFiles %s -> %s: %d правок от %d серверов',
+            old_uri, new_uri, count, len(results),
+        )
+        if edit is None:
+            return None, last_error
+        return edit, None
 
     async def _route_from_client(
         self, inst: _ServerInstance, conn: _ClientConnection, msg: dict

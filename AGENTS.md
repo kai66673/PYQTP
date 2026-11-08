@@ -53,11 +53,12 @@ Verify in this order: **ruff → pyright → tests → run the app**.
    + stage-9.1 project tree panel (test_project_tree.py, offscreen GUI без LSP/WebEngine, без маркеров)
    + stage-9.2 quick open (test_quick_open.py: scorer/scan unit без GUI + live offscreen диалог)
    + stage-9.3 project search (test_project_search.py: argv/парсер юниты без GUI и без бинаря rg + live offscreen с живым rg, skipif без rg)
-   + stage-9.4 workspace/symbol (test_workspace_symbol.py: юниты разбора ответа/гейтов/`sample_file_for` без GUI + live hub с basedpyright + live offscreen диалог)). Markers `live`
+   + stage-9.4 workspace/symbol (test_workspace_symbol.py: юниты разбора ответа/гейтов/`sample_file_for` без GUI + live hub с basedpyright + live offscreen диалог)
+   + stage-9.5 project fileops (test_project_fileops.py: юниты fileops/file_rename без GUI + offscreen меню/обработчики с фейковым хабом + live basedpyright end-to-end rename)). Markers `live`
   (real LSP server processes) and
-  `webengine` (real QWebEngineView/Monaco) are deselected by default via `addopts` → 93 passed / 31
+  `webengine` (real QWebEngineView/Monaco) are deselected by default via `addopts` → 110 passed / 34
   deselected; run them with `uv run pytest -m 'live or webengine'` (~2 min, they work offscreen) or
-  all 124 in one
+  all 144 in one
   process with `uv run pytest -m ''` (~2 min, full run keeps passing despite `os._exit` in
   `pytest_sessionfinish` eating the summary line — count the dots). Test-suite gotchas:
   - root `conftest.py` sets `QT_QPA_PLATFORM=offscreen` + `QTWEBENGINE_DISABLE_SANDBOX=1` at import
@@ -270,6 +271,34 @@ Verify in this order: **ruff → pyright → tests → run the app**.
    `action_workspace_symbols` (Ctrl+T) активируется/гаснет вместе с
    quick-open/поиском, console-API `workspace_symbols_show`, выбор →
    `doc_ctrl.open_definition_uri` (тот же путь, что LSP-переходы).
+   Файловые операции «Проводника» (этап 9.5): `ProjectTreeView` строит только
+   контекстное меню QMenu (позиция → путь через `indexAt`, тексты пунктов:
+   «Открыть»/«Новый файл»/«Новая папка»/«Переименовать»/«Удалить в корзину»;
+   пустая область — только создание в корень) и эмитит сигналы намерений
+   `create_file_requested/create_folder_requested/rename_requested/
+   delete_requested`; диалоги (QInputDialog/QMessageBox), диск и LSP-обход —
+   на `ProjectControl` поверх чистых хелперов `project_control/project_fileops.py`
+   (валидация имени/`create_entry`/`renamed_path`/`move_to_trash` —
+   `QFile.moveToTrash()`, при недоступной корзине отказ с предупреждением,
+   никогда не удаляем безвозвратно молча; квирка: рантайм PySide6 6.6 отдаёт
+   `bool`, стабы объявляют пару `(bool, путь_в_корзине)` — нормализованы обе
+   формы). Rename-flow: валидация -> при открытом документе с правками отказ,
+   чистая вкладка закрывается заранее (`DocumentManager.has_document/
+   document_is_modified/close_document/documents_under` + общий хелпер
+   `_force_close_doc_dock`) -> `lsp_hub.will_rename_files_async(root, old_uri,
+   new_uri, cb)` (чистый разбор/мердж — `lsp_control/file_rename.py`; поддержка
+   принимается в обеих записях — спековой `workspace.willRenameFiles` и
+   pyright'овской `workspace.fileOperations.willRename`; хаб обязан заявить
+   `workspace.willRenameFiles` в `HUB_CAPABILITIES`, иначе basedpyright правки
+   импортов не шлёт; в отличие от wsym здесь сливаются ответы ВСЕХ поддерживающих
+   серверов) -> cb через queued-мост `_RenameSignals` + токен-карту
+   `_pending_renames` (чистится при смене корня и в `teardown_views`) -> слитая
+   правка через `doc_ctrl.on_workspace_edit_requested({'origin': 'rename', ...})`
+   -> повторная проверка `new.exists()` (имя могли занять, пока ждали ответ) ->
+   `old.rename(new)` -> `hub.did_rename_files(...)` fire-and-forget (серверам
+   обновить индекс) -> переоткрытие вкладки + `tree_view.reveal_path`; сбой LSP
+   НИКОГДА не блокирует дисковое переименование. Create/delete LSP-нотификаций
+   не шлют (v1).
 
 ## Runtime gotchas
 
@@ -307,9 +336,14 @@ Verify in this order: **ruff → pyright → tests → run the app**.
   Concurrency + cold start: `_ServerInstance._ready` (`asyncio.Event`, set in
   `start()` finally) — concurrent `_ensure_instance` calls await the handshake
   instead of spawning a second process on the same key; basedpyright/clangd
-  answer `workspace/symbol` with `[]` (not an error) while building their initial
-  index after the handshake (~2 s on a small project) — hence one cold-retry per
-  process (`wsym_answered` flag + `_WSYM_COLD_RETRY_DELAY`);
+  answer cold (`[]`, not an error) while building their initial index after the
+  handshake (~2 s on a small project) — hence `_ServerInstance.request_local_warm(
+  method, params, reply_timeout, is_empty)`: one cold-retry per (process, method)
+  (`cold_checked` budget + `_COLD_RETRY_DELAY`, shared by `workspace/symbol` and
+  `workspace/willRenameFiles`), and concurrent same-method empty answers await
+  each other's warm and re-ask instead of burning the budget (race found by
+  `test_live_workspace_symbols_cb_and_stale` — a about-to-be-stale request must
+  not leave the current one with an empty answer);
   `HUB_CAPABILITIES['workspace']['workspaceSymbol']` must be advertised or the
   server never enables the feature.
 - The server registry (`lsp_registry.py`, `LspRegistry`) is **configurable, not hardcoded**:
