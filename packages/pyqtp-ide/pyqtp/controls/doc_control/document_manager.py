@@ -24,6 +24,7 @@ from pyqtp.controls.doc_control.workspace_edit import (
     path_from_file_uri,
     rename_file,
 )
+from pyqtp.controls.project_control.project_session import SessionData
 from pyqtp.utils.action import Action
 from pyqtp.utils.priority_menu import PriorityMenu
 from pyqtp.views.monaco_document_view import MonacoDocumentView
@@ -55,6 +56,7 @@ class DocumentManager(BaseControl):
 
     _last_open_dir: Path
     _opened_docs: dict[str, BaseDocumentView]
+    _active_doc_key: str | None
 
     document_opened = Signal(BaseDocumentView)
     document_closed = Signal(BaseDocumentView)
@@ -64,6 +66,7 @@ class DocumentManager(BaseControl):
 
         self._last_open_dir = Path.home()
         self._opened_docs = {}
+        self._last_activated_key = None
 
         self.action_open_doc = Action(
             icon=QIcon(),
@@ -230,11 +233,18 @@ class DocumentManager(BaseControl):
         identity = str(Path(identity))
         doc_view = self._opened_docs.get(identity)
         if doc_view is not None:
+            self._note_activated(identity)
             doc_view.ensure_visible()
             return doc_view
 
         new_view = _document_view_cls_from_identity(identity)(
             self._main_wnd, key=identity
+        )
+        # заметка активной вкладки (9.6): любой ensure_visible по этой вьюхе
+        # (открытие, повторный клик, LSP-переход) обновляет «последнюю
+        # активированную» — сигнал instance-level, вьюхи не мешают друг другу
+        new_view.ensure_visible_requested.connect(
+            lambda _=None, view_=new_view: self._note_activated(view_.key)
         )
         self._apply_editor_ux_options(new_view)
         self._main_wnd.view_central_register(
@@ -244,6 +254,87 @@ class DocumentManager(BaseControl):
         new_view.ensure_visible()
         self.document_opened.emit(new_view)
         return new_view
+
+    # --- активная вкладка и снимок сессии (этап 9.6) ---
+    #
+    # Активная вкладка documents-зоны в python-биндингах KDD (2.x,
+    # frontend-reverse) напрямую недоступна: ``isCurrentTabChanged`` при
+    # смене вкладки не выстреливает (проверено зондом), ``isCurrentTab()``
+    # не экспортируется. Поэтому учёт гибридный:
+    #   1) «последний активированный» — обновляем на каждом ``ensure_visible``
+    #      (открытие вкладки, клик по дереву/поиску, LSP-переход);
+    #   2) при снимке сессии перепроверяем по Qt-фокусу: если фокус внутри
+    #      открытой вьюхи — активна она (ловит пользовательские клики по
+    #      вкладкам и редакторам);
+    #   3) при закрытии активной вкладки активной делаем соседа по порядку
+    #      вкладок и реально его активируем (как в браузере).
+
+    def _note_activated(self, view_key: str) -> None:
+        """Вьюха стала последней активированной (слот ``ensure_visible_requested``)."""
+        self._last_activated_key = view_key
+
+    def _focused_doc_view(self) -> BaseDocumentView | None:
+        """Открытая вьюха, внутри которой сейчас фокус главного окна.
+
+        Берём ``focusWidget()`` самого окна, не ``QApplication.focusWidget``:
+        Qt хранит фокус по top-level (он переживает переключение приложения,
+        работает и на неактивном окне — на этом держатся offscreen-тесты),
+        а подъём по цепочке родителей проваливается в webview редактора.
+        """
+        widget = self._main_wnd.focusWidget()
+        if widget is None or not self._opened_docs:
+            return None
+        views = set(self._opened_docs.values())
+        while widget is not None:
+            if widget in views:
+                return widget  # type: ignore[return-value]
+            widget = widget.parentWidget()
+        return None
+
+    def _activate_sibling_on_close(
+        self, closed_key: str, position: int | None = None
+    ) -> None:
+        """После закрытия вкладки активируем соседа по порядку (если вкладка была активной).
+
+        ``position`` — позиция закрытой вкладки в порядке открытия (для
+        выбора соседа); если не передана — берём 0 (реестра уже нет).
+        """
+        siblings = [key for key in self._opened_docs if key != closed_key]
+        if not siblings:
+            self._last_activated_key = None
+            return
+        neighbour = siblings[min(position or 0, len(siblings) - 1)]
+        self._opened_docs[neighbour].ensure_visible()
+        self._last_activated_key = neighbour
+
+    def _sibling_position(self, view_key: str) -> int:
+        """Позиция вкладки в порядке открытия (снимается до удаления из реестра)."""
+        try:
+            return list(self._opened_docs).index(view_key)
+        except ValueError:
+            return 0
+
+    def open_documents(self) -> list[str]:
+        """Пути открытых документов в порядке их открытия (сессия)."""
+        return list(self._opened_docs)
+
+    def active_document_get(self) -> BaseDocumentView | None:
+        """Активная вкладка documents-зоны (None — вкладок нет)."""
+        focused = self._focused_doc_view()
+        if focused is not None:
+            return focused
+        return self._opened_docs.get(self._last_activated_key or '')
+
+    def session_snapshot(self) -> SessionData:
+        """Снимок сессии: открытые документы + активный из них."""
+        docs = self.open_documents()
+        focused = self._focused_doc_view()
+        active = (
+            focused.key
+            if focused is not None and focused.key in docs
+            else self._last_activated_key
+        )
+        return SessionData(docs=docs, active=active)
 
     def open_definition_uri(self, payload: dict) -> None:
         """Этап 6: LSP-навигация «переход к определению» в другой файл.
@@ -450,13 +541,23 @@ class DocumentManager(BaseControl):
         close_dock = getattr(dock, 'closeDockWidget', None) or getattr(dock, 'forceClose')  # noqa: B009
         close_dock()
         self.document_closed.emit(view)
+        # была активной — позиция нужна ДО удаления из реестра,
+        # после удаления сделаем активной соседку по порядку
+        was_active = self._last_activated_key == view_key
+        position = self._sibling_position(view_key)
         del self._opened_docs[view_key]
+        if was_active:
+            self._activate_sibling_on_close(view_key, position)
 
     # --- программные операции с открытыми документами (этап 9.5) ---
 
     def has_document(self, identity: str | Path) -> bool:
         """Открыт ли документ с таким путём-ключом."""
         return str(Path(identity)) in self._opened_docs
+
+    def document_view(self, identity: str | Path) -> BaseDocumentView | None:
+        """Вьюха открытого документа (None — документ не открыт)."""
+        return self._opened_docs.get(str(Path(identity)))
 
     def document_is_modified(self, identity: str | Path) -> bool:
         """Есть ли несохранённые правки (для закрытого — False)."""
@@ -491,8 +592,11 @@ class DocumentManager(BaseControl):
         docks = getattr(self._main_wnd.views_manager, 'documents_dock', None)
         dock = docks.get(view_key) if isinstance(docks, dict) else None
         if dock is None:
+            was_active = self._last_activated_key == view_key
             self.document_closed.emit(view)
             del self._opened_docs[view_key]
+            if was_active:
+                self._last_activated_key = None
             return True
         self._force_close_doc_dock(view, dock, view_key)
         return True

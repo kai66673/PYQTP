@@ -17,6 +17,12 @@ from pyqtp.controls.project_control.project_fileops import (
     move_to_trash,
     renamed_path,
 )
+from pyqtp.controls.project_control.project_session import (
+    SessionData,
+    filter_session,
+    read_session,
+    write_session,
+)
 from pyqtp.controls.project_control.quick_open import iter_project_files
 from pyqtp.controls.project_control.quick_open_dialog import QuickOpenDialog
 from pyqtp.controls.project_control.workspace_symbol_dialog import (
@@ -136,6 +142,11 @@ class ProjectControl(BaseControl):
         self._rename_seq = itertools.count(1)
         self._pending_renames: dict[int, dict[str, Any]] = {}
 
+        # проектная сессия (этап 9.6): снимок, восстановленный из
+        # <root>/.pyqtp/session.json при открытии проекта (расходится
+        # при смене/закрытии корня)
+        self._loaded_session: SessionData | None = None
+
     ###############
     # Настройки #
 
@@ -156,6 +167,13 @@ class ProjectControl(BaseControl):
         super().settings_write()
         self._persist_root()
 
+    def on_shutdown(self) -> bool:
+        # закрываемся с открытым проектом — сохраняем его сессию, пока
+        # вкладки документов ещё живы (до teardown'а контролов)
+        if self._project_root is not None:
+            self._save_project_session()
+        return True
+
     ####################
     # Жизненный цикл #
 
@@ -174,6 +192,8 @@ class ProjectControl(BaseControl):
                 'quick_open_show': self._show_quick_open,
                 'project_search_show': self._show_project_search,
                 'workspace_symbols_show': self._show_workspace_symbols,
+                # снимок сессии (пустой, если проект не открыт) — этап 9.6
+                'project_session_show': self.session_snapshot,
             }
         )
 
@@ -219,6 +239,9 @@ class ProjectControl(BaseControl):
             search_view.set_project_root(self._project_root)
             self.action_close_folder.setEnabled(True)
             self._start_scan()
+            # сессия проекта (этап 9.6): восстанавливаем вкладки, сохранённые
+            # при последнем закрытии этого проекта
+            self._restore_project_session(self._project_root)
 
         # подсветка открытого документа в дереве (смену активной вкладки
         # пока не отслеживаем — сигнала об активации в core нет)
@@ -229,6 +252,7 @@ class ProjectControl(BaseControl):
     def teardown_views(self) -> None:
         super().teardown_views()
         self._scan_gen += 1  # сброс: запоздалые результаты скана не нужны
+        self._loaded_session = None
         self._pending_renames.clear()  # чужие ответы willRenameFiles не нужны
         if self._symbol_dialog is not None:
             self._symbol_dialog.drop_pending()
@@ -256,6 +280,10 @@ class ProjectControl(BaseControl):
         resolved = candidate.resolve()
         if resolved == self._project_root:
             return True
+        if self._project_root is not None:
+            # переключение проекта: сначала проводы старого (сохранение
+            # сессии + закрытие его вкладок) — этап 9.6
+            self.close_project()
         self._project_root = resolved
         self.action_close_folder.setEnabled(True)
         self._persist_root()
@@ -267,12 +295,29 @@ class ProjectControl(BaseControl):
         """Закрывает текущий проект (``False`` — открывать нечего)."""
         if self._project_root is None:
             return False
+        # сначала сохраняем сессию уходящего проекта (этап 9.6)
+        self._save_project_session()
+        root = self._project_root
         self._project_root = None
         self.action_close_folder.setEnabled(False)
         self._persist_root()
         self.project_root_changed.emit(None)
-        prj_log.info('Проект закрыт')
+        # затем закрываем вкладки проекта; документы с несохранёнными
+        # правками остаются открытыми (сессия уже сохранена, данные не
+        # выбрасываем)
+        self._close_project_documents(root)
+        prj_log.info('Проект закрыт: %s', root)
         return True
+
+    def _close_project_documents(self, root: Path) -> None:
+        """Закрывает вкладки документов внутри ``root`` (грязные остаются)."""
+        doc_ctrl = self._main_wnd.doc_ctrl
+        for path in doc_ctrl.documents_under(root):
+            if not doc_ctrl.close_document(path):
+                prj_log.warning(
+                    'Документ с несохранёнными правками оставлен открытым: %s',
+                    path,
+                )
 
     #####################
     # Внутреннее        #
@@ -300,6 +345,7 @@ class ProjectControl(BaseControl):
         if root is None:
             self._scan_gen += 1
             self._pending_renames.clear()  # чужие ответы willRenameFiles не нужны
+            self._loaded_session = None  # снятая сессия не должна вернуться
             self._quick_files = []
             self.action_quick_open.setEnabled(False)
             self.action_project_search.setEnabled(False)
@@ -310,6 +356,10 @@ class ProjectControl(BaseControl):
                 self._symbol_dialog.set_project(None)
             return
         self._start_scan()
+        # смена корня в рантайме (open_project из меню/консоли) — поднимаем
+        # сессию проекта (при старте restore делает setup_views, сигнал там
+        # не эмится — двойного восстановления нет)
+        self._restore_project_session(root)
 
     def _start_scan(self) -> None:
         """Фоновый обход проекта; результат — по поколению скана."""
@@ -398,6 +448,58 @@ class ProjectControl(BaseControl):
     def _open_symbol_payload(self, payload: dict) -> None:
         """Символ из диалога -> открыть файл и каретка на месте определения."""
         self._main_wnd.doc_ctrl.open_definition_uri(payload)
+
+    ###############################
+    # Сессия проекта (этап 9.6)   #
+
+    def session_snapshot(self) -> SessionData:
+        """Снимок текущей сессии (пустой, если проект не открыт)."""
+        if self._project_root is None:
+            return SessionData()
+        return self._main_wnd.doc_ctrl.session_snapshot()
+
+    def _save_project_session(self) -> None:
+        """Пишет ``<root>/.pyqtp/session.json`` по текущим вкладкам."""
+        if self._project_root is None:
+            return
+        try:
+            write_session(
+                self._project_root,
+                self._main_wnd.doc_ctrl.session_snapshot(),
+            )
+        except OSError as exc:
+            prj_log.warning('Не удалось сохранить сессию проекта: %s', exc)
+
+    def _restore_project_session(self, root: Path) -> None:
+        """Открывает вкладки из ``<root>/.pyqtp/session.json``.
+
+        Несуществующие файлы пропускаем (сообщаем в журнал); активной
+        становится сохранённая вкладка, а если её нет — последняя
+        восстановленная.
+        """
+        try:
+            stored = read_session(root)
+        except OSError as exc:
+            prj_log.warning('Не удалось прочитать сессию проекта: %s', exc)
+            return
+        if not stored.docs:
+            return
+        session, missing = filter_session(stored)
+        for skipped in missing:
+            prj_log.info('Файл из сессии отсутствует, пропущен: %s', skipped)
+        if not session.docs:
+            return
+        self._loaded_session = session
+        for doc in session.docs:
+            self._main_wnd.doc_ctrl.open_document(doc)
+        if session.active is not None:
+            view = self._main_wnd.doc_ctrl.document_view(session.active)
+            if view is not None:
+                view.ensure_visible()
+        prj_log.info(
+            'Сессия проекта восстановлена: %d документ(ов), активный: %s',
+            len(session.docs), session.active or '—',
+        )
 
     ############################################
     # Файловые операции «Проводника» (этап 9.5) #

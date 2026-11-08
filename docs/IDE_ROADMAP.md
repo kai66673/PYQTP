@@ -391,9 +391,48 @@ regression хаба + 5 offscreen — набор меню (файл/катало
 реальным basedpyright — willRenameFiles приносит правку импорта, cb всегда
 приходит при пустом стеке серверов, сквозная приёмка переименования).
 
+#### 9.6 (часть A) — сессия проекта: вкладки + активный документ — ГОТОВО
+- хранение — файл `<root>/.pyqtp/session.json` (НЕ QSettings — сессия живёт
+  вместе с проектом, переезжает вместе с папкой): формат
+  `{"docs": [...абсолютные пути в порядке открытия], "active": путь|null}`;
+- `project_session.py` (`pyqtp/controls/project_control/`) — чистый модуль:
+  `SessionData` + `serialize_session/parse_session/deserialize_session`
+  (разбор недоедливый: мусор/битый JSON -> пустая сессия), `read_session`,
+  `write_session` (атомарно: `tempfile.mkstemp` + `Path.replace`),
+  `clear_session` (пустые вкладки -> файл и пустой каталог `.pyqtp/` удаляются),
+  `filter_session` (фильтр «только внутри корня» — на случай переноса папки);
+- учёт активной вкладки — гибрид (прободы KDD 2.x: python-привязки НЕ эмитят
+  `isCurrentTabChanged` при смене вкладки и не экспортируют `isCurrentTab()`):
+  per-view `ensure_visible_requested` пишет `_last_activated_key`, а на момент
+  снапшота он перекрывается Qt-фокусом — подъём от `self._main_wnd.focusWidget()`
+  (НЕ `QApplication.focusWidget()`: Qt хранит фокус per-top-level, он работает и
+  на неактивном/скрытом окне — на этом держатся offscreen-тесты; `hasFocus()`
+  в offscreen тоже врёт);
+- закрытие активной вкладки активирует соседку по порядку открытия (позицию
+  снимаем ДО удаления из реестра — после удаления off-by-one);
+- `close_project()`: сначала `_save_project_session()`, затем снятие корня и
+  закрытие вкладок под корнем (`documents_under` + `close_document`; документы
+  с правками остаються открыты с предупреждением — ничего не выбрасываем);
+  `open_project()` при смене корня сначала проводит старый проект;
+- восстановление — в `setup_views()` (старт с сохранённым в QSettings корнем)
+  и в `_on_root_for_scan()` (открытие в рантайме; двойного восстановления нет —
+  при старте сигнал не эмитится); отсутствующие файлы пропускаются с логом,
+  активный опционально;
+- `DocumentManager`: `open_documents()`, `active_document_get()`,
+  `session_snapshot()`, `document_view()`; `ProjectControl.session_snapshot()`
+  + console-API `project_session_show`; раскладку дока глобально уже держит
+  `MainWindowKDD/dockState` (per-project раскладка отложена).
+
+**Приёмка:** `tests/test_project_session.py` (16: 12 юнитов project_session —
+формат/недоедливый разбор/атомарность/`clear_session`/`filter_session` +
+4 offscreen — гибрид учёта вкладки (ensure_visible + Qt-фокус + сосед при
+закрытии), цикл закрыть-переоткрыть проекта, пропуск удалённых файлов,
+пустые вкладки очищают файл).
+
 #### Остаток этапа 9
-- сессия проекта (вкладки/активная/раскладка; хранение — каталог `.pyqtp/`
-  проекта или QSettings по пути);
+- слой настроек проекта: `.pyqtp/settings.json` перекрывает настройки
+  приложения (настройки приложения = дефолт для режима «без проекта» и для
+  первого открытия проекта без `.pyqtp/`);
 - закладки: Monaco decorations + `.pyqtp/bookmarks.json` + панель закладок.
 **Приёмка:** webengine-тест закладок (юниты rg-парсера — уже закрыты в 9.3).
 

@@ -54,13 +54,17 @@ Verify in this order: **ruff → pyright → tests → run the app**.
    + stage-9.2 quick open (test_quick_open.py: scorer/scan unit без GUI + live offscreen диалог)
    + stage-9.3 project search (test_project_search.py: argv/парсер юниты без GUI и без бинаря rg + live offscreen с живым rg, skipif без rg)
    + stage-9.4 workspace/symbol (test_workspace_symbol.py: юниты разбора ответа/гейтов/`sample_file_for` без GUI + live hub с basedpyright + live offscreen диалог)
-   + stage-9.5 project fileops (test_project_fileops.py: юниты fileops/file_rename без GUI + offscreen меню/обработчики с фейковым хабом + live basedpyright end-to-end rename)). Markers `live`
+   + stage-9.5 project fileops (test_project_fileops.py: юниты fileops/file_rename без GUI + offscreen меню/обработчики с фейковым хабом + live basedpyright end-to-end rename)
+   + stage-9.6 project session (test_project_session.py: юниты project_session без GUI + offscreen вкладки/сессия с фейковой вьюхой без WebEngine)). Markers `live`
   (real LSP server processes) and
-  `webengine` (real QWebEngineView/Monaco) are deselected by default via `addopts` → 110 passed / 34
+  `webengine` (real QWebEngineView/Monaco) are deselected by default via `addopts` → 126 passed / 34
   deselected; run them with `uv run pytest -m 'live or webengine'` (~2 min, they work offscreen) or
-  all 144 in one
+  all 160 in one
   process with `uv run pytest -m ''` (~2 min, full run keeps passing despite `os._exit` in
-  `pytest_sessionfinish` eating the summary line — count the dots). Test-suite gotchas:
+  `pytest_sessionfinish` eating the summary line — count the dots; NB the stage81
+  document-symbols/document-highlight webengine tests are cold-start flaky under full-suite
+  load — basedpyright answers `[]`/extra word-highlights while still indexing; re-run or run
+  them alone and they pass). Test-suite gotchas:
   - root `conftest.py` sets `QT_QPA_PLATFORM=offscreen` + `QTWEBENGINE_DISABLE_SANDBOX=1` at import
     and overrides `qapp` as a **session-scoped** fixture (pytest-qt's DESTROY_ON_POLICY would kill
     QApplication between tests). GUI fixtures must depend on `qapp`, else `QMainWindow.__init__`
@@ -299,6 +303,38 @@ Verify in this order: **ruff → pyright → tests → run the app**.
    обновить индекс) -> переоткрытие вкладки + `tree_view.reveal_path`; сбой LSP
    НИКОГДА не блокирует дисковое переименование. Create/delete LSP-нотификаций
    не шлют (v1).
+   Сессия проекта (этап 9.6A): чистый `project_control/project_session.py` —
+   формат `<root>/.pyqtp/session.json` = `{"docs": [...абс. пути в порядке
+   открытия], "active": путь|null}`; `parse_session` недоедливый (битый
+   JSON/мусор -> пустая сессия), `write_session` атомарный (`tempfile.mkstemp`
+   + `Path.replace`), пустые вкладки -> `clear_session` убирает файл и пустой
+   `.pyqtp/`; `filter_session` — «только внутри корня» (перенос папки).
+   Учёт активной вкладки в `DocumentManager` — гибрид: KDD python-привязки
+   2.x НЕ эмитят `isCurrentTabChanged` при смене вкладки/`setAsCurrentTab` и
+   не экспортируют `isCurrentTab()`, а `view.hasFocus()`/
+   `QApplication.focusWidget()` в offscreen врут; поэтому per-view сигнал
+   `ensure_visible_requested` пишет `_last_activated_key`, а на момент
+   снапшота (`session_snapshot`) он перекрывается подъёмом по родителям от
+   `self._main_wnd.focusWidget()` — НЕ `QApplication.focusWidget()`: Qt
+   хранит фокус per-top-level, `setFocus`/`focusWidget` работают и на
+   неактивном/скрытом окне (на этом держатся offscreen-тесты без show()).
+   Закрытие активной вкладки активирует соседку по порядку открытия —
+   позицию снимать ДО удаления из `_opened_docs` (после — off-by-one).
+   `close_project()` = сохранить сессию -> снять корень -> закрыть вкладки
+   под корнем (`documents_under`+`close_document`, грязные остаются открыты
+   с предупреждением); `open_project()` при смене корня сначала закрывает
+   старый проект; restore — в `setup_views()` (старт с персистнутым в
+   QSettings корнем) и в `_on_root_for_scan()` (рантайм; двойного restore
+   нет — setup_views сигнал не эмитит); `on_shutdown` тоже сохраняет. API:
+   `DocumentManager.open_documents/active_document_get/session_snapshot/
+   document_view`, `ProjectControl.session_snapshot` + console
+   `project_session_show`. В GUI-тестах сессии фейк `FakeDocView` обязан
+   полностью соответствовать протоколу `Document` (в т.ч. конкретный `save()`
+   — Protocol структурный, дефолт не наследуется) и держать фокусируемого
+   ребёнка (`focus_child`, StrongFocus) для проверки фокус-обхода; тип
+   сужается хелпером `fake_view()` (`document_view()` возвращает Optional).
+   Per-project раскладка дока отложена (глобальная уже в
+   `MainWindowKDD/dockState`).
 
 ## Runtime gotchas
 
