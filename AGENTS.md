@@ -37,7 +37,7 @@ Verify in this order: **ruff → pyright → tests → run the app**.
 
 - `uv run ruff check <path>` — configs live per package (`[tool.ruff]` in each package's pyproject).
   **`fix = true` is set, so a plain `ruff check` rewrites files**; use `--no-fix` to only report.
-  Baseline failure is expected: 13 errors repo-wide (10 in the pyqtp packages, 3 in `qtmonaco`).
+  Baseline failure is expected: 12 errors repo-wide (9 in the pyqtp packages, 3 in `qtmonaco`).
   Ruff only lints `pyqtp/**/*.py` — `examples/` and `tests/` are not linted.
 - `cd packages && uv run pyright` — uses `packages/pyrightconfig.json` (`venvPath: ".."`), so run it
   from `packages/`. Baseline: 18 pre-existing errors (stale `bcad.*` imports + missing `PySide6QtAds`).
@@ -49,11 +49,12 @@ Verify in this order: **ruff → pyright → tests → run the app**.
   `packages/pyqtp-core/tests/` (settings window) and `packages/pyqtp-ide/tests/`
   (LSP registry + live editor + stage-7 editor UX + stage-8.1 references/symbols/highlight live tests
    + stage-8.2 rename/formatting/codeAction live tests
-   + editor-options/theme + workspace-edit-apply (test_workspace_edit_apply.py) unit tests). Markers `live`
+   + editor-options/theme + workspace-edit-apply (test_workspace_edit_apply.py) unit tests
+   + stage-9.1 project tree panel (test_project_tree.py, offscreen GUI без LSP/WebEngine, без маркеров)). Markers `live`
   (real LSP server processes) and
-  `webengine` (real QWebEngineView/Monaco) are deselected by default via `addopts` → 46 passed / 27
-  deselected; run them with `uv run pytest -m 'live or webengine'` (~1 min, they work offscreen) or
-  all 73 in one
+  `webengine` (real QWebEngineView/Monaco) are deselected by default via `addopts` → 54 passed / 27
+  deselected; run them with `uv run pytest -m 'live or webengine'` (~2 min, they work offscreen) or
+  all 81 in one
   process with `uv run pytest -m ''` (~2 min, full run keeps passing despite `os._exit` in
   `pytest_sessionfinish` eating the summary line — count the dots). Test-suite gotchas:
   - root `conftest.py` sets `QT_QPA_PLATFORM=offscreen` + `QTWEBENGINE_DISABLE_SANDBOX=1` at import
@@ -85,7 +86,8 @@ Verify in this order: **ruff → pyright → tests → run the app**.
     `bridge_initialized`, so a test that `setValue`s text right after `editor_init` gets it
     overwritten a moment later — re-issue `setValue` inside the readiness predicate.
   - pytest-qt 4.5 `waitUntil` has no `retry_interval` — expensive predicates use the local
-    `wait_for(...)` polling helper.
+    `wait_for(...)` polling helper. Its callback must return `None`/`True`/`False` — a
+    truthy-but-not-bool return (e.g. a `set`) raises `ValueError`, so wrap with `bool(...)`.
   - pytest 8 applies `testpaths` only when the invocation dir == rootdir, so `addopts` also carries
     `--ignore-glob=*/qtmonaco/tests/*` and `--ignore-glob=qtmonaco/tests/*`; the vendored qtmonaco
     tests must never be collected (they error at import).
@@ -205,6 +207,25 @@ Verify in this order: **ruff → pyright → tests → run the app**.
     оверрайдов `showEvent/closeEvent` должны совпадать со стабами PySide6
     (`arg__1`), а `showEvent` требует `# noqa: N802` — в pep8-naming белом
     списке есть `closeEvent`, но нет `showEvent`.
+- Панель проекта (этап 9.1, план — `docs/IDE_ROADMAP.md`): контрол
+  `ProjectControl` (`pyqtp-ide/pyqtp/controls/project_control/project_control.py`,
+  key = qualname, регистрируется в `IdeMainWindow.init_controls` после
+  `DocumentManager`) хранит корень проекта (QSettings ключ
+  `ProjectControl/root_path`, при закрытии снимается), даёт console-API
+  `project_root/project_open/project_close` и пункты меню «Файл»:
+  «Открыть папку...» (Ctrl+Shift+O, priority=4) / «Закрыть папку» (priority=8).
+  Панель — `ProjectTreeView` (`pyqtp/views/project_tree_view.py`, key
+  `ProjectControl_tree_view`, `widget_area='left'`): ленивый
+  `QFileSystemModel` + `_TreePruneProxy` (точечные записи + `__pycache__`/
+  `node_modules` скрыты; пока проект закрыт, гейт `_enabled=False` не
+  пропускает НИЧЕГО — иначе `QFileSystemModel` без rootPath показывает всё
+  ФС от `/`, а `QFileSystemModel.clear()` в PySide6 6.6 нет). Двойной клик/
+  Enter по файлу → `file_open_requested(str)` → `doc_ctrl.open_document`;
+  reveal активного документа — только по `document_opened` (сигнала о смене
+  активной вкладки в core нет) и идёт асинхронно шагами через
+  `QTimer.singleShot(0,...)`: `QFileSystemModel` наполняется изнутри, а
+  KDD-док-менеджер у скрытой панели `canFetchMore` не опрашивает — первый
+  уровень грузится вручную (`fetchMore` после `setRootPath`).
 
 ## Runtime gotchas
 

@@ -220,16 +220,33 @@ Python→JS: uri-фартук, одна undo-точка, warning `bcad.med` на
 `documentColor` сознательно не брали.
 
 ### Этап 9 — проект и сессии
-- панель дерева проекта (QTreeView, lazy, reveal активного файла, контекстное меню);
-- «Открыть папку» + сессия проекта (вкладки/активная/раскладка; хранение —
-  каталог `.pyqtp/` проекта или QSettings по пути);
+
+#### 9.1 — «Открыть папку» + корень проекта + панель дерева — ГОТОВО
+- `ProjectControl` (`pyqtp/controls/project_control/project_control.py`):
+  корень проекта в QSettings (`ProjectControl/root_path`, пропавшая папка
+  при старте молча пропускается), меню «Файл» — «Открыть папку...»
+  (Ctrl+Shift+O) / «Закрыть папку», console-API `project_root/
+  project_open/project_close`;
+- панель `ProjectTreeView` (`pyqtp/views/project_tree_view.py`, слева):
+  ленивый `QFileSystemModel` + proxy-фильтр (точечные записи, `__pycache__`,
+  `node_modules`), двойной клик по файлу → `DocumentManager.open_document`,
+  reveal активного документа по `document_opened` (асинхронная цепочка
+  `fetchMore`-шагов; контекстного меню пока нет);
+**Приёмка:** `tests/test_project_tree.py` (8 offscreen-GUI тестов без
+LSP/WebEngine: заполнение панели/фильтр мусора, двойной клик, reveal
+вложенного файла, персист корня между перезапусками, снятие при закрытии).
+
+#### Остаток этапа 9
+- `workspace/symbol` (остаток этапа 8) — в меню/палитре по корню проекта;
+- контекстное меню дерева (create/rename/delete в корзину с подтверждением;
+  rename — через **LSP `willRenameFiles`/`didRenameFiles`** — у хаба пока
+  нет, добавим сообщение DocumentManager→LspHub);
 - quick open (Ctrl+P): fuzzy по кэшу файлов;
 - поиск по проекту (Ctrl+Shift+F): субпроцесс **ripgrep** (`--json`) →
   results-панель → клик = `open_definition_uri` + reveal (regex/case/include
   бесплатно с rg; собственный fuzzy-движок как в iide не пишем);
-- файловые операции: create/rename (**LSP `willRenameFiles`/`didRenameFiles`**
-  — уже реализованы в iide как эталон; у хаба пока нет, добавим сообщение
-  DocumentManager→LspHub)/delete в корзину с подтверждением;
+- сессия проекта (вкладки/активная/раскладка; хранение — каталог `.pyqtp/`
+  проекта или QSettings по пути);
 - закладки: Monaco decorations + `.pyqtp/bookmarks.json` + панель закладок.
 **Приёмка:** юнит-тесты scorer'а и rg-парсера (без GUI); webengine-тест закладок.
 

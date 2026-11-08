@@ -1,0 +1,196 @@
+from __future__ import annotations
+
+import logging
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+from PySide6.QtCore import Signal
+from PySide6.QtGui import QIcon, QKeySequence
+from PySide6.QtWidgets import QFileDialog
+
+from pyqtp.controls.base_control import BaseControl
+from pyqtp.utils.action import Action
+from pyqtp.utils.priority_menu import PriorityMenu
+from pyqtp.views.project_tree_view import ProjectTreeView
+
+if TYPE_CHECKING:
+    from pyqtp.main_wnd.ide_main_window import IdeMainWindow
+
+prj_log = logging.getLogger('bcad.project')
+
+
+class ProjectControl(BaseControl):
+    """Контрол проекта (этап 9.1): папка-корень + панель «Проводник».
+
+    Хранит текущий корень проекта, Persistует его в QSettings
+    (``<key>/root_path``), создаёт докируемую панель дерева слева
+    (``widget_area='left'``) и прокидывает двойной клик по файлу в
+    ``DocumentManager.open_document``.
+    """
+
+    # аннотация ради plug_compatibility_check и типизированного доступа
+    # к doc_ctrl/project_ctrl IdeMainWindow (runtime — строка из-за
+    # `from __future__ import annotations`, цикл импортов нет)
+    _main_wnd: IdeMainWindow
+
+    tree_view: ProjectTreeView | None
+
+    project_root_changed = Signal(object)  # Path | None
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._project_root: Path | None = None
+        self.tree_view = None
+
+        self.action_open_folder = Action(
+            icon=QIcon(),
+            title='Открыть папку...',
+            parent=self,
+            description='Открыть папку как проект',
+            shortcut=QKeySequence('Ctrl+Shift+O'),
+        )
+        self.action_close_folder = Action(
+            icon=QIcon(),
+            title='Закрыть папку',
+            parent=self,
+            description='Закрыть текущий проект',
+        )
+        self.action_open_folder.triggered.connect(self._choose_folder)
+        self.action_close_folder.triggered.connect(self.close_project)
+        self.action_close_folder.setEnabled(False)
+
+    ###############
+    # Настройки #
+
+    def settings_read(self, **kwargs: Any) -> None:
+        super().settings_read(**kwargs)
+        raw = str(self._main_wnd.settings.value(f'{self.key}/root_path', '') or '')
+        if not raw:
+            return
+        path = Path(raw)
+        if path.is_dir():
+            self._project_root = path
+        else:
+            prj_log.warning(
+                'Сохранённая папка проекта недоступна и пропущена: %s', path
+            )
+
+    def settings_write(self) -> None:
+        super().settings_write()
+        self._persist_root()
+
+    ####################
+    # Жизненный цикл #
+
+    def setup(self) -> None:
+        super().setup()
+        self.action_open_folder.setIcon(
+            self._main_wnd.theme_manager.icon('io/open.svg')
+        )
+        # API проекта для Python-консоли (этап 9.1; расширение — этап 12)
+        self._main_wnd.api_ctrl.register_variables(
+            {
+                'project_root': lambda: self._project_root,
+                'project_open': self.open_project,
+                'project_close': self.close_project,
+            }
+        )
+
+    def setup_menu(self) -> None:
+        super().setup_menu()
+
+        menubar = self._main_wnd.menuBar()
+        try:
+            file_menu = menubar.by_path('Файл')
+        except KeyError:
+            file_menu = menubar.addMenu('Файл', priority=-10)
+
+        assert isinstance(file_menu, PriorityMenu)
+
+        file_menu.addAction(self.action_open_folder, priority=4)
+        file_menu.addAction(self.action_close_folder, priority=8)
+
+    def setup_views(self) -> None:
+        self.tree_view = view = ProjectTreeView(
+            self._main_wnd, key=f'{self.key}_tree_view'
+        )
+        self._main_wnd.view_register(view, widget_area='left')
+
+        view.file_open_requested.connect(self._open_file_from_tree)
+        self.project_root_changed.connect(view.set_project_root)
+        if self._project_root is not None:
+            view.set_project_root(self._project_root)
+            self.action_close_folder.setEnabled(True)
+
+        # подсветка открытого документа в дереве (смену активной вкладки
+        # пока не отслеживаем — сигнала об активации в core нет)
+        self._main_wnd.doc_ctrl.document_opened.connect(
+            lambda doc_view: view.reveal_path(doc_view.key)
+        )
+
+    def teardown_views(self) -> None:
+        super().teardown_views()
+        if self.tree_view is not None:
+            self._main_wnd.view_deregister(self.tree_view.key)
+            self.tree_view = None
+
+    #####################
+    # Публичный API     #
+
+    @property
+    def project_root(self) -> Path | None:
+        return self._project_root
+
+    def open_project(self, path: str | Path) -> bool:
+        """Открывает папку как проект (``False`` — папки нет)."""
+        candidate = Path(path).expanduser()
+        if not candidate.is_dir():
+            prj_log.warning('Не папка проекта, пропущено: %s', candidate)
+            return False
+        resolved = candidate.resolve()
+        if resolved == self._project_root:
+            return True
+        self._project_root = resolved
+        self.action_close_folder.setEnabled(True)
+        self._persist_root()
+        self.project_root_changed.emit(resolved)
+        prj_log.info('Открыт проект: %s', resolved)
+        return True
+
+    def close_project(self) -> bool:
+        """Закрывает текущий проект (``False`` — открывать нечего)."""
+        if self._project_root is None:
+            return False
+        self._project_root = None
+        self.action_close_folder.setEnabled(False)
+        self._persist_root()
+        self.project_root_changed.emit(None)
+        prj_log.info('Проект закрыт')
+        return True
+
+    #####################
+    # Внутреннее        #
+
+    def _choose_folder(self) -> None:
+        start = str(self._project_root or Path.home())
+        dir_name = QFileDialog.getExistingDirectory(
+            parent=self._main_wnd,
+            caption='Открыть папку проекта',
+            dir=start,
+            options=QFileDialog.Option.ShowDirsOnly
+            | QFileDialog.Option.DontUseNativeDialog,
+        )
+        if dir_name:
+            self.open_project(dir_name)
+
+    def _open_file_from_tree(self, path_str: str) -> None:
+        self._main_wnd.doc_ctrl.open_document(path_str)
+
+    def _persist_root(self) -> None:
+        settings = self._main_wnd.settings
+        key = f'{self.key}/root_path'
+        if self._project_root is None:
+            settings.remove(key)
+        else:
+            settings.setValue(key, str(self._project_root))
+        settings.sync()

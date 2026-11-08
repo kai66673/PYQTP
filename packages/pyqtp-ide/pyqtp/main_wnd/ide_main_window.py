@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 from pyqtp.base.base_main_window import BaseMainWindow
 from pyqtp.controls.doc_control.document_manager import DocumentManager
 from pyqtp.controls.lsp_control.lsp_hub import LspHub
+from pyqtp.controls.project_control.project_control import ProjectControl
 
 if TYPE_CHECKING:
     from pyqtp.base.docking_system.base_views_manager import ViewsManagerType
@@ -13,6 +14,7 @@ if TYPE_CHECKING:
 class IdeMainWindow(BaseMainWindow):
     doc_ctrl: DocumentManager
     lsp_hub: LspHub
+    project_ctrl: ProjectControl
 
     @staticmethod
     def dbus_iface_name() -> str:
@@ -30,4 +32,5 @@ class IdeMainWindow(BaseMainWindow):
         super().init_controls()
         self.lsp_hub = self.plug_register(LspHub())
         self.doc_ctrl = self.plug_register(DocumentManager())
+        self.project_ctrl = self.plug_register(ProjectControl())
 
