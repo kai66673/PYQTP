@@ -10,6 +10,9 @@ import {
   createDocumentSymbolProvider,
   createDocumentHighlightProvider,
   createSemanticTokensProvider,
+  createRenameProvider,
+  createFormattingProviders,
+  createCodeActionProvider,
 } from "./providers";
 
 export type LspCompletionItem = {
@@ -105,6 +108,15 @@ class LspClient {
   public prependedData: string | null = null; // Data to prepend to the model content
   public onSignatureHelp: ((data: monaco.languages.SignatureHelp) => void) | null = null; // Callback for signature help
   public settings: object | null = null; // Store workspace settings
+  // vendored-patch (этап 8.2): чужая (по текущей модели) часть WorkspaceEdit
+  // уходит Python'у; коллбэки навешивает LspClientManager из main.ts
+  public onWorkspaceEditRequest: ((payload: any) => void) | null = null;
+  public registerForeignEdit: ((payload: any) => string) | null = null;
+  // vendored-patch (этап 8.2): последние сырые publishDiagnostics по текущей
+  // модели (LSP-координаты, поля включая ``data`` сохранены) — codeAction
+  // контекст строится по ним, т.к. MarkerService при подъёме маркера вырезает
+  // все поля кроме известного набора, а basedpyright требует roundtrip data
+  private publishedDiagnostics: any[] = [];
 
   // vendored-patch: жизнь документа (didOpen/didChange/didClose) и диагностики
   public owner: string;
@@ -237,8 +249,31 @@ class LspClient {
                 tokenModifiers: STANDARD_TOKEN_MODIFIERS,
                 formats: ["relative"],
               },
+              // vendored-patch (этап 8.2): rename/formatting/codeAction — набор
+              // согласован с HUB_CAPABILITIES на python-стороне (для живого IDE
+              // их объявляет хаб в своём initialize; здесь они нужны для
+              // standalone-пути «голого» Monaco без lsp_host)
+              rename: { dynamicRegistration: false, prepareProvider: true },
+              formatting: {},
+              rangeFormatting: {},
+              codeAction: {
+                dynamicRegistration: false,
+                codeActionLiteralSupport: {
+                  codeActionKind: {
+                    valueSet: [
+                      "quickfix", "refactor", "refactor.extract", "refactor.inline",
+                      "refactor.rewrite", "source", "source.organizeImports",
+                      "source.fixAll", "source.unusedImports",
+                    ],
+                  },
+                },
+                resolveSupport: { properties: ["edit"] },
+                dataSupport: true,
+                isPreferredSupport: true,
+                disabledSupport: true,
+              },
             },
-            workspace: { didChangeConfiguration: {} },
+            workspace: { didChangeConfiguration: {}, applyEdit: false },
           },
         };
 
@@ -318,6 +353,7 @@ class LspClient {
       monaco.editor.setModelMarkers(this.trackedModel, this.owner, []);
     }
     this.trackedModel = model;
+    this.publishedDiagnostics = []; // диагностики старой модели к новой не относятся
     if (model) {
       this.modelChangeListener = model.onDidChangeContent(() => this.scheduleDidChange());
       this.syncDidOpen();
@@ -416,6 +452,12 @@ class LspClient {
     if (!model || !params || !Array.isArray(params.diagnostics) || model.uri.toString() !== params.uri) {
       return;
     }
+    // vendored-patch (этап 8.2): копия СЫРЫХ диагностик (LSP-координаты, все
+    // поля включая data/tags/relatedInformation) — контекст textDocument/
+    // codeAction восстанавливается по ним (см. createCodeActionProvider)
+    this.publishedDiagnostics = params.diagnostics
+      .map((d) => ({ ...d }))
+      .filter((d) => d && d.range);
     const headerLines = this.prependedData ? this.prependedData.split("\n").length - 1 : 0;
     const markers: monaco.editor.IMarkerData[] = params.diagnostics
       .filter((d) => d.range && d.range.start.line >= headerLines) // диагностики по префикс-заголовку не относим к модели
@@ -561,6 +603,81 @@ class LspClient {
           () => this.prependedData,
           this.forceReconnect.bind(this),
           this.flushDocumentChanges.bind(this)
+        )
+      );
+    }
+    // vendored-patch (этап 8.2): переименование — единственный провайдер на
+    // язык (Monaco применяет правку rename одним batch'ем; второй сервер
+    // удвоил бы правки); гейт по renameProvider сервера (true | {prepareProvider})
+    if (
+      caps.renameProvider &&
+      (this.manager === null || this.manager.claimProvider("rename", this.languageId, this))
+    ) {
+      this.providerDisposables.push(
+        createRenameProvider(
+          this.languageId,
+          () => this.currentConnection,
+          this.isConnectionValid.bind(this),
+          this.prependModelData.bind(this),
+          () => this.prependedData,
+          this.forceReconnect.bind(this),
+          this.flushDocumentChanges.bind(this),
+          // prepareRename (подсветка переименуемого/валидация позиции) — только
+          // если сервер его объявил; иначе Monaco сам возьмёт слово под кареткой
+          caps.renameProvider.prepareProvider === true,
+          this.onWorkspaceEditRequest
+        )
+      );
+    }
+    // vendored-patch (этап 8.2): форматирование — единственный форматтер на
+    // язык (второй переписал бы результат первого); rangeFormatting регистрируется
+    // дополнительно, если сервер его объявил
+    if (
+      (caps.documentFormattingProvider || caps.documentRangeFormattingProvider) &&
+      (this.manager === null || this.manager.claimProvider("formatting", this.languageId, this))
+    ) {
+      this.providerDisposables.push(
+        createFormattingProviders(
+          this.languageId,
+          () => this.currentConnection,
+          this.isConnectionValid.bind(this),
+          this.prependModelData.bind(this),
+          () => this.prependedData,
+          this.forceReconnect.bind(this),
+          this.flushDocumentChanges.bind(this),
+          !!caps.documentRangeFormattingProvider
+        )
+      );
+    }
+    // vendored-patch (этап 8.2): codeAction — РЕГИСТРИРУЕТСЯ КАЖДЫМ сервером
+    // без заявки (Monaco объединяет quickfix-меню стека; у pyright и ruff
+    // непересекающиеся наборы фиксов)
+    if (caps.codeActionProvider) {
+      this.providerDisposables.push(
+        createCodeActionProvider(
+          this.languageId,
+          () => this.currentConnection,
+          this.isConnectionValid.bind(this),
+          this.prependModelData.bind(this),
+          () => this.prependedData,
+          this.forceReconnect.bind(this),
+          this.flushDocumentChanges.bind(this),
+          () => this.publishedDiagnostics,
+          this.registerForeignEdit
+            ? (payload) => this.registerForeignEdit!(payload)
+            : (payload) => {
+                console.warn(
+                  "No foreign-edit sink for codeAction edits (standalone fallback?), payload dropped:",
+                  payload
+                );
+                return "";
+              },
+          // codeAction/resolve включаем всегда: сервер может отдать действие без
+          // edit (cost-saving), Monaco вызовет resolve только в этом случае
+          true,
+          Array.isArray(caps.codeActionProvider.codeActionKinds)
+            ? caps.codeActionProvider.codeActionKinds
+            : undefined
         )
       );
     }
@@ -818,6 +935,9 @@ export class LspClientManager {
   prependedData: string | null = null;
   settings: object | null = null;
   onSignatureHelp: ((data: monaco.languages.SignatureHelp) => void) | null = null;
+  // vendored-patch (этап 8.2): см. одноимённые поля LspClient
+  onWorkspaceEditRequest: ((payload: any) => void) | null = null;
+  registerForeignEdit: ((payload: any) => string) | null = null;
 
   /** Пересоздать клиентский набор по стеку (порядок = приоритет). */
   public setStack(entries: LspStackEntry[]) {
@@ -836,6 +956,9 @@ export class LspClientManager {
       client.prependedData = this.prependedData;
       client.settings = this.settings;
       client.onSignatureHelp = this.onSignatureHelp;
+      // vendored-patch (этап 8.2): см. поля LspClientManager
+      client.onWorkspaceEditRequest = this.onWorkspaceEditRequest;
+      client.registerForeignEdit = this.registerForeignEdit;
       this.clients.push(client);
     });
     console.log(

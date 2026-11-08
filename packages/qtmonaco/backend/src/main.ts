@@ -1,5 +1,6 @@
 import * as monaco from "monaco-editor";
 import { LspClientManager, type LspStackEntry } from "./lsp";
+import { splitWorkspaceEdit } from "./providers";
 import { initVimMode, type CMAdapter } from "monaco-vim";
 
 const container = document.getElementById("container");
@@ -65,6 +66,47 @@ let bridge: any = null;
 // LSP-серверов (lsp_stack из Python или одиночный lsp_url ради совместимости)
 let lspManager: LspClientManager | null = null;
 let lspHeader: string | null = null;
+
+// vendored-patch (этап 8.2): отложенная чужая часть WorkspaceEdit. Локальную
+// часть codeAction применяет сам контроллер Monaco через bulkEditService, а
+// НАШУ команду он исполняет сразу после edit (esm/vs/editor/contrib/codeAction/
+// browser/codeAction.js: сначала action.edit, затем action.command) — поэтому
+// правки в чужих файлах (закрытые документы, другие вкладки) уходят Python
+// только когда пользователь реально выбрал действие из quickfix-меню.
+// Токены из map не вырезаем: каждое открывание меню порождает новые, а старые
+// безвредны (ограниченный рост); rename использует прямой коллбэк ниже, без
+// токена — F2 уже подтверждён пользователем.
+const pendingForeignEdits = new Map<string, any>();
+let foreignEditSeq = 0;
+
+function registerForeignEditPayload(payload: any): string {
+  const token = `fe${++foreignEditSeq}`;
+  pendingForeignEdits.set(token, payload);
+  return token;
+}
+
+function sendWorkspaceEditToPython(payload: any) {
+  sendToPython("_apply_workspace_edit_request", payload);
+}
+
+monaco.editor.registerCommand("qtmonaco.lsp.applyForeignEdit", (_accessor: unknown, token?: unknown) => {
+  if (typeof token !== "string") {
+    console.warn("qtmonaco.lsp.applyForeignEdit called without token");
+    return;
+  }
+  const payload = pendingForeignEdits.get(token);
+  if (!payload) {
+    console.warn(`qtmonaco.lsp.applyForeignEdit: unknown token ${token}`);
+    return;
+  }
+  sendWorkspaceEditToPython(payload);
+});
+
+// для live-тестов/отладки: доступ к менеджеру стека LSP извне (lspManager —
+// модульная переменная; clients менеджера private только на уровне TS) и к
+// разбору WorkspaceEdit (зонд stage82 split в тестах)
+Object.defineProperty(qtmonaco, "lspManager", { get: () => lspManager });
+qtmonaco.splitWorkspaceEdit = splitWorkspaceEdit;
 
 let decorationsCollection: monaco.editor.IEditorDecorationsCollection | null = null;
 
@@ -491,6 +533,12 @@ function setupLspStack(entries: LspStackEntry[]) {
   lspManager.onSignatureHelp = (signatureHelp) => {
     sendToPython("_signature_help", signatureHelp);
   };
+  // vendored-patch (этап 8.2): чужая (по текущей модели) часть WorkspaceEdit
+  // из rename/codeAction уходит Python'у — он решает, открытый это документ
+  // (сообщение apply_lsp_text_edits его редактору) или закрытый (правка диска),
+  // см. pyqtp/controls/doc_control/workspace_edit.py
+  lspManager.onWorkspaceEditRequest = sendWorkspaceEditToPython;
+  lspManager.registerForeignEdit = registerForeignEditPayload;
   lspManager.setStack(entries);
   lspManager.setModel(editor.getModel()); // подхватываем текущую модель
 }
@@ -596,6 +644,70 @@ function updateFromPython(name: string, value: string) {
         editor.focus(); // vendored-patch (этап 6): каретка активированного документа должна быть видна
         sendToPython("_current_cursor", { line: lineNumber, column: column }); // Send back the new cursor position
       }
+      break;
+    }
+
+    case "apply_lsp_text_edits": {
+      // vendored-patch (этап 8.2): правки в ЭТОМ документе, пришедшие из LSP
+      // операции, запущенной в другом файле (rename/quickfix чужого документа).
+      // DocumentManager маршрутизирует чужую часть WorkspaceEdit: открытый
+      // документ получает сюда свои TextEdit в LSP-координатах сервера (0-based;
+      // сервер видит текст с prepended-заголовком — отсюда вычет lspHeader).
+      // undo: точка одна — см. pushEditOperations ниже (регистрирует пачку
+      // одним undo-элементом). dirty-трекинг не трогаем: onDidChangeModelContent
+      // уже шлёт _current_text в Python, а слушатель модели у LspClient —
+      // didChange серверу.
+      const payload = data && typeof data === "object" ? data : null;
+      const wantUri = payload && payload.uri ? monaco.Uri.parse(String(payload.uri)).toString() : "";
+      const model = editor.getModel();
+      if (!model || !wantUri || model.uri.toString() !== wantUri) {
+        console.warn("apply_lsp_text_edits: no model or uri mismatch");
+        sendToPython("_workspace_edit_applied", { uri: wantUri, ok: false, error: "model not found" });
+        break;
+      }
+      const lspEdits = payload && Array.isArray(payload.edits) ? payload.edits : [];
+      const headerLines = lspHeader ? lspHeader.split("\n").length - 1 : 0;
+      const ops: Array<{ range: monaco.Range; text: string }> = [];
+      let invalid = lspEdits.length === 0;
+      for (const te of lspEdits) {
+        if (!te || !te.range || !te.range.start || !te.range.end) {
+          invalid = true;
+          break;
+        }
+        const startLine = te.range.start.line + 1 - headerLines;
+        const endLine = te.range.end.line + 1 - headerLines;
+        if (startLine < 1 || endLine < startLine) {
+          invalid = true;
+          break;
+        }
+        ops.push({
+          range: new monaco.Range(
+            startLine,
+            te.range.start.character + 1,
+            endLine,
+            te.range.end.character + 1
+          ),
+          text: te.newText ?? "",
+        });
+      }
+      if (invalid) {
+        console.warn("apply_lsp_text_edits: invalid or empty edits payload", payload);
+        sendToPython("_workspace_edit_applied", { uri: wantUri, ok: false, error: "invalid or empty edits" });
+        break;
+      }
+      // undo: pushEditOperations регистрирует всю пачку ОДНИМ undo-элементом
+      // (публичный API, тем же идёт bulkEditService). Обычный model.applyEdits
+      // по умолчанию computeUndoEdits=false — правка вышла бы неundoable.
+      model.pushEditOperations(
+        [],
+        ops.map((op) => ({ range: op.range, text: op.text })),
+        () => null
+      );
+      sendToPython("_workspace_edit_applied", {
+        uri: wantUri,
+        ok: true,
+        version: model.getVersionId(),
+      });
       break;
     }
     case "highlight_lines":

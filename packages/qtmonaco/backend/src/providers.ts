@@ -858,3 +858,567 @@ export function createSemanticTokensProvider(
     },
   });
 }
+
+// -----------------------------------------------------------------------------
+// vendored-patch (этап 8.2): WorkspaceEdit — разбор ответа rename/formatting/
+// codeAction на «свою» и «чужие» части.
+//
+// Ключевая причина разделения: StandaloneBulkEditService.apply (esm/vs/editor/
+// standalone/browser/standaloneServices.js) бросает «bad edit - model not
+// found» на любом edit для отсутствующей модели и «bad edit - only text edits
+// are supported» на file-ops — правка применяется all-or-nothing, поэтому
+// чужие файлы (закрытые документы, переименования на ФС) обязан принимать
+// Python: он применяет их к открытым чужим редакторам сообщением
+// ``apply_lsp_text_edits`` и к диску напрямую (pyqtp/controls/doc_control/
+// workspace_edit.py).
+//
+// versionId у локальных правок намеренно НЕ проставляется: сервер строил
+// ответ по снимку текста на момент последнего didChange (у него свои версии),
+// а проверка версии у bulkEditService сравнила бы её с текущей версией модели
+// и отменила всю правку («bad state - model changed in the meantime»).
+// -----------------------------------------------------------------------------
+
+export interface SplitWorkspaceEdit {
+  // правки текущей модели — формат Monaco (bulkEditService/CodeAction.edit)
+  localEdits: monaco.languages.IWorkspaceTextEdit[];
+  // чужие TextDocumentEdit и ресурсные операции — как получено от сервера
+  // (uri строкой, LSP-координаты), порядок массива сохранён
+  foreignDocumentChanges: any[];
+  // есть ли в исходном правке вообще, выходящем за пределы текущей модели
+  hasForeign: boolean;
+}
+
+/** Нормализация uri для сравнения (файловые uri из LSP приходят строками). */
+function uriKey(uriOrString: any): string {
+  const s =
+    uriOrString && typeof uriOrString === "object"
+      ? String(uriOrString.toString())
+      : String(uriOrString ?? "");
+  return s.replace(/\/+$/, "");
+}
+
+/** Monaco-диапазон в LSP-координаты (+ строки префикс-заголовка). */
+function monacoRangeToLsp(range: monaco.IRange, prependedData: string | null): any {
+  const headerLines = prependedData ? prependedData.split("\n").length - 1 : 0;
+  return {
+    start: { line: range.startLineNumber - 1 + headerLines, character: range.startColumn - 1 },
+    end: { line: range.endLineNumber - 1 + headerLines, character: range.endColumn - 1 },
+  };
+}
+
+/**
+ * Разбор LSP WorkspaceEdit (формы ``changes`` и ``documentChanges``) на локальную
+ * часть (текущая модель) и чужую (открытые в других редакторах документы и
+ * закрытые файлы — решает Python). ``changes`` нормализуется в документные
+ * правки, порядок documentChanges сохраняется; ресурсные операции
+ * (CreateFile/RenameFile/DeleteFile/ChangeAnnotation) уходят в чужую часть как
+ * есть — на ФС их выполняет Python (Monaco их и не умеет).
+ */
+export function splitWorkspaceEdit(
+  edit: any,
+  currentUri: string,
+  prependedData: string | null
+): SplitWorkspaceEdit {
+  const result: SplitWorkspaceEdit = { localEdits: [], foreignDocumentChanges: [], hasForeign: false };
+  if (!edit || typeof edit !== "object") {
+    return result;
+  }
+  const currentKey = uriKey(currentUri);
+
+  const addTextDocumentEdit = (uri: string, edits: any[]) => {
+    if (uriKey(uri) === currentKey) {
+      for (const te of edits) {
+        if (!te?.range?.start || !te?.range?.end) continue;
+        result.localEdits.push({
+          resource: monaco.Uri.parse(uri),
+          // Monaco-поле текста — ``text`` (IWorkspaceTextEdit), у LSP — ``newText``
+          textEdit: { range: lspRangeToMonaco(te.range, prependedData), text: te.newText ?? "" },
+          // versionId намеренно опущен (см. комментарий блока выше)
+        } as monaco.languages.IWorkspaceTextEdit);
+      }
+    } else {
+      result.hasForeign = true;
+      result.foreignDocumentChanges.push({ textDocument: { uri }, edits });
+    }
+  };
+
+  if (edit.changes && typeof edit.changes === "object") {
+    for (const [uri, edits] of Object.entries<any>(edit.changes)) {
+      if (Array.isArray(edits)) {
+        addTextDocumentEdit(uri, edits);
+      }
+    }
+  }
+  if (Array.isArray(edit.documentChanges)) {
+    for (const change of edit.documentChanges) {
+      if (!change || typeof change !== "object") continue;
+      if (change.textDocument && Array.isArray(change.edits)) {
+        // TextDocumentEdit (в т.ч. AnnotatedTextEdit в edits — аннотации
+        // (changeAnnotationId) клиентом не используются, поля правок совместимы)
+        addTextDocumentEdit(String(change.textDocument.uri), change.edits);
+      } else if (typeof change.kind === "number") {
+        // ресурсные операции 3.16: CreateFile(1)/RenameFile(2)/DeleteFile(3)
+        // (+ speculative-варианты); анонсированные изменения (WillRename) вне
+        // объёма — уходят Python как есть
+        result.hasForeign = true;
+        result.foreignDocumentChanges.push(change);
+      }
+    }
+  }
+  return result;
+}
+
+/** Payload для Python-моста (``_apply_workspace_edit_request``). */
+export function foreignWorkspaceEditPayload(
+  origin: string,
+  sourceUri: string,
+  split: SplitWorkspaceEdit
+) {
+  return {
+    origin,
+    sourceUri,
+    workspaceEdit: { documentChanges: split.foreignDocumentChanges },
+  };
+}
+
+/**
+ * vendored-patch (этап 8.2): textDocument/rename + textDocument/prepareRename
+ * (F2, встроенный виджет RenameInput Monaco). single-owner на язык (правки
+ * rename Monaco применяет одним batch'ем — объединение результатов двух
+ * серверов дублировало бы правки).
+ *
+ * ВНИМАНИЕ: в этом билде Monaco 0.55 контроллер вызывает
+ * ``resolveRenameLocation(model, position, token)`` — БЕЗ аргумента options
+ * (в monaco.d.ts сигнатура четырёхаргументная); аргументы разбираем хвостом.
+ * ``supportsPrepare`` включает регистрацию resolveRenameLocation — иначе
+ * Monaco сам возьмёт слово под кареткой (RenameSkeleton.resolveRenameLocation).
+ */
+export function createRenameProvider(
+  languageId: string,
+  getCurrentConnection: () => MessageConnection | null,
+  isConnectionValid: (connection: MessageConnection | null) => boolean,
+  prependModelData: (model: monaco.editor.ITextModel) => string,
+  getPrependedData: () => string | null,
+  forceReconnect: () => void,
+  flushDocumentChanges: () => void,
+  supportsPrepare: boolean,
+  onWorkspaceEditRequest: ((payload: any) => void) | null
+): monaco.IDisposable {
+  const provider: any = {
+    provideRenameEdits: async (
+      model: monaco.editor.ITextModel,
+      position: monaco.Position,
+      newName: string
+    ) => {
+      const connection = getCurrentConnection();
+      if (!isConnectionValid(connection)) {
+        console.warn("No valid LSP connection available for rename");
+        return null;
+      }
+      const validConnection = connection!;
+
+      flushDocumentChanges();
+
+      const prependedData = getPrependedData();
+      const uri = prepareDocument(validConnection, model, prependModelData);
+
+      try {
+        const result: any = await validConnection.sendRequest("textDocument/rename", {
+          textDocument: { uri },
+          position: {
+            line: adjustLineForPrependedData(position, prependedData),
+            character: position.column - 1,
+          },
+          newName,
+        });
+        if (!result) return null;
+
+        const split = splitWorkspaceEdit(result, model.uri.toString(), prependedData);
+        // чужая часть уходит Python СРАЗУ: пользователь уже подтвердил F2,
+        // откладывать исполнение не на чём (в отличие от codeAction)
+        if (split.hasForeign && onWorkspaceEditRequest) {
+          onWorkspaceEditRequest(foreignWorkspaceEditPayload("rename", uri, split));
+        }
+        // локальную часть применяет сам контроллер rename через
+        // bulkEditService (pushStackElement до/после — одна undo-группа);
+        // пустые edits при наличии чужой части — валидный «ноль» для Monaco
+        return { edits: split.localEdits };
+      } catch (e) {
+        console.error("LSP rename failed:", e);
+        if (e instanceof Error && (e.message.includes("disposed") || e.message.includes("closed"))) {
+          console.warn("Connection was disposed during rename request, forcing reconnection");
+          forceReconnect();
+        }
+        return null;
+      }
+    },
+  };
+
+  if (supportsPrepare) {
+    // PrepareRenameResult: Range | {range, placeholder} | {range, defaultBehavior}
+    provider.resolveRenameLocation = async (
+      model: monaco.editor.ITextModel,
+      position: monaco.Position,
+      optionsOrToken: any,
+      maybeToken?: any
+    ) => {
+      // этот билд передаёт (model, position, token) — токен ищем хвостом
+      const token =
+        maybeToken && typeof maybeToken === "object" && "isCancellationRequested" in maybeToken
+          ? maybeToken
+          : optionsOrToken;
+      const connection = getCurrentConnection();
+      if (!isConnectionValid(connection)) {
+        return null;
+      }
+      const validConnection = connection!;
+      const prependedData = getPrependedData();
+      const uri = prepareDocument(validConnection, model, prependModelData);
+
+      try {
+        const result: any = await validConnection.sendRequest("textDocument/prepareRename", {
+          textDocument: { uri },
+          position: {
+            line: adjustLineForPrependedData(position, prependedData),
+            character: position.column - 1,
+          },
+        });
+        if (token?.isCancellationRequested) return null;
+        if (!result) return null;
+        const lspRange = result.range ?? result;
+        if (!lspRange?.start || !lspRange?.end) return null;
+        const range = lspRangeToMonaco(lspRange, prependedData);
+        const placeholder =
+          typeof result.placeholder === "string" ? result.placeholder : undefined;
+        const word = model.getWordUntilPosition(position);
+        return {
+          range,
+          text: placeholder ?? (word?.word || model.getValueInRange(range)),
+        };
+      } catch (e) {
+        console.error("LSP prepareRename failed:", e);
+        // rejectReason не формируем: сервер вернул RangeError-ответ — Monaco
+        // сам откатится на слово под кареткой (RenameSkeleton)
+        if (e instanceof Error && (e.message.includes("disposed") || e.message.includes("closed"))) {
+          console.warn("Connection was disposed during prepareRename request, forcing reconnection");
+          forceReconnect();
+        }
+        return null;
+      }
+    };
+  }
+
+  return monaco.languages.registerRenameProvider(languageId, provider);
+}
+
+/**
+ * vendored-patch (этап 8.2): textDocument/formatting и
+ * textDocument/rangeFormatting (команды editor.action.formatDocument /
+ * formatSelection; в linux-сборке формат документа забинден на Ctrl+Shift+I).
+ * single-owner на язык (форматирование от двух серверов конфликтовало бы:
+ * второй форматтер переписал бы результат первого). Композитный disposable
+ * на обе регистрации.
+ */
+export function createFormattingProviders(
+  languageId: string,
+  getCurrentConnection: () => MessageConnection | null,
+  isConnectionValid: (connection: MessageConnection | null) => boolean,
+  prependModelData: (model: monaco.editor.ITextModel) => string,
+  getPrependedData: () => string | null,
+  forceReconnect: () => void,
+  flushDocumentChanges: () => void,
+  supportRange: boolean
+): monaco.IDisposable {
+  const disposables: monaco.IDisposable[] = [];
+
+  const request = async (
+    method: string,
+    model: monaco.editor.ITextModel,
+    lspRange: any | undefined,
+    options: monaco.languages.FormattingOptions
+  ): Promise<monaco.languages.TextEdit[]> => {
+    const connection = getCurrentConnection();
+    if (!isConnectionValid(connection)) {
+      return [];
+    }
+    const validConnection = connection!;
+    flushDocumentChanges();
+    const prependedData = getPrependedData();
+    const uri = prepareDocument(validConnection, model, prependModelData);
+    const params: any = {
+      textDocument: { uri },
+      options: {
+        tabSize: options?.tabSize ?? 4,
+        insertSpaces: options?.insertSpaces ?? true,
+      },
+    };
+    if (lspRange) {
+      params.range = lspRange;
+    }
+    try {
+      const result: any = await validConnection.sendRequest(method, params);
+      if (!Array.isArray(result)) return [];
+      return result
+        .filter((te: any) => te?.range?.start && te?.range?.end)
+        .map((te: any) => ({
+          range: lspRangeToMonaco(te.range, prependedData),
+          text: te.newText ?? "",
+        }));
+    } catch (e) {
+      console.error(`LSP ${method} failed:`, e);
+      if (e instanceof Error && (e.message.includes("disposed") || e.message.includes("closed"))) {
+        console.warn(`Connection was disposed during ${method} request, forcing reconnection`);
+        forceReconnect();
+      }
+      return [];
+    }
+  };
+
+  disposables.push(
+    monaco.languages.registerDocumentFormattingEditProvider(languageId, {
+      provideDocumentFormattingEdits: (model, options) =>
+        request("textDocument/formatting", model, undefined, options),
+    })
+  );
+  if (supportRange) {
+    disposables.push(
+      monaco.languages.registerDocumentRangeFormattingEditProvider(languageId, {
+        provideDocumentRangeFormattingEdits: (model, range, options) => {
+          const sorted =
+            range.startLineNumber < range.endLineNumber ||
+            (range.startLineNumber === range.endLineNumber &&
+              range.startColumn <= range.endColumn)
+              ? range
+              : {
+                  startLineNumber: range.endLineNumber,
+                  startColumn: range.endColumn,
+                  endLineNumber: range.startLineNumber,
+                  endColumn: range.startColumn,
+                };
+          return request(
+            "textDocument/rangeFormatting",
+            model,
+            monacoRangeToLsp(sorted, getPrependedData()),
+            options
+          );
+        },
+      })
+    );
+  }
+  return { dispose: () => disposables.forEach((d) => d.dispose()) };
+}
+
+/**
+ * vendored-patch (этап 8.2): textDocument/codeAction + codeAction/resolve.
+ * РЕГИСТРИРУЕТСЯ КАЖДЫМ поддерживающим сервером (без claimProvider): Monaco
+ * сам объединяет действия всех провайдеров в общий список quickfix-меню.
+ *
+ * Диагностический контекст: в этом билде Monaco провайдеру приходят маркерные
+ * IMarker (standaloneLanguages докидывает context.markers), но MarkerService.
+ * _toMarker вырезает все поля, кроме известного набора, а basedpyright требует
+ * roundtrip поля ``data`` его diagnostic'ов (иначе они не проходят
+ * isDiagnosticWithActions). Поэтому контекст восстанавливаем из СЫРЫХ
+ * publishDiagnostics, кэшированных клиентом (getPublishedDiagnostics), а не из
+ * маркеров.
+ *
+ * Разделение правок: локальная часть — в ``action.edit`` (её применяет
+ * контроллер codeAction через bulkEditService), чужая — откладывается до
+ * выбора действия пользователем: регистрируется в ``registerForeignEdit``
+ * (token → payload в main.ts) и подвешивается командой
+ * ``qtmonaco.lsp.applyForeignEdit`` — она исполнится после локальной части
+ * (codeAction.js: сначала edit, затем command). Действие с edit только для
+ * чужих файлов остаётся в списке с этой командой (edit не ставим — иначе
+ * bulkEditService упадёт на отсутствующей модели).
+ */
+export function createCodeActionProvider(
+  languageId: string,
+  getCurrentConnection: () => MessageConnection | null,
+  isConnectionValid: (connection: MessageConnection | null) => boolean,
+  prependModelData: (model: monaco.editor.ITextModel) => string,
+  getPrependedData: () => string | null,
+  forceReconnect: () => void,
+  flushDocumentChanges: () => void,
+  getPublishedDiagnostics: () => any[],
+  registerForeignEdit: (payload: any) => string,
+  supportsResolve: boolean,
+  providedKinds?: string[]
+): monaco.IDisposable {
+  // Monaco-действие -> {сырое LSP-действие, uri модели на момент выдачи}
+  // (resolveCodeAction приходит БЕЗ модели — uri помним с момента provide)
+  const monacoToRaw = new WeakMap<object, { raw: any; modelUri: monaco.Uri }>();
+
+  const toMonacoAction = (action: any): any => {
+    const monacoAction: any = { title: action.title ?? "" };
+    if (action.kind) monacoAction.kind = action.kind;
+    if (action.isPreferred) monacoAction.isPreferred = true;
+    if (action.diagnostics) {
+      monacoAction.diagnostics = (action.diagnostics ?? [])
+        .filter((d: any) => d?.range?.start)
+        .map((d: any) => ({
+          range: {
+            startLineNumber: d.range.start.line + 1,
+            startColumn: d.range.start.character + 1,
+            endLineNumber: d.range.end.line + 1,
+            endColumn: d.range.end.character + 1,
+          },
+          message: d.message ?? "",
+        }));
+    }
+    if (action.disabled) {
+      monacoAction.disabled =
+        typeof action.disabled === "string"
+          ? action.disabled
+          : action.disabled?.reason || "disabled";
+    }
+    return monacoAction;
+  };
+
+  const attachEditSplit = (
+    monacoAction: any,
+    rawAction: any,
+    split: SplitWorkspaceEdit,
+    sourceUri: string
+  ) => {
+    if (split.localEdits.length) {
+      monacoAction.edit = { edits: split.localEdits };
+    }
+    if (split.hasForeign) {
+      const token = registerForeignEdit(
+        foreignWorkspaceEditPayload("codeAction", sourceUri, split)
+      );
+      // цепочка: если у сервера была своя команда (workspace/executeCommand
+      // у нас не реализован, на практике pyright/ruff кладут edit в действие),
+      // сохраняем её в payload для отладки, а исполняемой делаем нашу
+      if (rawAction.command) {
+        console.warn("Ignoring server command of code action (foreign edit takes its slot):", rawAction.command);
+      }
+      monacoAction.command = {
+        id: "qtmonaco.lsp.applyForeignEdit",
+        title: monacoAction.title,
+        arguments: [token],
+      };
+    }
+  };
+
+  const applyRawEdit = (monacoAction: any, rawAction: any, model: monaco.editor.ITextModel) => {
+    const sourceUri = model.uri.toString();
+    const split = splitWorkspaceEdit(rawAction.edit, sourceUri, getPrependedData());
+    attachEditSplit(monacoAction, rawAction, split, sourceUri);
+  };
+
+  // Monaco требует, чтобы провайдер возвращал CodeActionList С методом
+  // dispose() (CodeActionRegistry кладёт список в DisposableStore — без него
+  // TypeError «dispose is not a function» рвёт состояние контроллера).
+  const emptyActionList = () => ({ actions: [], dispose() {} });
+
+  const provider: any = {
+    provideCodeActions: async (
+      model: monaco.editor.ITextModel,
+      range: monaco.IRange,
+      context: { only?: string; trigger?: number },
+      token: { isCancellationRequested: boolean }
+    ) => {
+      const connection = getCurrentConnection();
+      if (!isConnectionValid(connection)) {
+        return emptyActionList();
+      }
+      const validConnection = connection!;
+
+      flushDocumentChanges();
+
+      const prependedData = getPrependedData();
+      const uri = prepareDocument(validConnection, model, prependModelData);
+      const sorted =
+        range.startLineNumber < range.endLineNumber ||
+        (range.startLineNumber === range.endLineNumber && range.startColumn <= range.endColumn)
+          ? range
+          : {
+              startLineNumber: range.endLineNumber,
+              startColumn: range.endColumn,
+              endLineNumber: range.startLineNumber,
+              endColumn: range.startColumn,
+            };
+      const lspRange = monacoRangeToLsp(sorted, prependedData);
+      const intersects = (r: any) =>
+        r?.start && r?.end &&
+        (r.end.line > lspRange.start.line ||
+          (r.end.line === lspRange.start.line && r.end.character >= lspRange.start.character)) &&
+        (r.start.line < lspRange.end.line ||
+          (r.start.line === lspRange.end.line && r.start.character <= lspRange.end.character));
+      const diagnostics = getPublishedDiagnostics().filter((d) => intersects(d?.range));
+
+      try {
+        const result: any = await validConnection.sendRequest("textDocument/codeAction", {
+          textDocument: { uri },
+          range: lspRange,
+          // Monaco отдаёт context.only ОДИН строкой ('quickfix'), а по LSP
+          // context.only — массив kinds; basedpyright зовёт на нём .some() и
+          // падает на строке («kinds.some is not a function»)
+          context: {
+            diagnostics,
+            only: context?.only ? [String(context.only)] : undefined,
+          },
+        });
+        if (token?.isCancellationRequested) return emptyActionList();
+        const actions: any[] = Array.isArray(result) ? result : result?.actions ?? [];
+        const monacoActions = actions
+          .filter((a) => a && a.title)
+          .map((raw) => {
+            const monacoAction = toMonacoAction(raw);
+            monacoToRaw.set(monacoAction, { raw, modelUri: model.uri });
+            if (raw.edit) {
+              applyRawEdit(monacoAction, raw, model);
+            }
+            return monacoAction;
+          });
+        return { actions: monacoActions, dispose() {} };
+      } catch (e) {
+        console.error("LSP codeAction failed:", e);
+        if (e instanceof Error && (e.message.includes("disposed") || e.message.includes("closed"))) {
+          console.warn("Connection was disposed during codeAction request, forcing reconnection");
+          forceReconnect();
+        }
+        return emptyActionList();
+      }
+    },
+  };
+
+  if (supportsResolve) {
+    // codeAction/resolve: сервер дописывает edit (у basedpyright organizeImports
+    // edit приходит сразу, resolve — подстраховка для экономных серверов)
+    provider.resolveCodeAction = async (monacoAction: any) => {
+      const entry = monacoToRaw.get(monacoAction);
+      const connection = getCurrentConnection();
+      if (!entry || !isConnectionValid(connection)) {
+        return monacoAction;
+      }
+      const validConnection = connection!;
+      try {
+        const resolved: any = await validConnection.sendRequest("codeAction/resolve", entry.raw);
+        if (!resolved) return monacoAction;
+        const merged = { ...entry.raw, ...resolved };
+        if (merged.edit) {
+          const split = splitWorkspaceEdit(
+            merged.edit,
+            entry.modelUri.toString(),
+            getPrependedData()
+          );
+          attachEditSplit(monacoAction, merged, split, entry.modelUri.toString());
+        }
+        monacoToRaw.set(monacoAction, { raw: merged, modelUri: entry.modelUri });
+        return monacoAction;
+      } catch (e) {
+        console.error("codeAction/resolve failed:", e);
+        return monacoAction;
+      }
+    };
+  }
+
+  return monaco.languages.registerCodeActionProvider(
+    languageId,
+    provider,
+    providedKinds && providedKinds.length
+      ? { providedCodeActionKinds: providedKinds }
+      : undefined
+  );
+}
