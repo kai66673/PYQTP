@@ -236,12 +236,33 @@ Python→JS: uri-фартук, одна undo-точка, warning `bcad.med` на
 LSP/WebEngine: заполнение панели/фильтр мусора, двойной клик, reveal
 вложенного файла, персист корня между перезапусками, снятие при закрытии).
 
+#### 9.2 — quick open (Ctrl+P) — ГОТОВО
+- `quick_open.py` (`pyqtp/controls/project_control/`): DP fuzzy-скоринг
+  (`fuzzy_score`: регистронезависимое подпоследовательностное вхождение,
+  бонусы старт/граница/подряд; граница бонусится только первому символу
+  query, иначе «p после точки» в `deep.py` обгонял бы цепочку `dp.py`;
+  итог — только за полностью совпавшую query) + синхронный скан
+  `iter_project_files` (тот же prune, что у дерева: точечные + `__pycache__`
+  /`node_modules`);
+- `ProjectControl`: фоновый скан (`threading.Thread` + queued-сигнал
+  `_ScanSignals`) с защитой от запоздалых результатов поколением `_scan_gen`
+  (инкремент при смене/закрытии проекта и teardown), экшен «Быстрый переход
+  по файлам...» (Ctrl+P, «Файл» priority=7, активен только с проектом),
+  console-API `quick_open_show`;
+- `QuickOpenDialog`: немодальный, QLineEdit + QListWidget (до 100 строк,
+  сортировка по скорингу, при равном — порядок обхода), Up/Down/Enter из
+  поля ввода через `eventFilter`, выбор → `file_selected` (абсолютный путь)
+  → тот же `open_document`, что у дерева.
+**Приёмка:** `tests/test_quick_open.py` (13: 7 юнитов скоринга + 2 юнита
+сканера без GUI + 4 offscreen-GUI — гейт экшена по проекту, скан→диалог→
+Enter открывает документ, набор fuzzy-строк, обнуление кэша и сброс
+диалога при закрытии проекта + отброс запоздалого скана по поколению).
+
 #### Остаток этапа 9
 - `workspace/symbol` (остаток этапа 8) — в меню/палитре по корню проекта;
 - контекстное меню дерева (create/rename/delete в корзину с подтверждением;
   rename — через **LSP `willRenameFiles`/`didRenameFiles`** — у хаба пока
   нет, добавим сообщение DocumentManager→LspHub);
-- quick open (Ctrl+P): fuzzy по кэшу файлов;
 - поиск по проекту (Ctrl+Shift+F): субпроцесс **ripgrep** (`--json`) →
   results-панель → клик = `open_definition_uri` + reveal (regex/case/include
   бесплатно с rg; собственный fuzzy-движок как в iide не пишем);

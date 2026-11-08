@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import logging
+import threading
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from PySide6.QtCore import Signal
+from PySide6.QtCore import QObject, Signal
 from PySide6.QtGui import QIcon, QKeySequence
 from PySide6.QtWidgets import QFileDialog
 
 from pyqtp.controls.base_control import BaseControl
+from pyqtp.controls.project_control.quick_open import iter_project_files
+from pyqtp.controls.project_control.quick_open_dialog import QuickOpenDialog
 from pyqtp.utils.action import Action
 from pyqtp.utils.priority_menu import PriorityMenu
 from pyqtp.views.project_tree_view import ProjectTreeView
@@ -19,13 +22,20 @@ if TYPE_CHECKING:
 prj_log = logging.getLogger('bcad.project')
 
 
-class ProjectControl(BaseControl):
-    """Контрол проекта (этап 9.1): папка-корень + панель «Проводник».
+class _ScanSignals(QObject):
+    """Мост «фоновый поток -> поток GUI» для результатов скана файлов."""
 
-    Хранит текущий корень проекта, Persistует его в QSettings
+    finished = Signal(int, list)  # поколение скана + относительные пути
+
+
+class ProjectControl(BaseControl):
+    """Контрол проекта (этапы 9.1–9.2): папка-корень, панель «Проводник», quick open.
+
+    Хранит текущий корень проекта, сохраняет его в QSettings
     (``<key>/root_path``), создаёт докируемую панель дерева слева
-    (``widget_area='left'``) и прокидывает двойной клик по файлу в
-    ``DocumentManager.open_document``.
+    (``widget_area='left'``), прокидывает двойной клик по файлу в
+    ``DocumentManager.open_document`` и держит фоновый кэш файлов проекта
+    для диалога «Быстрый переход» (Ctrl+P).
     """
 
     # аннотация ради plug_compatibility_check и типизированного доступа
@@ -55,9 +65,25 @@ class ProjectControl(BaseControl):
             parent=self,
             description='Закрыть текущий проект',
         )
+        self.action_quick_open = Action(
+            icon=QIcon(),
+            title='Быстрый переход по файлам...',
+            parent=self,
+            description='Поиск файла проекта по имени (fuzzy)',
+            shortcut=QKeySequence('Ctrl+P'),
+        )
         self.action_open_folder.triggered.connect(self._choose_folder)
         self.action_close_folder.triggered.connect(self.close_project)
+        self.action_quick_open.triggered.connect(self._show_quick_open)
         self.action_close_folder.setEnabled(False)
+        self.action_quick_open.setEnabled(False)
+
+        # кэш файлов проекта (быстрый переход) и фоновый скан
+        self._scan_signals = _ScanSignals()
+        self._scan_signals.finished.connect(self._on_scan_ready)
+        self._scan_gen = 0
+        self._quick_files: list[str] = []
+        self._quick_dialog: QuickOpenDialog | None = None
 
     ###############
     # Настройки #
@@ -87,12 +113,14 @@ class ProjectControl(BaseControl):
         self.action_open_folder.setIcon(
             self._main_wnd.theme_manager.icon('io/open.svg')
         )
+        self.project_root_changed.connect(self._on_root_for_scan)
         # API проекта для Python-консоли (этап 9.1; расширение — этап 12)
         self._main_wnd.api_ctrl.register_variables(
             {
                 'project_root': lambda: self._project_root,
                 'project_open': self.open_project,
                 'project_close': self.close_project,
+                'quick_open_show': self._show_quick_open,
             }
         )
 
@@ -108,6 +136,7 @@ class ProjectControl(BaseControl):
         assert isinstance(file_menu, PriorityMenu)
 
         file_menu.addAction(self.action_open_folder, priority=4)
+        file_menu.addAction(self.action_quick_open, priority=7)
         file_menu.addAction(self.action_close_folder, priority=8)
 
     def setup_views(self) -> None:
@@ -121,6 +150,7 @@ class ProjectControl(BaseControl):
         if self._project_root is not None:
             view.set_project_root(self._project_root)
             self.action_close_folder.setEnabled(True)
+            self._start_scan()
 
         # подсветка открытого документа в дереве (смену активной вкладки
         # пока не отслеживаем — сигнала об активации в core нет)
@@ -130,6 +160,7 @@ class ProjectControl(BaseControl):
 
     def teardown_views(self) -> None:
         super().teardown_views()
+        self._scan_gen += 1  # сброс: запоздалые результаты скана не нужны
         if self.tree_view is not None:
             self._main_wnd.view_deregister(self.tree_view.key)
             self.tree_view = None
@@ -185,6 +216,59 @@ class ProjectControl(BaseControl):
 
     def _open_file_from_tree(self, path_str: str) -> None:
         self._main_wnd.doc_ctrl.open_document(path_str)
+
+    #####################
+    # Quick open (9.2)  #
+
+    def _on_root_for_scan(self, root: Path | None) -> None:
+        """Смена корня проекта: старт/сброс фонового кэша файлов."""
+        if root is None:
+            self._scan_gen += 1
+            self._quick_files = []
+            self.action_quick_open.setEnabled(False)
+            if self._quick_dialog is not None:
+                self._quick_dialog.set_index(None, [])
+            return
+        self._start_scan()
+
+    def _start_scan(self) -> None:
+        """Фоновый обход проекта; результат — по поколению скана."""
+        if self._project_root is None:
+            return
+        self._scan_gen += 1
+        gen = self._scan_gen
+        self.action_quick_open.setEnabled(True)
+        root = self._project_root
+        signals = self._scan_signals
+
+        def _work() -> None:
+            try:
+                files = iter_project_files(root)
+            except OSError as exc:
+                prj_log.warning('Скан файлов проекта сорван: %s', exc)
+                files = []
+            # emit из python-потока: PySide доставляет queued-сигналом в GUI
+            signals.finished.emit(gen, files)
+
+        threading.Thread(target=_work, name='pyqtp-project-scan', daemon=True).start()
+
+    def _on_scan_ready(self, gen: int, files: list) -> None:
+        if gen != self._scan_gen:
+            return  # проект уже сменился/закрыт
+        self._quick_files = list(files)
+        prj_log.debug('Кэш файлов проекта: %d', len(self._quick_files))
+        if self._quick_dialog is not None:
+            self._quick_dialog.set_index(self._project_root, self._quick_files)
+
+    def _show_quick_open(self) -> None:
+        if self._project_root is None:
+            prj_log.info('Быстрый переход: проект не открыт')
+            return
+        if self._quick_dialog is None:
+            self._quick_dialog = QuickOpenDialog(self._main_wnd)
+            self._quick_dialog.file_selected.connect(self._open_file_from_tree)
+        self._quick_dialog.set_index(self._project_root, self._quick_files)
+        self._quick_dialog.show_for_use()
 
     def _persist_root(self) -> None:
         settings = self._main_wnd.settings

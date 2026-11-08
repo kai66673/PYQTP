@@ -50,11 +50,12 @@ Verify in this order: **ruff → pyright → tests → run the app**.
   (LSP registry + live editor + stage-7 editor UX + stage-8.1 references/symbols/highlight live tests
    + stage-8.2 rename/formatting/codeAction live tests
    + editor-options/theme + workspace-edit-apply (test_workspace_edit_apply.py) unit tests
-   + stage-9.1 project tree panel (test_project_tree.py, offscreen GUI без LSP/WebEngine, без маркеров)). Markers `live`
+   + stage-9.1 project tree panel (test_project_tree.py, offscreen GUI без LSP/WebEngine, без маркеров)
+   + stage-9.2 quick open (test_quick_open.py: scorer/scan unit без GUI + live offscreen диалог)). Markers `live`
   (real LSP server processes) and
-  `webengine` (real QWebEngineView/Monaco) are deselected by default via `addopts` → 54 passed / 27
+  `webengine` (real QWebEngineView/Monaco) are deselected by default via `addopts` → 67 passed / 27
   deselected; run them with `uv run pytest -m 'live or webengine'` (~2 min, they work offscreen) or
-  all 81 in one
+  all 94 in one
   process with `uv run pytest -m ''` (~2 min, full run keeps passing despite `os._exit` in
   `pytest_sessionfinish` eating the summary line — count the dots). Test-suite gotchas:
   - root `conftest.py` sets `QT_QPA_PLATFORM=offscreen` + `QTWEBENGINE_DISABLE_SANDBOX=1` at import
@@ -204,9 +205,10 @@ Verify in this order: **ruff → pyright → tests → run the app**.
     на самой странице нет — кнопки окна вызывают `registry_apply_json/
     registry_reset/registry_json`.
   - Квирка pyright/ruff при подклассировании `QDialog`: имена параметров
-    оверрайдов `showEvent/closeEvent` должны совпадать со стабами PySide6
-    (`arg__1`), а `showEvent` требует `# noqa: N802` — в pep8-naming белом
-    списке есть `closeEvent`, но нет `showEvent`.
+    оверрайдов `showEvent/closeEvent` (у `eventFilter` стаб — `arg__1`/
+    `arg__2`) должны совпадать со стабами PySide6 (`arg__1`), а `showEvent`
+    и `eventFilter` требуют `# noqa: N802` — в pep8-naming белом списке есть
+    `closeEvent`/`keyPressEvent`, но нет `showEvent`/`eventFilter`.
 - Панель проекта (этап 9.1, план — `docs/IDE_ROADMAP.md`): контрол
   `ProjectControl` (`pyqtp-ide/pyqtp/controls/project_control/project_control.py`,
   key = qualname, регистрируется в `IdeMainWindow.init_controls` после
@@ -226,6 +228,18 @@ Verify in this order: **ruff → pyright → tests → run the app**.
   `QTimer.singleShot(0,...)`: `QFileSystemModel` наполняется изнутри, а
   KDD-док-менеджер у скрытой панели `canFetchMore` не опрашивает — первый
   уровень грузится вручную (`fetchMore` после `setRootPath`).
+   Быстрый переход (этап 9.2): `quick_open.py` — чистый (без GUI) DP
+   fuzzy-скорер `fuzzy_score` + синхронный скан `iter_project_files` (тот же
+   prune, что у дерева); `QuickOpenDialog` — QLineEdit+QListWidget, выбор →
+   `file_selected(абсолютный путь)` → `open_document`. Скан крутится в
+   `threading.Thread` (daemon) и приходит queued-сигналом через
+   `_ScanSignals(QObject)`; результат отбрасывается по поколению
+   `_scan_gen` (инкремент при смене/закрытии корня и в `teardown_views`).
+   Экшен `action_quick_open` (Ctrl+P, «Файл» priority=7) активен только с
+   открытым проектом; console-API `quick_open_show`. Нюанс скоринга: бонус
+   границы даётся только ПЕРВОМУ символу query (иначе «p после точки» в
+   `deep.py` обгонял бы цепочку «подряд» в `dp.py`), итог считается по
+   `best_any[-1]` — совпасть должна вся query, а не префикс.
 
 ## Runtime gotchas
 
