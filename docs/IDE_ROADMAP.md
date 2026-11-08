@@ -216,8 +216,8 @@ whole-document edit + одна undo-точка), `test_stage82_code_action_quick
 (список фиксов basedpyright через `apply:'never'`, применение первого,
 уход диагностики), `test_stage82_apply_lsp_text_edits_direct` (мост
 Python→JS: uri-фартук, одна undo-точка, warning `bcad.med` на ok:false).
-Остаток этапа — `workspace/symbol` (этап 9); `inlayHint`/`codeLens`/
-`documentColor` сознательно не брали.
+Остаток этапа — `workspace/symbol` — закрыт этапом 9.4; `inlayHint`/
+`codeLens`/`documentColor` сознательно не брали.
 
 ### Этап 9 — проект и сессии
 
@@ -275,7 +275,7 @@ Enter открывает документ, набор fuzzy-строк, обну
   exit≥2 — «Ошибка: <последняя строка stderr>» (битый regex), rg не найден —
   FailedToStart;
 - `ProjectControl`: экшен «Поиск по проекту...» (Ctrl+Shift+F, «Файл»
-  priority=8 — «Закрыть папку» переехал на 9, активен только с проектом),
+  priority=9 — после добавления 9.4 «Закрыть папку» на 10, активен только с проектом),
   console-API `project_search_show`; клик по совпадению →
   `DocumentManager.open_definition_uri` (тот же путь, что переходы LSP этапа 6).
 **Приёмка:** `tests/test_project_search.py` (15: 2 юнита argv + 5 юнитов
@@ -285,8 +285,53 @@ UTF-16-колонки) + 7 offscreen-GUI с живым rg (гейт экшена
 результат/сброс при закрытии проекта, битый regex → «Ошибка»; плюс
 гейт `skipif` при отсутствии rg).
 
+#### 9.4 — переход к символу проекта (Ctrl+T, workspace/symbol) — ГОТОВО
+- `workspace_symbol.py` (`pyqtp/controls/lsp_control/`): чистый разбор
+  ответа сервера — спека LSP допускает две формы элемента: `SymbolInformation`
+  (`location={uri, range}` + `containerName`) и `WorkspaceSymbol` 3.17
+  (`location={uri[, range]}` + устаревшие верхнеуровневые
+  `range`/`selectionRange`); битые элементы молча пропускаются, fallback
+  без валидного range — `(1, 1)` (переход в начало файла); dataclass
+  `WorkspaceSymbol` — уже в Monaco-координатах (1-based, тот же формат,
+  что у `open_definition_uri`); `SYMBOL_KIND_NAMES` — русские тексты
+  kind'ов 1..26;
+- `LspHub.workspace_symbols_async(project_root, query, cb, timeout)` —
+  вход из GUI-потока, корутина уходит в event-loop потока хаба. Выбор
+  сервера без открытого редактора: `LspRegistry.sample_file_for()` находит
+  обходом корня «образцовый» файл каждого языка реестра (тот же prune,
+  что у дерева/quick open) → `servers_for_uri` → процесс переиспользуется
+  из общего пула `(command, root_uri)`; отвечает первый, объявивший
+  `workspaceSymbolProvider`; кэш образцов `_wsym_samples` сбрасывается при
+  применении/сбросе реестра;
+- хаб обязан заявить клиентскую возможность `workspace.workspaceSymbol`
+  (иначе сервер не включает фичу) — есть regression-guard тест;
+- надёжность (у хаба теперь два источника запросов, не только редакторы):
+  `_ServerInstance._ready` (`asyncio.Event`, ставится в `finally start()`) —
+  параллельные `_ensure_instance` ждут чужой хендшейк, а не плодят второй
+  процесс на тот же ключ; холодный старт: pyright/clangd во время первичной
+  индексации после хендшейка отвечают пустым списком (замер на basedpyright
+  — индекс готов ~через 2 с), поэтому первый пустой ответ повторяется один
+  раз на процесс (`wsym_answered` + `_WSYM_COLD_RETRY_DELAY`); поколение
+  `_wsym_gen` — запоздалые ответы устаревших запросов не доходят до cb;
+- `WorkspaceSymbolDialog` (`pyqtp/controls/project_control/`): немодальный
+  в стиле quick open (QLineEdit + QListWidget + статус), дебаунс 400 мс,
+  cb из потока хаба — queued-сигналом `_SymbolSignals`, гейт поколения
+  `_req_gen` на стороне диалога (`drop_pending()` при смене/закрытии
+  проекта и teardown); выбор → `symbol_selected` (payload для
+  `DocumentManager.open_definition_uri`);
+- `ProjectControl`: экшен «Переход к символу проекта...» (Ctrl+T, «Файл»
+  priority=8 — поиск переехал на 9, «Закрыть папку» на 10, активен только
+  с проектом), console-API `workspace_symbols_show`.
+**Приёмка:** `tests/test_workspace_symbol.py` (15: 10 юнитов — три формы
+ответа + мусор/None, гейт `workspaceSymbolProvider: boolean|options`,
+форма payload, замороженность dataclass, regression-guard возможности
+хаба, 3 юнита `sample_file_for` с prune/точечными + 1 не-live GUI
+(гейт Ctrl+T по проекту) + 4 live с реальным basedpyright — запрос через
+хаб (MyClass, строка 4, колонка 7), доставка cb и устаревание по
+поколению, пустой проект (понятная ошибка без зависания), offscreen-
+диалог: запрос → дебаунс → список → payload открытия).
+
 #### Остаток этапа 9
-- `workspace/symbol` (остаток этапа 8) — в меню/палитре по корню проекта;
 - контекстное меню дерева (create/rename/delete в корзину с подтверждением;
   rename — через **LSP `willRenameFiles`/`didRenameFiles`** — у хаба пока
   нет, добавим сообщение DocumentManager→LspHub);

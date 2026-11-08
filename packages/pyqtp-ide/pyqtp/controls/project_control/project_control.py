@@ -12,6 +12,9 @@ from PySide6.QtWidgets import QFileDialog
 from pyqtp.controls.base_control import BaseControl
 from pyqtp.controls.project_control.quick_open import iter_project_files
 from pyqtp.controls.project_control.quick_open_dialog import QuickOpenDialog
+from pyqtp.controls.project_control.workspace_symbol_dialog import (
+    WorkspaceSymbolDialog,
+)
 from pyqtp.utils.action import Action
 from pyqtp.utils.priority_menu import PriorityMenu
 from pyqtp.views.project_search_view import ProjectSearchView
@@ -31,7 +34,8 @@ class _ScanSignals(QObject):
 
 
 class ProjectControl(BaseControl):
-    """Контрол проекта (этапы 9.1–9.3): папка-корень, панель «Проводник», quick open, поиск.
+    """Контрол проекта (этапы 9.1–9.3 + workspace/symbol): папка-корень, панель
+    «Проводник», quick open, поиск, переход к символу проекта.
 
     Хранит текущий корень проекта, сохраняет его в QSettings
     (``<key>/root_path``), создаёт докируемую панель дерева слева
@@ -84,13 +88,24 @@ class ProjectControl(BaseControl):
             description='Полнотекстовый поиск по файлам проекта (ripgrep)',
             shortcut=QKeySequence('Ctrl+Shift+F'),
         )
+        self.action_workspace_symbols = Action(
+            icon=QIcon(),
+            title='Переход к символу проекта...',
+            parent=self,
+            description='Поиск символов во всём проекте (LSP workspace/symbol)',
+            shortcut=QKeySequence('Ctrl+T'),
+        )
         self.action_open_folder.triggered.connect(self._choose_folder)
         self.action_close_folder.triggered.connect(self.close_project)
         self.action_quick_open.triggered.connect(self._show_quick_open)
         self.action_project_search.triggered.connect(self._show_project_search)
+        self.action_workspace_symbols.triggered.connect(
+            self._show_workspace_symbols
+        )
         self.action_close_folder.setEnabled(False)
         self.action_quick_open.setEnabled(False)
         self.action_project_search.setEnabled(False)
+        self.action_workspace_symbols.setEnabled(False)
 
         # кэш файлов проекта (быстрый переход) и фоновый скан
         self._scan_signals = _ScanSignals()
@@ -98,6 +113,7 @@ class ProjectControl(BaseControl):
         self._scan_gen = 0
         self._quick_files: list[str] = []
         self._quick_dialog: QuickOpenDialog | None = None
+        self._symbol_dialog: WorkspaceSymbolDialog | None = None
 
     ###############
     # Настройки #
@@ -136,6 +152,7 @@ class ProjectControl(BaseControl):
                 'project_close': self.close_project,
                 'quick_open_show': self._show_quick_open,
                 'project_search_show': self._show_project_search,
+                'workspace_symbols_show': self._show_workspace_symbols,
             }
         )
 
@@ -152,8 +169,9 @@ class ProjectControl(BaseControl):
 
         file_menu.addAction(self.action_open_folder, priority=4)
         file_menu.addAction(self.action_quick_open, priority=7)
-        file_menu.addAction(self.action_project_search, priority=8)
-        file_menu.addAction(self.action_close_folder, priority=9)
+        file_menu.addAction(self.action_workspace_symbols, priority=8)
+        file_menu.addAction(self.action_project_search, priority=9)
+        file_menu.addAction(self.action_close_folder, priority=10)
 
     def setup_views(self) -> None:
         self.tree_view = view = ProjectTreeView(
@@ -186,6 +204,8 @@ class ProjectControl(BaseControl):
     def teardown_views(self) -> None:
         super().teardown_views()
         self._scan_gen += 1  # сброс: запоздалые результаты скана не нужны
+        if self._symbol_dialog is not None:
+            self._symbol_dialog.drop_pending()
         if self.search_view is not None:
             self.search_view.stop_search()
             self._main_wnd.view_deregister(self.search_view.key)
@@ -256,8 +276,11 @@ class ProjectControl(BaseControl):
             self._quick_files = []
             self.action_quick_open.setEnabled(False)
             self.action_project_search.setEnabled(False)
+            self.action_workspace_symbols.setEnabled(False)
             if self._quick_dialog is not None:
                 self._quick_dialog.set_index(None, [])
+            if self._symbol_dialog is not None:
+                self._symbol_dialog.set_project(None)
             return
         self._start_scan()
 
@@ -269,7 +292,10 @@ class ProjectControl(BaseControl):
         gen = self._scan_gen
         self.action_quick_open.setEnabled(True)
         self.action_project_search.setEnabled(True)
+        self.action_workspace_symbols.setEnabled(True)
         root = self._project_root
+        if self._symbol_dialog is not None and root is not None:
+            self._symbol_dialog.set_project(root)
         signals = self._scan_signals
 
         def _work() -> None:
@@ -324,6 +350,27 @@ class ProjectControl(BaseControl):
                 },
             }
         )
+
+    ##############################
+    # Символы проекта (workspace) #
+
+    def _show_workspace_symbols(self) -> None:
+        if self._project_root is None:
+            prj_log.info('Переход к символу: проект не открыт')
+            return
+        if self._symbol_dialog is None:
+            self._symbol_dialog = WorkspaceSymbolDialog(
+                self._main_wnd, self._main_wnd.lsp_hub
+            )
+            self._symbol_dialog.symbol_selected.connect(
+                self._open_symbol_payload
+            )
+        self._symbol_dialog.set_project(self._project_root)
+        self._symbol_dialog.show_for_use()
+
+    def _open_symbol_payload(self, payload: dict) -> None:
+        """Символ из диалога -> открыть файл и каретка на месте определения."""
+        self._main_wnd.doc_ctrl.open_definition_uri(payload)
 
     def _persist_root(self) -> None:
         settings = self._main_wnd.settings

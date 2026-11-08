@@ -54,6 +54,16 @@ from pyqtp.controls.lsp_control.lsp_registry import (
 from pyqtp.controls.lsp_control.lsp_settings_page import (
     LspRegistrySettingsPage,
 )
+from pyqtp.controls.lsp_control.workspace_symbol import (
+    parse_workspace_symbols,
+    spec_supports_workspace_symbol,
+)
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+    from concurrent.futures import Future
+
+    from pyqtp.controls.lsp_control.workspace_symbol import WorkspaceSymbol
 
 if TYPE_CHECKING:
     from websockets.asyncio.server import ServerConnection
@@ -172,6 +182,9 @@ HUB_CAPABILITIES: dict[str, Any] = {
         'workspaceFolders': True,
         'configuration': True,
         'didChangeConfiguration': {'dynamicRegistration': False},
+        # поиск символов по корню проекта (остаток этапа 8): запрос исходит
+        # от хаба, динамическая регистрация не нужна
+        'workspaceSymbol': {'dynamicRegistration': False},
         # чужие WorkspaceEdit применяем сами (doc_control/workspace_edit.py):
         # серверу отвечаем, что applyEdit у клиента нет, чтобы он не присылал
         # workspace/applyEdit и включал documentChanges/ресурсные операции
@@ -194,6 +207,11 @@ SERVER_NOTIFICATIONS_SWALLOW = frozenset({
 })
 # Нотификации клиента, которые не пересылаются процессу (хендшейк делает хаб)
 CLIENT_NOTIFICATIONS_SWALLOW = frozenset({'initialized', 'exit', '$/setTrace'})
+
+# Повторная пауза для «холодного» пустого ответа workspace/symbol
+# (первичная индексация проекта сервером; измерено на basedpyright — индекс
+# готов примерно через 2 с после handshake на маленьком проекте)
+_WSYM_COLD_RETRY_DELAY = 2.0
 
 
 @dataclass
@@ -229,8 +247,20 @@ class _ServerInstance:
         self._local_futures: dict[str, asyncio.Future[dict]] = {}
         self._id_seq = itertools.count(1)
         self._dispatch_task: asyncio.Task | None = None
+        # хендшейк (initialize) завершён — событие ставим в finally start();
+        # параллельные _ensure_instance ждут его, а не плодят второй процесс
+        self._ready = asyncio.Event()
+        # первый ответ workspace/symbol по этому процессу уже был (прогрев
+        # холодного индекса сервера делается один раз на процесс)
+        self.wsym_answered = False
 
     async def start(self) -> None:
+        try:
+            await self._start_inner()
+        finally:
+            self._ready.set()
+
+    async def _start_inner(self) -> None:
         await self.proc.start()
         self._dispatch_task = asyncio.create_task(self._dispatch())
         root_name = Path(self.proc.cwd).name or 'root'
@@ -401,6 +431,11 @@ class LspHub(BaseControl):
         self._instances: dict[tuple[str, str], _ServerInstance] = {}
         self._conn_seq = itertools.count(1)
         self._registry: LspRegistry = LspRegistry.default()
+        # workspace/symbol (остаток этапа 8): поколение запроса — запоздалые
+        # ответы старых запросов не доходят до колбэка; кэш образцовых файлов
+        # root_uri -> [(spec, sample_uri)] (сбрасывается при смене реестра)
+        self._wsym_gen = 0
+        self._wsym_samples: dict[str, list[tuple[ServerSpec, str]]] = {}
 
     ###############################
     # Жизненный цикл контрола #
@@ -482,11 +517,13 @@ class LspHub(BaseControl):
         ``shutdown`` IDE.
         """
         self._registry = LspRegistry.from_json(text)
+        self._wsym_samples.clear()
         srv_log.info('LSP реестр применён: %s', ', '.join(self._registry.languages))
 
     def registry_reset(self) -> None:
         """Вернуть реестр серверов по умолчанию."""
         self._registry = LspRegistry.default()
+        self._wsym_samples.clear()
         srv_log.info('LSP реестр сброшен на значения по умолчанию')
 
     def ws_host_for(self, file_uri: str) -> str:
@@ -526,6 +563,55 @@ class LspHub(BaseControl):
                 zip(self.ws_hosts_for(file_uri), specs, strict=True)
             )
         ]
+
+    def workspace_symbols_async(
+        self,
+        project_root: Path,
+        query: str,
+        cb: Callable[[list[WorkspaceSymbol], str | None], None] | None = None,
+        timeout: float = 5.0,
+    ) -> Future[tuple[list[WorkspaceSymbol], str | None]]:
+        """``workspace/symbol`` по корню проекта (остаток этапа 8, этап 9).
+
+        Вызывается из GUI-потока; запрос исполняется в event-loop потока
+        хаба. Выбор сервера: по образцовому файлу каждого языка реестра
+        поднимается (или переиспользуется) процесс из общего пула
+        ``(command, root_uri)``, сервер берётся по очереди приоритета —
+        первый, объявивший ``workspaceSymbolProvider``.
+
+        ``cb(symbols, error)`` вызывается в потоке хаба (GUI-стороне цеплять
+        queued-сигнал), но только если запрос не устарел — более новый
+        запрос ``workspace_symbols_async`` гасит чужие запоздалые ответы.
+        Тот же результат возвращает ``concurrent.futures.Future``
+        (исключение — только сбой самого хаба).
+        """
+        self.ensure_started()
+        loop = self._loop
+        if loop is None:  # ensure_started уже кинул, но loop гаснет на shutdown
+            msg = 'LSP hub остановлен'
+            raise RuntimeError(msg)
+        self._wsym_gen += 1
+        root_uri = Path(project_root).resolve().as_uri()
+        fut = asyncio.run_coroutine_threadsafe(
+            self._gather_workspace_symbols(root_uri, query, timeout), loop,
+        )
+        if cb is None:
+            return fut
+        gen = self._wsym_gen
+
+        def _done(fut_: Future[tuple[list[WorkspaceSymbol], str | None]]) -> None:
+            if fut_.cancelled() or gen != self._wsym_gen:
+                return
+            try:
+                symbols, error = fut_.result()
+            except (Exception, asyncio.CancelledError):  # noqa: BLE001
+                srv_log.exception('workspace/symbol упал в потоке хаба')
+                return
+            with contextlib.suppress(Exception):
+                cb(symbols, error)
+
+        fut.add_done_callback(_done)
+        return fut
 
     def ensure_started(self) -> None:
         """Ленивый (идемпотентный) запуск сервера хаба."""
@@ -691,6 +777,17 @@ class LspHub(BaseControl):
         key = (' '.join(spec.command), root_uri)
         inst = self._instances.get(key)
         if inst is not None and not inst.dying:
+            if not inst._ready.is_set():
+                # параллельный хендшейк другой сопрограммы (два редактора или
+                # GUI-запрос workspace/symbol): ждём его, а не поднимаем второй
+                # процесс на тот же ключ
+                await inst._ready.wait()
+                if not inst.init_result:
+                    msg = (
+                        f'LSP-сервер {spec.name} не поднялся '
+                        '(параллельный старт завершился ошибкой)'
+                    )
+                    raise RuntimeError(msg)
             return inst
         command = resolve_command(spec.command)
         if command is None:
@@ -705,6 +802,111 @@ class LspHub(BaseControl):
             await inst.proc.stop()
             raise
         return inst
+
+    ###############################
+    # Внутренности: поиск символов #
+
+    async def _gather_workspace_symbols(
+        self, root_uri: str, query: str, reply_timeout: float
+    ) -> tuple[list[WorkspaceSymbol], str | None]:
+        """Рабочая лошадка запроса; живёт в потоке event-loop хаба."""
+        try:
+            return await self._workspace_symbols(root_uri, query, reply_timeout)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            srv_log.exception('workspace/symbol (%r) упал', query)
+            return [], 'внутренняя ошибка хаба (подробности в журнале LSP)'
+
+    async def _workspace_symbols(
+        self, root_uri: str, query: str, reply_timeout: float
+    ) -> tuple[list[WorkspaceSymbol], str | None]:
+        """Обход стеков всех языков реестра с образцовыми файлами проекта.
+
+        Первый сервер, объявивший ``workspaceSymbolProvider``, отвечает;
+        остальные (и чужие ошибки) — следующий по приоритету. ``error`` —
+        последняя неудача, если символов так и не дождались.
+        """
+        samples = self._wsym_samples.get(root_uri)
+        if samples is None:
+            samples = self._collect_samples(root_uri)
+            self._wsym_samples[root_uri] = samples
+        last_error: str | None = None
+        for spec, _sample_uri in samples:
+            try:
+                inst = await self._ensure_instance(spec, root_uri)
+            except (OSError, RuntimeError) as exc:
+                last_error = str(exc)
+                continue
+            if inst.dying:
+                last_error = f'{spec.name}: процесс завершается'
+                continue
+            if not spec_supports_workspace_symbol(inst.init_result):
+                continue
+            try:
+                response = await asyncio.wait_for(
+                    inst.request_local(
+                        'workspace/symbol', {'query': query}
+                    ),
+                    reply_timeout,
+                )
+            except (TimeoutError, ConnectionError, OSError):
+                last_error = (
+                    f'{spec.name}: ответ не получен (сервер не готов или '
+                    'процесс завершился)'
+                )
+                continue
+            if 'error' in response:
+                message = (response.get('error') or {}).get('message')
+                last_error = f'{spec.name}: {message or "ошибка запроса"}'
+                continue
+            symbols = parse_workspace_symbols(response.get('result'))
+            if not symbols and not inst.wsym_answered:
+                # холодный старт: pyright/clangd во время построения
+                # первичного индекса отвечают пустым списком, а не ждут —
+                # даём запросу второй шанс (один раз на процесс)
+                await asyncio.sleep(_WSYM_COLD_RETRY_DELAY)
+                try:
+                    response = await asyncio.wait_for(
+                        inst.request_local(
+                            'workspace/symbol', {'query': query}
+                        ),
+                        reply_timeout,
+                    )
+                except (TimeoutError, ConnectionError, OSError):
+                    response = {}
+                if 'result' in response:
+                    symbols = parse_workspace_symbols(response['result'])
+            inst.wsym_answered = True
+            srv_log.info(
+                '%s: workspace/symbol %r -> %d символов',
+                spec.name, query, len(symbols),
+            )
+            return symbols, None
+        if last_error is None:
+            last_error = (
+                'ни один сервер реестра не поддерживает workspace/symbol'
+            )
+        return [], last_error
+
+    def _collect_samples(self, root_uri: str) -> list[tuple[ServerSpec, str]]:
+        """(Сервер, uri образцового файла) для всех языков реестра по корню.
+
+        Порядок — за обходом реестра (для python это в первую очередь
+        basedpyright — он и отвечает за ``workspace/symbol``).
+        """
+        root = Path(unquote(urlparse(root_uri).path))
+        samples: list[tuple[ServerSpec, str]] = []
+        for language in self._registry.languages:
+            sample = self._registry.sample_file_for(root, language)
+            if sample is None:
+                continue
+            sample_uri = sample.as_uri()
+            samples.extend(
+                (spec, sample_uri)
+                for spec in self._registry.servers_for_uri(sample_uri)
+            )
+        return samples
 
     async def _route_from_client(
         self, inst: _ServerInstance, conn: _ClientConnection, msg: dict

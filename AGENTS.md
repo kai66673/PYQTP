@@ -52,11 +52,12 @@ Verify in this order: **ruff → pyright → tests → run the app**.
    + editor-options/theme + workspace-edit-apply (test_workspace_edit_apply.py) unit tests
    + stage-9.1 project tree panel (test_project_tree.py, offscreen GUI без LSP/WebEngine, без маркеров)
    + stage-9.2 quick open (test_quick_open.py: scorer/scan unit без GUI + live offscreen диалог)
-   + stage-9.3 project search (test_project_search.py: argv/парсер юниты без GUI и без бинаря rg + live offscreen с живым rg, skipif без rg)). Markers `live`
+   + stage-9.3 project search (test_project_search.py: argv/парсер юниты без GUI и без бинаря rg + live offscreen с живым rg, skipif без rg)
+   + stage-9.4 workspace/symbol (test_workspace_symbol.py: юниты разбора ответа/гейтов/`sample_file_for` без GUI + live hub с basedpyright + live offscreen диалог)). Markers `live`
   (real LSP server processes) and
-  `webengine` (real QWebEngineView/Monaco) are deselected by default via `addopts` → 82 passed / 27
+  `webengine` (real QWebEngineView/Monaco) are deselected by default via `addopts` → 93 passed / 31
   deselected; run them with `uv run pytest -m 'live or webengine'` (~2 min, they work offscreen) or
-  all 109 in one
+  all 124 in one
   process with `uv run pytest -m ''` (~2 min, full run keeps passing despite `os._exit` in
   `pytest_sessionfinish` eating the summary line — count the dots). Test-suite gotchas:
   - root `conftest.py` sets `QT_QPA_PLATFORM=offscreen` + `QTWEBENGINE_DISABLE_SANDBOX=1` at import
@@ -215,9 +216,10 @@ Verify in this order: **ruff → pyright → tests → run the app**.
   key = qualname, регистрируется в `IdeMainWindow.init_controls` после
   `DocumentManager`) хранит корень проекта (QSettings ключ
   `ProjectControl/root_path`, при закрытии снимается), даёт console-API
-  `project_root/project_open/project_close` и пункты меню «Файл»:
-  «Открыть папку...» (Ctrl+Shift+O, priority=4) / «Поиск по проекту...»
-  (Ctrl+Shift+F, priority=8) / «Закрыть папку» (priority=9, была 8).
+  `project_root/project_open/project_close` и пункты меню «Файл» (priority):
+  «Открыть папку...» (Ctrl+Shift+O, 4) / «Быстрый переход по файлам...»
+  (Ctrl+P, 7) / «Переход к символу проекта...» (Ctrl+T, 8) / «Поиск по
+  проекту...» (Ctrl+Shift+F, 9) / «Закрыть папку» (10).
   Панель — `ProjectTreeView` (`pyqtp/views/project_tree_view.py`, key
   `ProjectControl_tree_view`, `widget_area='left'`): ленивый
   `QFileSystemModel` + `_TreePruneProxy` (точечные записи + `__pycache__`/
@@ -256,6 +258,18 @@ Verify in this order: **ruff → pyright → tests → run the app**.
    `doc_ctrl.open_definition_uri` (тот же путь, что LSP-переходы этапа 6);
    экшен `action_project_search` активируется вместе с quick-open в
    `_start_scan`, гаснет в `_on_root_for_scan(None)`.
+   Символы проекта (этап 9.4, остаток этапа 8): чистый
+   `controls/lsp_control/workspace_symbol.py` — разбор ответа `workspace/symbol`
+   в обеих формах спеки (`SymbolInformation` и `WorkspaceSymbol` 3.17 +
+   устаревшие верхнеуровневые `range`/`selectionRange`, fallback без range —
+   (1,1)), координаты Monaco 1-based (тот же payload, что `open_definition_uri`),
+   русские тексты kind'ов — + диалог `WorkspaceSymbolDialog` (в
+   `project_control/`, в стиле quick open, дебаунс 400 мс, queued-мост
+   `_SymbolSignals` из потока event-loop хаба, свой гейт поколения `_req_gen`
+   + `drop_pending()` в смене/закрытии проекта и teardown); экшен
+   `action_workspace_symbols` (Ctrl+T) активируется/гаснет вместе с
+   quick-open/поиском, console-API `workspace_symbols_show`, выбор →
+   `doc_ctrl.open_definition_uri` (тот же путь, что LSP-переходы).
 
 ## Runtime gotchas
 
@@ -281,7 +295,23 @@ Verify in this order: **ruff → pyright → tests → run the app**.
   `publishDiagnostics` to the pool's connections, answers server-initiated requests
   (`workspace/configuration` etc.) itself, and on IDE shutdown terminates servers
   (`shutdown`+`exit`, then kill). Unknown/absent server name → stub handler with empty
-  capabilities (no providers registered on the JS side).
+  capabilities (no providers registered on the JS side). Stage 9.4 add-on:
+  `workspace_symbols_async(project_root, query, cb, timeout)` is the GUI-thread
+  entry (coroutine goes to its own loop; `_wsym_gen` generation gate suppresses
+  cb of stale requests — their futures still resolve). Servers are picked
+  without an open editor via `LspRegistry.sample_file_for(root, language)`
+  (sorted os.walk for a sample file of each registry language, same prune as the
+  tree/quick open) → `servers_for_uri` → first server declaring
+  `workspaceSymbolProvider` answers; processes reuse the `(command, root_uri)`
+  pool, `_wsym_samples` cache is cleared by `registry_apply_json`/`registry_reset`.
+  Concurrency + cold start: `_ServerInstance._ready` (`asyncio.Event`, set in
+  `start()` finally) — concurrent `_ensure_instance` calls await the handshake
+  instead of spawning a second process on the same key; basedpyright/clangd
+  answer `workspace/symbol` with `[]` (not an error) while building their initial
+  index after the handshake (~2 s on a small project) — hence one cold-retry per
+  process (`wsym_answered` flag + `_WSYM_COLD_RETRY_DELAY`);
+  `HUB_CAPABILITIES['workspace']['workspaceSymbol']` must be advertised or the
+  server never enables the feature.
 - The server registry (`lsp_registry.py`, `LspRegistry`) is **configurable, not hardcoded**:
   JSON `languageId → {extensions, root_markers, servers: [{name, command, enabled}]}`
   (list order = priority), stored as a JSON string in QSettings key

@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
@@ -64,6 +65,10 @@ DEFAULT_ROOT_MARKERS = (
     'basedpyrightconfig.json',
     '.git',
 )
+
+# Каталоги, которые пропускает обход за «образцовым» файлом языка
+# (workspace/symbol); каталоги и файлы с точкой отсекаются всегда отдельно.
+_SAMPLE_PRUNE_DIRS = frozenset({'__pycache__', 'node_modules'})
 
 
 @dataclass(frozen=True)
@@ -298,6 +303,30 @@ class LspRegistry:
         if cfg is None:
             return ()
         return tuple(spec for spec in cfg.servers if spec.enabled)
+
+    def sample_file_for(self, root: Path, language: str) -> Path | None:
+        """Первый «образцовый» файл языка при обходе ``root`` (или None).
+
+        Нужен, чтобы выбрать серверы языка для запроса ``workspace/symbol``
+        по корню проекта (без открытого редактора). Обход отсортированный и
+        с тем же prune, что у дерева проекта/quick open: детерминированный
+        результат и короткий путь до нужного расширения.
+        """
+        cfg = self.languages.get(language)
+        if cfg is None or not cfg.extensions:
+            return None
+        wanted = {ext.lower() for ext in cfg.extensions}
+        for dir_path, dir_names, file_names in os.walk(root):
+            dir_names[:] = sorted(
+                d for d in dir_names
+                if not d.startswith('.') and d not in _SAMPLE_PRUNE_DIRS
+            )
+            for name in sorted(file_names):
+                if name.startswith('.'):
+                    continue
+                if Path(name).suffix.lower() in wanted:
+                    return Path(dir_path) / name
+        return None
 
     def root_uri_for(self, file_uri: str) -> str:
         """Корень рабочей папки для файла: ближайший предок с маркером проекта
