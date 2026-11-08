@@ -17,14 +17,26 @@ Env-переменные ставятся на импорте этого фай�
 C++-указателям — heap corruption/сегфолт ПОСЛЕ того, как все тесты прошли
 (результаты и коды выхода к этому моменту полностью сформированы и
 выписаны). Тот же граф в standalone-харнесе живёт без проблем.
+
+Циклический GC отключён на всю сессию (на импорте этого файла): тот же граф
+утёкших обёрток (PluggableMainWindow/KDD, пойманных в циклы ссылок) иначе
+финализируется коллектором СЕРЕДИ сессии — gen2-сборка в момент, когда C++
+граф уже частично уничтожен, даёт SIGTRAP в QWebEngineCore (подтверждено
+core dump: gc_collect_main -> DockWidgetWrapper::~ -> QWebEnginePage::~).
+Не-циклические объекты это не задевает (refcounting работает), а финал
+сессии всё равно ``os._exit``. Отладочный рубильник: ``PYQTP_GC=1``.
 """
 
+import gc
 import os
 import sys
 from typing import cast
 
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 os.environ.setdefault('QTWEBENGINE_DISABLE_SANDBOX', '1')
+
+if not os.environ.get('PYQTP_GC'):
+    gc.disable()  # см. докстринг модуля (защита от GC-финализации Qt-графа)
 
 import pytest
 from PySide6.QtCore import Qt

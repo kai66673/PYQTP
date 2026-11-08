@@ -6,6 +6,9 @@ import {
   createSignatureHelpProvider,
   createHoverProvider,
   createDefinitionProvider,
+  createReferencesProvider,
+  createDocumentSymbolProvider,
+  createDocumentHighlightProvider,
   createSemanticTokensProvider,
 } from "./providers";
 
@@ -499,6 +502,58 @@ class LspClient {
     ) {
       this.providerDisposables.push(
         createDefinitionProvider(
+          this.languageId,
+          () => this.currentConnection,
+          this.isConnectionValid.bind(this),
+          this.prependModelData.bind(this),
+          () => this.prependedData,
+          this.forceReconnect.bind(this),
+          this.flushDocumentChanges.bind(this)
+        )
+      );
+    }
+    // vendored-patch (этап 8.1): references / documentSymbol / documentHighlight —
+    // каждый ровно один провайдер на язык (Monaco не объединяет references и
+    // выбирает единственный outline-провайдер; дубли подсветки незачем), гейт по
+    // InitializeResult сервера, тот же механизм заявок, что signatureHelp/definition.
+    if (
+      caps.referencesProvider &&
+      (this.manager === null || this.manager.claimProvider("references", this.languageId, this))
+    ) {
+      this.providerDisposables.push(
+        createReferencesProvider(
+          this.languageId,
+          () => this.currentConnection,
+          this.isConnectionValid.bind(this),
+          this.prependModelData.bind(this),
+          () => this.prependedData,
+          this.forceReconnect.bind(this),
+          this.flushDocumentChanges.bind(this)
+        )
+      );
+    }
+    if (
+      caps.documentSymbolProvider &&
+      (this.manager === null || this.manager.claimProvider("documentSymbol", this.languageId, this))
+    ) {
+      this.providerDisposables.push(
+        createDocumentSymbolProvider(
+          this.languageId,
+          () => this.currentConnection,
+          this.isConnectionValid.bind(this),
+          this.prependModelData.bind(this),
+          () => this.prependedData,
+          this.forceReconnect.bind(this),
+          this.flushDocumentChanges.bind(this)
+        )
+      );
+    }
+    if (
+      caps.documentHighlightProvider &&
+      (this.manager === null || this.manager.claimProvider("documentHighlight", this.languageId, this))
+    ) {
+      this.providerDisposables.push(
+        createDocumentHighlightProvider(
           this.languageId,
           () => this.currentConnection,
           this.isConnectionValid.bind(this),

@@ -108,6 +108,42 @@ Python, find/replace, folding, smart select, история переходов, 
   работают статически).
 **Приёмка:** live-тест на каждую фичу (паттерн `test_lsp_editor_stack`).
 
+#### Этап 8.1 — references, documentSymbol, documentHighlight ✅ (готово)
+- `textDocument/references` → `createReferencesProvider` (vendored-patch в
+  `providers.ts`): встроенная команда `editor.action.goToReferences` (связка
+  `Shift+F12` уже зарегистрирована самим contrib'ом — своих правил не добавляли);
+  при >1 результате Monaco открывает peek `referenceSearch`, переходы из peek по
+  чужим файлам идут через opener этапа 6 (`_open_uri_request` →
+  `open_uri_requested`); разбор `Location[]`/`LocationLink[]` вынесен в общий
+  `mapLspLocations` (его же использует definition-провайдер этапа 4);
+- `textDocument/documentSymbol` → `createDocumentSymbolProvider`: хаб заявляет
+  `hierarchicalDocumentSymbolSupport`, иерархия рекурсивно маппится в
+  `monaco.languages.DocumentSymbol` (таблица числовых kind LSP отличается от
+  Monaco-enum ровно сдвигом `-1`), плоский `SymbolInformation[]` тоже
+  поддерживается; breadcrumb-виджета в standalone-бандле этого Monaco нет
+  (в esm-дереве только `diffEditorBreadcrumbs`), поэтому навигация по символам
+  документа отдана встроенному **sticky scroll** (`stickyScroll: {enabled: true}`,
+  `defaultModel: outlineModel` строит модель из того же провайдера);
+- `textDocument/documentHighlight` → `createDocumentHighlightProvider`:
+  семантическая подсветка вхождений в текущем документе (LSP kind Text/Read/Write
+  → Monaco 0/1/2: `wordHighlightText`/`wordHighlight`/`wordHighlightStrong`);
+  при наличии провайдера wordHighlighter использует его, поэтому текстовые
+  совпадения одноимённых локальных имён не подсвечиваются;
+- регистрация в `lsp.ts` (`ensureProvidersRegistered`): гейт по InitializeResult
+  сервера (`referencesProvider`/`documentSymbolProvider`/
+  `documentHighlightProvider`) + `claimProvider` — ровно один провайдер на язык
+  (Monaco не объединяет references/outline/highlight, в отличие от
+  completion/hover); Python-хаб не менялся — его `HUB_CAPABILITIES` уже
+  содержали нужные записи.
+**Приёмка:** live-тесты `test_stage81_references_peek_and_cross_document`
+(модель refs + peek-DOM + `open_uri_requested` из peek по чужому файлу),
+`test_stage81_document_symbols_and_sticky_scroll` (outline-иерархия через
+`_executeDocumentSymbolProvider` + DOM sticky scroll),
+`test_stage81_document_highlight_semantic` (набор строк write/read модульной
+переменной без текстовых ложных срабатываний). Остаток этапа 8
+(formatting/rename+applyEdit/codeAction — 8.2) отдельным заходом;
+`workspace/symbol` — за этой же чертой (связан с этапом 9).
+
 ### Этап 9 — проект и сессии
 - панель дерева проекта (QTreeView, lazy, reveal активного файла, контекстное меню);
 - «Открыть папку» + сессия проекта (вкладки/активная/раскладка; хранение —

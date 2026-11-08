@@ -58,6 +58,33 @@ function lspRangeToMonaco(r: any, prependedData: string | null): monaco.IRange {
   };
 }
 
+/**
+ * vendored-patch (этап 8.1): общий разбор ответов вида Location[] / LocationLink[]
+ * (definition — этап 4, references — этап 8.1). Для текущей модели диапазон
+ * корректируется на prependedData, для чужих файлов берётся как есть — переход
+ * по ним обслуживает opener из этапа 6 (registerEditorOpener → Python-мост).
+ */
+function mapLspLocations(items: any[], modelUri: string, prependedData: string | null): monaco.languages.Location[] {
+  const locations: monaco.languages.Location[] = [];
+  for (const item of items) {
+    if (!item) continue;
+    const targetUri: string | undefined = item.targetUri ?? item.uri;
+    const targetRange: any = item.targetSelectionRange ?? item.targetRange ?? item.range;
+    if (!targetUri || !targetRange?.start || !targetRange?.end) continue;
+    const sameDocument = targetUri === modelUri;
+    const range = sameDocument
+      ? lspRangeToMonaco(targetRange, prependedData)
+      : {
+          startLineNumber: targetRange.start.line + 1,
+          startColumn: targetRange.start.character + 1,
+          endLineNumber: targetRange.end.line + 1,
+          endColumn: targetRange.end.character + 1,
+        };
+    locations.push({ uri: monaco.Uri.parse(targetUri), range });
+  }
+  return locations;
+}
+
 const LSP_KIND_TO_MONACO: Record<number, monaco.languages.CompletionItemKind> = {
   1: monaco.languages.CompletionItemKind.Text,
   2: monaco.languages.CompletionItemKind.Method,
@@ -514,28 +541,246 @@ export function createDefinitionProvider(
         if (!result) return null;
 
         const items: any[] = Array.isArray(result) ? result : [result];
-        const locations: monaco.languages.Location[] = [];
-        for (const item of items) {
-          if (!item) continue;
-          const targetUri: string | undefined = item.targetUri ?? item.uri;
-          const targetRange: any = item.targetSelectionRange ?? item.targetRange ?? item.range;
-          if (!targetUri || !targetRange?.start || !targetRange?.end) continue;
-          const sameDocument = targetUri === modelUri;
-          const range = sameDocument
-            ? lspRangeToMonaco(targetRange, prependedData)
-            : {
-                startLineNumber: targetRange.start.line + 1,
-                startColumn: targetRange.start.character + 1,
-                endLineNumber: targetRange.end.line + 1,
-                endColumn: targetRange.end.character + 1,
-              };
-          locations.push({ uri: monaco.Uri.parse(targetUri), range });
-        }
+        const locations = mapLspLocations(items, modelUri, prependedData);
         return locations.length ? locations : null;
       } catch (e) {
         console.error("LSP definition failed:", e);
         if (e instanceof Error && (e.message.includes("disposed") || e.message.includes("closed"))) {
           console.warn("Connection was disposed during definition request, forcing reconnection");
+          forceReconnect();
+        }
+        return null;
+      }
+    },
+  });
+}
+
+/**
+ * vendored-patch (этап 8.1): textDocument/references. Встроенная команда
+ * editor.action.goToReferences (связка Shift+F12 зарегистрирована самим
+ * contrib'ом) при >1 результате открывает peek-виджет referenceSearch, при
+ * одном — переходит сразу; переходы по чужим файлам идут через opener этапа 6
+ * (_open_uri_request → Python). Range для текущей модели корректируется на
+ * prependedData, для чужих — как есть (см. mapLspLocations).
+ * Регистрируется ровно один провайдер на язык: Monaco не объединяет
+ * references (в отличие от completion/hover) — иначе были бы дубли в списке.
+ */
+export function createReferencesProvider(
+  languageId: string,
+  getCurrentConnection: () => MessageConnection | null,
+  isConnectionValid: (connection: MessageConnection | null) => boolean,
+  prependModelData: (model: monaco.editor.ITextModel) => string,
+  getPrependedData: () => string | null,
+  forceReconnect: () => void,
+  flushDocumentChanges: () => void
+): monaco.IDisposable {
+  return monaco.languages.registerReferenceProvider(languageId, {
+    provideReferences: async (
+      model: monaco.editor.ITextModel,
+      position: monaco.Position,
+      context: { includeDeclaration: boolean }
+    ) => {
+      const connection = getCurrentConnection();
+      if (!isConnectionValid(connection)) {
+        console.warn("No valid LSP connection available for references");
+        return null;
+      }
+
+      const validConnection = connection!;
+
+      // позиции считаются по свежему документу (та же гонка с дебаунсом
+      // didChange, что у completion — см. фикс авокомплита)
+      flushDocumentChanges();
+
+      const prependedData = getPrependedData();
+      const line = adjustLineForPrependedData(position, prependedData);
+      const character = position.column - 1;
+      const uri = prepareDocument(validConnection, model, prependModelData);
+      const modelUri = model.uri.toString();
+
+      try {
+        const result: any = await validConnection.sendRequest("textDocument/references", {
+          textDocument: { uri },
+          position: { line, character },
+          context: { includeDeclaration: !!context.includeDeclaration },
+        });
+        if (!Array.isArray(result) || !result.length) return null;
+
+        const locations = mapLspLocations(result, modelUri, prependedData);
+        return locations.length ? locations : null;
+      } catch (e) {
+        console.error("LSP references failed:", e);
+        if (e instanceof Error && (e.message.includes("disposed") || e.message.includes("closed"))) {
+          console.warn("Connection was disposed during references request, forcing reconnection");
+          forceReconnect();
+        }
+        return null;
+      }
+    },
+  });
+}
+
+/**
+ * vendored-patch (этап 8.1): маппинг числового SymbolKind из LSP (начинается с
+ * 1) в Monaco-enum (с 0) — таблицы отличаются ровно сдвигом -1
+ * (LSP File=1 … TypeParameter=26 → Monaco File=0 … TypeParameter=25).
+ * Tags совпадают и как есть (Deprecated=1 в обеих).
+ */
+function mapLspSymbolKind(kind: number | undefined): monaco.languages.SymbolKind {
+  const mapped = (kind ?? 13) - 1; // LSP Variable=13 как fallback
+  if (mapped >= monaco.languages.SymbolKind.File && mapped <= monaco.languages.SymbolKind.TypeParameter) {
+    return mapped as monaco.languages.SymbolKind;
+  }
+  return monaco.languages.SymbolKind.Variable;
+}
+
+/** Рекурсивный пересчёт иерархии DocumentSymbol в Monaco-формат (range/selectionRange —
+ * через lspRangeToMonaco с коррекцией на prependedData). */
+function mapDocumentSymbol(sym: any, prependedData: string | null): monaco.languages.DocumentSymbol {
+  const range = sym.range ? lspRangeToMonaco(sym.range, prependedData) : lspRangeToMonaco(sym.selectionRange, prependedData);
+  const mapped: monaco.languages.DocumentSymbol = {
+    name: String(sym.name ?? ""),
+    detail: String(sym.detail ?? ""),
+    kind: mapLspSymbolKind(sym.kind),
+    tags: Array.isArray(sym.tags) ? sym.tags : [],
+    range,
+    selectionRange: lspRangeToMonaco(sym.selectionRange ?? sym.range, prependedData),
+  };
+  if (sym.containerName) mapped.containerName = String(sym.containerName);
+  if (Array.isArray(sym.children) && sym.children.length) {
+    mapped.children = sym.children.map((child: any) => mapDocumentSymbol(child, prependedData));
+  }
+  return mapped;
+}
+
+/**
+ * vendored-patch (этап 8.1): textDocument/documentSymbol. Хаб заявляет
+ * hierarchicalDocumentSymbolSupport — basedpyright/clangd отдают иерархию;
+ * плоский SymbolInformation[] тоже принимается (fallback). Провайдер
+ * зажигает встроенный sticky scroll (contrib/stickyScroll читает outline-
+ * модель) и команду _executeDocumentSymbolProvider; breadcrumb-виджета в
+ * standalone-сборке этого Monaco нет (в esm-дереве только diffEditorBreadcrumbs).
+ * Регистрируется ровно один на язык (outline-модель выбирает один провайдер).
+ */
+export function createDocumentSymbolProvider(
+  languageId: string,
+  getCurrentConnection: () => MessageConnection | null,
+  isConnectionValid: (connection: MessageConnection | null) => boolean,
+  prependModelData: (model: monaco.editor.ITextModel) => string,
+  getPrependedData: () => string | null,
+  forceReconnect: () => void,
+  flushDocumentChanges: () => void
+): monaco.IDisposable {
+  return monaco.languages.registerDocumentSymbolProvider(languageId, {
+    provideDocumentSymbols: async (model: monaco.editor.ITextModel) => {
+      const connection = getCurrentConnection();
+      if (!isConnectionValid(connection)) {
+        console.warn("No valid LSP connection available for documentSymbol");
+        return null;
+      }
+
+      const validConnection = connection!;
+
+      // символы снимались бы с устаревшего текста сразу после правки
+      flushDocumentChanges();
+
+      const prependedData = getPrependedData();
+      const uri = prepareDocument(validConnection, model, prependModelData);
+
+      try {
+        const result: any = await validConnection.sendRequest("textDocument/documentSymbol", {
+          textDocument: { uri },
+        });
+        if (!Array.isArray(result) || !result.length) return null;
+
+        if (result[0]?.selectionRange) {
+          // иерархический DocumentSymbol[] (хаб заявляет hierarchicalDocumentSymbolSupport)
+          return result.map((sym: any) => mapDocumentSymbol(sym, prependedData));
+        }
+        // плоский SymbolInformation[]: range из location, иерархии нет
+        return result
+          .filter((sym: any) => sym.location?.range)
+          .map((sym: any) => ({
+            name: String(sym.name ?? ""),
+            detail: "",
+            kind: mapLspSymbolKind(sym.kind),
+            tags: Array.isArray(sym.tags) ? sym.tags : [],
+            containerName: sym.containerName ? String(sym.containerName) : undefined,
+            range: lspRangeToMonaco(sym.location.range, prependedData),
+            selectionRange: lspRangeToMonaco(sym.location.range, prependedData),
+          }));
+      } catch (e) {
+        console.error("LSP documentSymbol failed:", e);
+        if (e instanceof Error && (e.message.includes("disposed") || e.message.includes("closed"))) {
+          console.warn("Connection was disposed during documentSymbol request, forcing reconnection");
+          forceReconnect();
+        }
+        return null;
+      }
+    },
+  });
+}
+
+/** LSP DocumentHighlightKind (Text=1, Read=2, Write=3) → Monaco (Text=0, Read=1, Write=2). */
+function mapLspHighlightKind(kind: number | undefined): monaco.languages.DocumentHighlightKind {
+  const mapped = (kind ?? 1) - 1;
+  if (mapped === monaco.languages.DocumentHighlightKind.Read || mapped === monaco.languages.DocumentHighlightKind.Write) {
+    return mapped as monaco.languages.DocumentHighlightKind;
+  }
+  return monaco.languages.DocumentHighlightKind.Text;
+}
+
+/**
+ * vendored-patch (этап 8.1): textDocument/documentHighlight — подсветка
+ * вхождений символа в текущем документе (классы decorations wordHighlight/
+ * wordHighlightStrong/wordHighlightText; встроенный wordHighlighter работает
+ * и без провайдера, но с серверным провайдером Monaco отдаёт приоритет ему —
+ * семантически точнее, чем текстовые совпадения). Опция editor.occurrencesHighlight
+ * по умолчанию 'singleFile', задержка 0 — отдельного включения не требуется.
+ * Регистрируется ровно один на язык (дубли подсветки от двух серверов незачем).
+ */
+export function createDocumentHighlightProvider(
+  languageId: string,
+  getCurrentConnection: () => MessageConnection | null,
+  isConnectionValid: (connection: MessageConnection | null) => boolean,
+  prependModelData: (model: monaco.editor.ITextModel) => string,
+  getPrependedData: () => string | null,
+  forceReconnect: () => void,
+  flushDocumentChanges: () => void
+): monaco.IDisposable {
+  return monaco.languages.registerDocumentHighlightProvider(languageId, {
+    provideDocumentHighlights: async (model: monaco.editor.ITextModel, position: monaco.Position) => {
+      const connection = getCurrentConnection();
+      if (!isConnectionValid(connection)) {
+        return null;
+      }
+
+      const validConnection = connection!;
+
+      flushDocumentChanges();
+
+      const prependedData = getPrependedData();
+      const line = adjustLineForPrependedData(position, prependedData);
+      const character = position.column - 1;
+      const uri = prepareDocument(validConnection, model, prependModelData);
+
+      try {
+        const result: any = await validConnection.sendRequest("textDocument/documentHighlight", {
+          textDocument: { uri },
+          position: { line, character },
+        });
+        if (!Array.isArray(result) || !result.length) return null;
+
+        return result
+          .filter((h: any) => h?.range?.start && h?.range?.end)
+          .map((h: any) => ({
+            range: lspRangeToMonaco(h.range, prependedData),
+            kind: mapLspHighlightKind(h.kind),
+          }));
+      } catch (e) {
+        console.error("LSP documentHighlight failed:", e);
+        if (e instanceof Error && (e.message.includes("disposed") || e.message.includes("closed"))) {
+          console.warn("Connection was disposed during documentHighlight request, forcing reconnection");
           forceReconnect();
         }
         return null;

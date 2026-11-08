@@ -558,3 +558,378 @@ def test_cross_document_definition_open_request(editor_pair, qtbot) -> None:
     # 'def finx():' — определение на строке 1, символ 'f' с колонки 5
     assert rng.get('startLineNumber') == 1, payload
     assert rng.get('startColumn') == 5, payload
+
+
+# --- этап 8.1: references / documentSymbol / documentHighlight (IDE_ROADMAP) ---
+
+# Раскладка строф зафиксирована числами в тестах: 4 calc / 8 shadow / 12
+# second — определения; 9-10 локальный x в shadow(); 18 x = calc(1, 2);
+# 19 y = calc(3, 4); 20 finx(); 21 print — use-site модульного x
+STAGE81_SRC = (
+    'from helper import finx\n'
+    '\n\n'
+    'def calc(a, b):\n'
+    '    total = a + b\n'
+    '    return total\n'
+    '\n'
+    'def shadow():\n'
+    '    x = 0\n'
+    '    return x\n'
+    '\n'
+    'def second():\n'
+    '    t2 = 0\n'
+    '    for i in range(5):\n'
+    '        t2 += i\n'
+    '    return t2\n'
+    '\n'
+    'x = calc(1, 2)\n'
+    'y = calc(3, 4)\n'
+    'finx()\n'
+    'print(x, y, second(), shadow())\n'
+) + '\n# pad\n' * 30
+
+
+def _trigger(widget, command: str, line: int, col: int) -> None:
+    """Каретка на (line, col) + команда через editor.trigger (offscreen-клавиши
+    в Monaco не доходят — см. note в доке модуля; паттерн этапа 7)."""
+    run_js(
+        widget,
+        '(() => { const ed = window.qtmonaco.editor; ed.focus();'
+        f'  ed.setPosition({{ lineNumber: {line}, column: {col} }});'
+        f"  ed.trigger('test', '{command}', {{}}); return 'T'; }})()",
+    )
+
+
+def _refs_controller_dump(widget) -> str:
+    """Модель referencesController: refs (файл:строка:колонка) + состояние peek."""
+    return run_js(widget, """
+(() => {
+  try {
+    const c = window.qtmonaco.editor.getContribution(
+      'editor.contrib.referencesController');
+    if (!c || !c._model) return '';
+    const m = c._model;
+    return JSON.stringify({
+      refs: m.references.map(r => ({
+        file: (r.uri.path || '').split('/').pop(),
+        line: r.range.startLineNumber, col: r.range.startColumn,
+      })),
+      widget: !!c._widget,
+      dom: !!document.querySelector('.reference-zone-widget'),
+      rows: document.querySelectorAll(
+        '.reference-zone-widget .monaco-list-row').length,
+    });
+  } catch (e) { return 'ERR: ' + (e && e.message || e); }
+})()
+""")
+
+
+def test_stage81_references_peek_and_cross_document(editor_pair, qtbot) -> None:
+    """textDocument/references: peek-виджет + переход из peek в чужой файл.
+
+    Цепочка: basedpyright -> провайдер этапа 8.1 -> встроенная команда
+    editor.action.goToReferences (связка shift+F12 от contrib'а) -> при 3
+    результатах Monaco открывает peek referenceSearch; openReference по
+    чужому файлу идёт через opener этапа 6 -> ``open_uri_requested``.
+    """
+    hub, widget = editor_pair(
+        STAGE81_SRC,
+        registry_json=BP_ONLY_REGISTRY,
+        extra_files={'helper.py': HELPER_SRC},
+    )
+    wait_editor_ready(qtbot, widget)
+
+    # связка Shift+F12 зарегистрирована (contrib регистрирует её сам, без наших
+    # addKeybindingRules — проверяем, что она не потерямась)
+    kb = json_from_js(run_js(widget, """
+(() => {
+  const svc = window.qtmonaco.editor._standaloneKeybindingService;
+  if (!svc) return '';
+  const out = [];
+  for (const item of svc.getKeybindings()) {
+    if ((item.command || '').includes('goToReferences')) {
+      out.push({command: item.command, chords: (item.chords || []).join('+')});
+    }
+  }
+  return JSON.stringify(out);
+})()
+""")) or []
+    got = {item['command']: item['chords'] for item in kb}
+    assert got.get('editor.action.goToReferences', '').lower() == 'shift+f12', got
+
+    hits: list[dict] = []
+    widget.open_uri_requested.connect(hits.append)
+
+    # фаза 1: references на 'calc' в x = calc(1, 2) (18,5) -> declaration + 2 use
+    _trigger(widget, 'editor.action.goToReferences', 18, 5)
+
+    def _refs_dump() -> dict | None:
+        raw = _refs_controller_dump(widget)
+        if not isinstance(raw, str) or not raw.startswith('{'):
+            return None
+        return json.loads(raw)
+
+    holder: dict = {}
+
+    def _refs_ready() -> bool:
+        d = _refs_dump()
+        if not d or not d.get('refs'):
+            return False
+        holder.clear()
+        holder.update(d)
+        return True
+
+    wait_for(
+        qtbot,
+        _refs_ready,
+        timeout=60.0,
+        poll=1.0,
+        message='referencesController так и не построил модель',
+    )
+    data = holder
+    main_name = widget.file_path.name  # фикстура пишет основной файл test_file.py
+    assert all(
+        (r['file'], r['line'], r['col']) in {
+            (main_name, 4, 5),    # declaration def calc
+            (main_name, 18, 5),   # x = calc(1, 2)
+            (main_name, 19, 5),   # y = calc(3, 4)
+        } for r in data['refs']
+    ), data['refs']
+    assert len(data['refs']) == 3, data['refs']
+    # peek открыт (3 результата -> referenceSearch-виджет в DOM) — ждём
+    # досовмещения peek после построения модели
+    peek: dict = {}
+
+    def _peek_ready() -> bool:
+        d = _refs_dump()
+        if not d or not d.get('dom') or not d.get('rows'):
+            return False
+        peek.clear()
+        peek.update(d)
+        return True
+
+    wait_for(
+        qtbot,
+        _peek_ready,
+        timeout=30.0,
+        poll=1.0,
+        message='peek referenceSearch так и не появился в DOM',
+    )
+    assert peek['widget'], peek
+    assert peek['rows'] == 3, peek
+
+    # закрытие peek перед второй фазой
+    run_js(widget, """
+(() => {
+  const c = window.qtmonaco.editor.getContribution(
+    'editor.contrib.referencesController');
+  if (c && c.closeWidget) c.closeWidget();
+  return 'CLOSED';
+})()
+""")
+    qtbot.wait(500)
+
+    # фаза 2: references на 'finx' в вызове (20,1) -> use в main.py + def в helper.py
+    _trigger(widget, 'editor.action.goToReferences', 20, 1)
+
+    foreign_box: list[dict] = []
+
+    def _foreign_ready() -> bool:
+        d = _refs_dump() or {}
+        found = [r for r in d.get('refs', []) if r['file'] == 'helper.py']
+        if not found:
+            return False
+        foreign_box.clear()
+        foreign_box.extend(found)
+        return True
+
+    wait_for(
+        qtbot,
+        _foreign_ready,
+        timeout=90.0,
+        poll=1.0,
+        message='basedpyright так и не вернул references в helper.py',
+    )
+    foreign = foreign_box
+    assert (foreign[0]['line'], foreign[0]['col']) == (1, 5), foreign
+
+    # клик по чужому файлу из peek -> opener этапа 6 -> open_uri_requested
+    run_js(widget, """
+(() => {
+  const c = window.qtmonaco.editor.getContribution(
+    'editor.contrib.referencesController');
+  const ref = c && c._model && c._model.references.find(
+    r => (r.uri.path || '').endsWith('helper.py'));
+  if (ref && c.openReference) { c.openReference(ref, false, false); return 'OPENED'; }
+  return 'NO_REF';
+})()
+""")
+    wait_for(
+        qtbot,
+        lambda: bool(hits),
+        timeout=30.0,
+        poll=0.5,
+        message='openReference по чужому файлу не породил open_uri_requested',
+    )
+    helper_uri = (widget.file_path.parent / 'helper.py').as_uri()
+    payload = hits[-1]
+    assert payload.get('uri') == helper_uri, payload
+    rng = payload.get('range') or {}
+    # 'def finx():' — 'finx' на строке 1 с колонки 5 по 9
+    assert rng.get('startLineNumber') == 1, payload
+    assert rng.get('startColumn') == 5, payload
+    assert rng.get('endColumn') == 9, payload
+
+
+def test_stage81_document_symbols_and_sticky_scroll(editor_pair, qtbot) -> None:
+    """textDocument/documentSymbol: иерархия символов + sticky scroll из неё.
+
+    Проверка двух уровней: (1) внутренняя команда Monaco ``_executeDocumentSymbolProvider``
+    строит outline-модель через наш провайдер (basedpyright отдаёт иерархию,
+    SymbolKind LSP=Function(12)/Variable(13) -> Monaco 11/12 со сдвигом -1);
+    (2) встроенный sticky scroll (defaultModel=outlineModel) рисует заголовок
+    ``def calc`` когда верх вьюпорта внутри тела calc.
+    """
+    hub, widget = editor_pair(STAGE81_SRC, registry_json=BP_ONLY_REGISTRY)
+    wait_editor_ready(qtbot, widget)
+
+    run_js(widget, """
+(() => {
+  const ed = window.qtmonaco.editor;
+  const p = ed._commandService.executeCommand(
+    '_executeDocumentSymbolProvider', ed.getModel().uri);
+  const store = (v) => {
+    window.__syms = JSON.stringify((v || []).map(s => ({
+      name: s.name, kind: s.kind,
+      line: (s.selectionRange || s.range).startLineNumber,
+      children: (s.children || []).map(c => c.name),
+    })));
+  };
+  p.then(store, e => { window.__syms = 'ERR:' + (e && e.message || e); });
+  return 'PENDING';
+})()
+""")
+    syms: list[dict] = []
+
+    def _syms_ready() -> bool:
+        raw = run_js(widget, "window.__syms || ''")
+        if not isinstance(raw, str) or not raw:
+            return False
+        if raw.startswith('ERR'):
+            raise AssertionError(raw)
+        syms.clear()
+        syms.extend(json.loads(raw))
+        return True
+
+    wait_for(
+        qtbot,
+        _syms_ready,
+        timeout=60.0,
+        poll=1.0,
+        message='documentSymbol-провайдер так и не отдал символы документа',
+    )
+    top = {s['name']: s for s in syms}
+    # верхний уровень: три функции + два модульных имени (порядок — из LSP)
+    assert {'calc', 'shadow', 'second', 'x', 'y'} <= set(top), syms
+    assert top['calc']['kind'] == 11, top['calc']  # monaco Function
+    assert top['x']['kind'] == 12, top['x']  # monaco Variable
+    assert top['calc']['line'] == 4, top['calc']
+    # иерархия: у calc параметры-дети (basedpyright отдаёт children)
+    child_names = [c for c in top['calc'].get('children', [])]
+    assert 'a' in child_names and 'b' in child_names, top['calc']
+
+    # sticky scroll: каретка в теле calc, вьюпорт ниже заголовка (строка 4
+    # уезжает за верх) -> прилипший заголовок 'def calc(a, b):'
+    run_js(widget, """
+(() => {
+  const ed = window.qtmonaco.editor;
+  ed.setPosition({ lineNumber: 5, column: 5 });
+  ed.setScrollTop(95);
+  return 'SCROLLED';
+})()
+""")
+    sticky: list[str] = []
+
+    def _sticky_ready() -> bool:
+        raw = run_js(widget, """
+(() => {
+  const w = document.querySelector('.sticky-widget');
+  if (!w) return '';
+  return JSON.stringify([...w.querySelectorAll('.sticky-line-content')]
+    .map(e => e.textContent.trim()));
+})()
+""")
+        if not isinstance(raw, str) or not raw.startswith('['):
+            return False
+        sticky.clear()
+        # Monaco рисует отступы/пробелы кода через &nbsp; (\xa0)
+        sticky.extend(t.replace('\xa0', ' ') for t in json.loads(raw))
+        return bool(sticky)
+
+    wait_for(
+        qtbot,
+        _sticky_ready,
+        timeout=30.0,
+        poll=1.0,
+        message='sticky scroll не показал ни одного прилипшего заголовка',
+    )
+    assert any('def calc' in t for t in sticky), sticky
+
+
+def test_stage81_document_highlight_semantic(editor_pair, qtbot) -> None:
+    """textDocument/documentHighlight: семантическая подсветка вхождений.
+
+    Каретка на модульном ``x`` (18,1): basedpyright отдаёт write-подсветку
+    самого присваивания и read в print (21) — и НЕ трогает локальный ``x``
+    в shadow() (9-10). Встроенный текстовый wordHighlighter подсветил бы
+    строки 9-10 тоже, поэтому набор строк {18, 21} доказывает, что Monaco
+    выбрал наш LSP-провайдер (classes wordHighlightStrong=write /
+    wordHighlight=read / wordHighlightText=text).
+    """
+    hub, widget = editor_pair(STAGE81_SRC, registry_json=BP_ONLY_REGISTRY)
+    wait_editor_ready(qtbot, widget)
+
+    run_js(widget, """
+(() => {
+  const ed = window.qtmonaco.editor;
+  ed.focus();
+  ed.setPosition({ lineNumber: 18, column: 1 });
+  return 'POS_SET';
+})()
+""")
+    hl: list[str] = []
+
+    def _hl_ready() -> bool:
+        raw = run_js(widget, """
+(() => {
+  const ed = window.qtmonaco.editor;
+  const ds = ed.getModel().getAllDecorations().filter(
+    d => d.options && d.options.className
+      && d.options.className.includes('wordHighlight'));
+  return ds.length
+    ? JSON.stringify([...new Set(ds.map(d => d.range.startLineNumber + ':'
+        + d.range.startColumn + ':' + d.options.className))])
+    : '';
+})()
+""")
+        if not isinstance(raw, str) or not raw.startswith('['):
+            return False
+        hl.clear()
+        hl.extend(json.loads(raw))
+        return True
+
+    wait_for(
+        qtbot,
+        _hl_ready,
+        timeout=45.0,
+        poll=1.0,
+        message='wordHighlight- decorations от LSP-провайдера так и не появились',
+    )
+    parsed = [e.split(':', 2) for e in hl]
+    lines = {int(p[0]) for p in parsed}
+    kinds = {int(p[0]): p[2] for p in parsed}
+    # только use-site модульного x, без текстовых совпадений в shadow()
+    assert lines == {18, 21}, hl
+    assert kinds[18] == 'wordHighlightStrong', hl  # write: x = calc(...)
+    assert kinds[21] in ('wordHighlight', 'wordHighlightText'), hl  # read: print(x
+    assert 9 not in lines and 10 not in lines, hl

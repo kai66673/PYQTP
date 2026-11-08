@@ -47,11 +47,12 @@ Verify in this order: **ruff → pyright → tests → run the app**.
 - Tests: `uv run pytest` (`pytest` + `pytest-qt` are dev deps of core/ide). Config
   `[tool.pytest.ini_options]` is in the **root** pyproject; tests live in
   `packages/pyqtp-core/tests/` (settings window) and `packages/pyqtp-ide/tests/`
-  (LSP registry + live editor + stage-7 editor UX + editor-options/theme unit tests). Markers `live`
+  (LSP registry + live editor + stage-7 editor UX + stage-8.1 references/symbols/highlight live tests
+   + editor-options/theme unit tests). Markers `live`
   (real LSP server processes) and
-  `webengine` (real QWebEngineView/Monaco) are deselected by default via `addopts` → 30 passed / 19
+  `webengine` (real QWebEngineView/Monaco) are deselected by default via `addopts` → 30 passed / 22
   deselected; run them with `uv run pytest -m 'live or webengine'` (~1 min, they work offscreen) or
-  all 49 in one
+  all 52 in one
   process with `uv run pytest -m ''`. Test-suite gotchas:
   - root `conftest.py` sets `QT_QPA_PLATFORM=offscreen` + `QTWEBENGINE_DISABLE_SANDBOX=1` at import
     and overrides `qapp` as a **session-scoped** fixture (pytest-qt's DESTROY_ON_POLICY would kill
@@ -90,7 +91,11 @@ Verify in this order: **ruff → pyright → tests → run the app**.
     tests passed. Standalone harnesses with the same lifecycle exit fine, so don't "fix" the
     lifecycle; keep the hook. `PYQTP_NO_OS_EXIT=1` skips the hook — for debugging real test
     failures whose traceback prints after the hook (results are the same, the process may then
-    abort in Qt destructors).
+    abort in Qt destructors). The same conftest also disables the **cyclic GC at import**
+    (`gc.disable()`, escape hatch `PYQTP_GC=1`): a gen2 collection *mid-session* finalizes the
+    leaked KDD/QWebEngine wrappers (gc_collect_main → DockWidgetWrapper dtor → QWebEnginePage
+    dtor → SIGTRAP in libQt6WebEngineCore, confirmed via coredump) — extra webengine tests shift
+    GC timing and trigger it; keep GC off for the whole session.
 - Run the IDE: `uv run python ide.py -v` (run from `packages/pyqtp-ide/pyqtp/`; cwd is irrelevant
   since all members are installed editable). Core smoke app: `uv run python launcher.py` from
   `packages/pyqtp-core/pyqtp/`. Examples: `packages/pyqtp-core/examples/{central_dock,kddw_docs}`.

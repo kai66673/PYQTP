@@ -29,6 +29,12 @@ const defaultEditorOptions: monaco.editor.IStandaloneEditorConstructionOptions =
   // настройкам ОС перехватывает управление темой (vs/vs-dark молча меняются
   // на hc-*) — выключаем, темой управляет только явная настройка из Python
   autoDetectHighContrast: false,
+  // vendored-patch (этап 8.1): breadcrumb-виджета в standalone-сборке этого
+  // Monaco нет (esm-дерево содержит только diffEditorBreadcrumbs), поэтому
+  // навигацию по символам документа отдаёт documentSymbol-провайдер + sticky
+  // scroll: заголовки текущих символов прилипают к верху вьюпорта
+  // (contrib/stickyScroll строит модель из outline-модели того же провайдера).
+  stickyScroll: { enabled: true },
 };
 
 // vendored-patch (тема редактора): запоминаем применённую тему — setTheme
