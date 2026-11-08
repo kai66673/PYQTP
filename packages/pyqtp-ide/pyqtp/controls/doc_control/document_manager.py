@@ -12,6 +12,18 @@ from PySide6.QtWidgets import QFileDialog, QMessageBox, QToolBar
 from pyqtp.base.base_document_view import BaseDocumentView
 from pyqtp.controls.base_control import BaseControl
 from pyqtp.controls.doc_control.editor_settings_page import EditorSettingsPage
+from pyqtp.controls.doc_control.workspace_edit import (
+    CREATE_FILE,
+    DELETE_FILE,
+    RENAME_FILE,
+    apply_text_edits_to_text,
+    create_file,
+    delete_file,
+    is_text_document_edit,
+    normalize_document_changes,
+    path_from_file_uri,
+    rename_file,
+)
 from pyqtp.utils.action import Action
 from pyqtp.utils.priority_menu import PriorityMenu
 from pyqtp.views.monaco_document_view import MonacoDocumentView
@@ -264,6 +276,123 @@ class DocumentManager(BaseControl):
                 line, column if isinstance(column, int) else 1,
                 move_to_position='center',
             )
+
+    # --- применение чужой части WorkspaceEdit (этап 8.2) ---
+
+    def on_workspace_edit_requested(self, payload: dict) -> None:
+        """Этап 8.2: правки в файлах вне того, где запущена LSP-операция.
+
+        Ответ редактора (``QtMonacoEditorWidget.workspace_edit_requested``):
+        ``{'origin': 'rename'|'codeAction', 'sourceUri': ...,
+        'workspaceEdit': {'documentChanges': [...]}}`` — JS-сторона уже вырезала
+        локальную часть (её применяет сам Monaco) и нормализовала форму
+        ``changes``. Здесь, в порядке массива documentChanges:
+
+        - TextDocumentEdit в открытый документ -> сообщение ``apply_lsp_text_edits``
+          его редактору (диск не трогаем — документ dirty, save перепишет;
+          didChange серверу уйдёт сам через слушателя модели);
+        - TextDocumentEdit в закрытый файл -> прочитать диск, применить
+          TextEdit (UTF-16 колонки), записать обратно;
+        - CreateFile/RenameFile/DeleteFile (kind 1/2/3) -> файловые операции с
+          опциями overwrite/ignoreIfExists/recursive.
+
+        Ограничение v1: ресурсная операция над ОТКРЫТЫМ документом
+        (например переименование файла с открытой вкладкой) выполняется на диске,
+        вкладки не переименовываются/не закрываются — об этом предупреждаем.
+        """
+        origin = str(payload.get('origin') or 'LSP')
+        changes = normalize_document_changes(payload.get('workspaceEdit'))
+        if not changes:
+            med_log.warning('Пустой WorkspaceEdit от %s', origin)
+            return
+
+        docs_count = 0
+        disk_count = 0
+        fs_count = 0
+        for change in changes:
+            if is_text_document_edit(change):
+                target = self._apply_foreign_text_edit(change, origin)
+                if target == 'doc':
+                    docs_count += 1
+                elif target == 'disk':
+                    disk_count += 1
+            elif self._apply_file_operation(change, origin):
+                fs_count += 1
+
+        med_log.info(
+            'WorkspaceEdit (%s): применено — редакторы: %d, закрытые файлы: %d, '
+            'файловые операции: %d', origin, docs_count, disk_count, fs_count,
+        )
+
+    def _apply_foreign_text_edit(self, change: dict, origin: str) -> str:
+        """TextDocumentEdit чужого файла: 'doc' | 'disk' | '' (пропущено)."""
+        uri = str((change.get('textDocument') or {}).get('uri') or '')
+        path = path_from_file_uri(uri)
+        if path is None:
+            med_log.warning(
+                'Пропущен workspace edit по не-файловому uri: %s (%s)', uri, origin
+            )
+            return ''
+        view = self._opened_docs.get(str(path))
+        edit_widget = getattr(view, 'edit_widget', None) if view else None
+        if edit_widget is not None and hasattr(edit_widget, 'apply_lsp_text_edits'):
+            # открытый документ — правим его редактор (координаты сервер видит
+            # через этот же документ, offset prepended-заголовка вычитает сама
+            # JS-сторона; диск не трогаем — документ dirty, save перепишет)
+            edit_widget.apply_lsp_text_edits(uri, list(change['edits']))
+            return 'doc'
+        try:
+            text = path.read_text(encoding='utf-8')
+        except (OSError, UnicodeDecodeError):
+            med_log.exception(
+                'WorkspaceEdit (%s): не удалось прочитать %s', origin, path
+            )
+            return ''
+        new_text = apply_text_edits_to_text(text, list(change['edits']))
+        try:
+            path.write_text(new_text, encoding='utf-8')
+        except OSError:
+            med_log.exception(
+                'WorkspaceEdit (%s): не удалось записать %s', origin, path
+            )
+            return ''
+        return 'disk'
+
+    def _apply_file_operation(self, change: dict, origin: str) -> bool:
+        """Ресурсная операция (CreateFile/RenameFile/DeleteFile) на диске."""
+        kind = change.get('kind')
+        if kind == CREATE_FILE:
+            path = path_from_file_uri(str(change.get('uri') or ''))
+            if path is not None:
+                return create_file(path, change.get('options'), change.get('contents'))
+        elif kind == RENAME_FILE:
+            old_path = path_from_file_uri(str(change.get('oldUri') or ''))
+            new_path = path_from_file_uri(str(change.get('newUri') or ''))
+            if old_path is not None and new_path is not None:
+                if (
+                    str(old_path) in self._opened_docs
+                    or str(new_path) in self._opened_docs
+                ):
+                    med_log.warning(
+                        'WorkspaceEdit (%s): переименование %s -> %s затрагивает '
+                        'открытый документ — вкладки не переименовываются (v1)',
+                        origin, old_path, new_path,
+                    )
+                return rename_file(old_path, new_path, change.get('options'))
+        elif kind == DELETE_FILE:
+            path = path_from_file_uri(str(change.get('uri') or ''))
+            if path is not None:
+                if str(path) in self._opened_docs:
+                    med_log.warning(
+                        'WorkspaceEdit (%s): удаляемый файл %s открыт в редакторе '
+                        '— вкладка останется без файла (v1)', origin, path,
+                    )
+                return delete_file(path, change.get('options'))
+        else:
+            med_log.warning(
+                'WorkspaceEdit (%s): неизвестная операция kind=%r', origin, kind
+            )
+        return False
 
     def _handle_doc_view_close_requested(
         self, dock: BaseDockWidget, view_key: str

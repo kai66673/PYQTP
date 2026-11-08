@@ -143,15 +143,38 @@ HUB_CAPABILITIES: dict[str, Any] = {
             'formats': ['relative'],
         },
         'codeAction': {
+            'dynamicRegistration': False,
             'codeActionLiteralSupport': {
-                'codeActionKind': {'valueSet': ['quickfix', 'refactor']}
-            }
+                'codeActionKind': {
+                    'valueSet': [
+                        'quickfix', 'refactor', 'refactor.extract',
+                        'refactor.inline', 'refactor.rewrite', 'source',
+                        'source.organizeImports', 'source.fixAll',
+                        'source.unusedImports',
+                    ]
+                }
+            },
+            'resolveSupport': {'properties': ['edit']},
+            # basedpyright/generic pyright не отдаёт фиксы без roundtrip
+            # diagnostic.data и без isPreferred/disabled в литеральной форме
+            'dataSupport': True,
+            'isPreferredSupport': True,
+            'disabledSupport': True,
+            'honorsChangeAnnotations': False,
         },
+        # этап 8.2: переименование (F2) и форматирование — JS-клиент объявляет
+        # эти возможности сам, хаб обязан транслировать их серверу так же
+        'rename': {'dynamicRegistration': False, 'prepareProvider': True},
+        'formatting': {'dynamicRegistration': False},
+        'rangeFormatting': {'dynamicRegistration': False},
     },
     'workspace': {
         'workspaceFolders': True,
         'configuration': True,
         'didChangeConfiguration': {'dynamicRegistration': False},
+        # чужие WorkspaceEdit применяем сами (doc_control/workspace_edit.py):
+        # серверу отвечаем, что applyEdit у клиента нет, чтобы он не присылал
+        # workspace/applyEdit и включал documentChanges/ресурсные операции
         'applyEdit': False,
     },
     'window': {'workDoneProgress': False, 'showMessage': {}},
@@ -317,6 +340,9 @@ class _ServerInstance:
         ):
             response = {'jsonrpc': '2.0', 'id': mid, 'result': None}
         elif method == 'workspace/applyEdit':
+            # не должен приходить (в HUB_CAPABILITIES applyEdit: False); если
+            # сервер всё же прислал — own-side применение чужих правок идёт через
+            # DocumentManager.on_workspace_edit_requested, здесь отказ
             response = {
                 'jsonrpc': '2.0', 'id': mid, 'result': {'applied': False}
             }

@@ -48,12 +48,14 @@ Verify in this order: **ruff → pyright → tests → run the app**.
   `[tool.pytest.ini_options]` is in the **root** pyproject; tests live in
   `packages/pyqtp-core/tests/` (settings window) and `packages/pyqtp-ide/tests/`
   (LSP registry + live editor + stage-7 editor UX + stage-8.1 references/symbols/highlight live tests
-   + editor-options/theme unit tests). Markers `live`
+   + stage-8.2 rename/formatting/codeAction live tests
+   + editor-options/theme + workspace-edit-apply (test_workspace_edit_apply.py) unit tests). Markers `live`
   (real LSP server processes) and
-  `webengine` (real QWebEngineView/Monaco) are deselected by default via `addopts` → 30 passed / 22
+  `webengine` (real QWebEngineView/Monaco) are deselected by default via `addopts` → 46 passed / 27
   deselected; run them with `uv run pytest -m 'live or webengine'` (~1 min, they work offscreen) or
-  all 52 in one
-  process with `uv run pytest -m ''`. Test-suite gotchas:
+  all 73 in one
+  process with `uv run pytest -m ''` (~2 min, full run keeps passing despite `os._exit` in
+  `pytest_sessionfinish` eating the summary line — count the dots). Test-suite gotchas:
   - root `conftest.py` sets `QT_QPA_PLATFORM=offscreen` + `QTWEBENGINE_DISABLE_SANDBOX=1` at import
     and overrides `qapp` as a **session-scoped** fixture (pytest-qt's DESTROY_ON_POLICY would kill
     QApplication between tests). GUI fixtures must depend on `qapp`, else `QMainWindow.__init__`
@@ -64,6 +66,8 @@ Verify in this order: **ruff → pyright → tests → run the app**.
     `model.regions.getStartLineNumber/getEndLineNumber/isCollapsed(i)`), and in this Monaco build
     `EditorOption.effectiveFontSize` is missing (use `EditorOption.fontInfo` → `.fontSize` +
     `.zoomLevel`, or `getOption(monaco.editor.EditorOption.multiCursorModifier)` = `'altKey'`).
+    `editor.getValue()` **keeps the model's trailing EOL** — compare test expectations against the
+    source text with the final `\n`, not `rstrip`.
   - The active Monaco theme is **not readable via JS** in this bundle (monaco-editor 0.55):
     `monaco.editor.getActiveTheme`/`onDidThemeChange` and `EditorOption.theme` don't exist
     (`autoDetectHighContrast` is absent from the public `EditorOption` enum too — don't try to
@@ -349,6 +353,31 @@ Verify in this order: **ruff → pyright → tests → run the app**.
   `open_document`/broadcast and re-applies to open docs on
   `theme_manager.theme_changed` (auto mode follows `Theme.is_dark`, like the
   IPython console colors);
+  stage 8.2 (`docs/IDE_ROADMAP.md`) — rename/formatting/codeAction providers in
+  `providers.ts` (factories gated on server capabilities + `claimProvider`:
+  `rename`/`prepareRename` and `formatting`+`rangeFormatting` are single-owner,
+  codeAction registers on EVERY supporting server — Monaco merges them) and the
+  WorkspaceEdit split (`splitWorkspaceEdit`/`foreignWorkspaceEditPayload` in
+  `providers.ts`): local part becomes a Monaco
+  `{edits:[{resource, textEdit:{range,text}}]}` WITHOUT `versionId`
+  (bulkEditService would veto the whole edit on version mismatch), foreign part
+  is sent verbatim as `documentChanges` to Python via bridge message
+  `_apply_workspace_edit_request` (handled by DocumentManager →
+  `workspace_edit.py`: open doc gets `apply_lsp_text_edits` into its editor,
+  closed doc is patched on disk); codeAction foreign parts are deferred with a
+  `fe{N}` token (`pendingForeignEdits` in `main.ts`, command id
+  `qtmonaco.lsp.applyForeignEdit`), rename foreign parts apply immediately;
+  `LspClient` keeps the raw `publishDiagnostics` cache for the codeAction
+  context (`basedpyright` needs `data`) and `flushDocumentChanges()` before
+  requests; new bridge case `apply_lsp_text_edits` in `main.ts` applies
+  LSP-coordinate edits (lspHeader line offset) via `model.pushEditOperations`
+  (plain `model.applyEdits` is NOT undoable — `computeUndoEdits` defaults to
+  false — and pushEditOperations makes the whole batch one undo point).
+  Monaco-0.55 quirks found here: the returned `CodeActionList` object MUST have
+  `dispose()` (Monaco puts it in a DisposableStore), `CodeActionContext.only` is
+  a single STRING in Monaco but LSP wants `string[]` (basedpyright crashed on
+  `.some()`), and cold-start codeAction fetches racing diagnostics make
+  basedpyright error «parserOutput» (harmless, provider catches it).
   python patch in `monaco.py` —
   `Monaco.__init__` takes an `lsp_host` param and no longer eagerly spawns
   `get_pylsp_host()` (lazy `_resolve_lsp_host()` fallback keeps standalone

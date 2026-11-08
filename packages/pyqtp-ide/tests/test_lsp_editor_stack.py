@@ -16,6 +16,7 @@
 """
 
 import json
+import logging
 import shutil
 import time
 from pathlib import Path
@@ -25,6 +26,12 @@ import pytest
 import qtmonaco
 from PySide6.QtCore import QEventLoop, QTimer
 from qtmonaco import Monaco
+
+from pyqtp.controls.doc_control.workspace_edit import (
+    apply_text_edits_to_text,
+    is_text_document_edit,
+    normalize_document_changes,
+)
 
 # js_build не лежит в git — без него редактор не поднимется
 JS_BUILD_OK = (Path(qtmonaco.__file__).parent / 'js_build' / 'index.html').is_file()
@@ -933,3 +940,412 @@ def test_stage81_document_highlight_semantic(editor_pair, qtbot) -> None:
     assert kinds[18] == 'wordHighlightStrong', hl  # write: x = calc(...)
     assert kinds[21] in ('wordHighlight', 'wordHighlightText'), hl  # read: print(x
     assert 9 not in lines and 10 not in lines, hl
+
+
+# --- этап 8.2: rename / formatting / codeAction + WorkspaceEdit (IDE_ROADMAP) ---
+
+# стек из одного ruff — форматтер только у него (у basedpyright
+# documentFormattingProvider нет); single-owner claim «formatting» прозрачен
+RUFF_ONLY_REGISTRY = json.dumps({
+    'python': {
+        'extensions': ['.py', '.pyi'],
+        'servers': [{'name': 'ruff', 'command': ['ruff', 'server']}],
+    },
+})
+
+# --- rename (editor.action.rename, встроенный виджет Monaco) ---
+
+RENAME_SRC = 'def greet():\n    return 1\n\ngreet()\ngreet()\n'
+# getValue() сохраняет хвостовой EOL модели (источник кончается '\n')
+RENAME_EXPECTED = 'def howdy():\n    return 1\n\nhowdy()\nhowdy()\n'
+
+
+def _js_rename_trigger(line: int, col: int) -> str:
+    """Каретка в (line, col) + вызов команды rename.
+
+    РЕДАКТОР НЕ В ФОКУСЕ: слушатель ``onDidBlurEditorWidget`` виджета rename
+    отменяет ввод при ``!ownerDocument.hasFocus()`` — в offscreen QWebEngine
+    Qt-фокус у виджета не держится, фокусировка DOM-редактора guarantee-ит
+    blur-отмену сразу после открытия виджета.
+    """
+    return (
+        '(() => { const ed = window.qtmonaco.editor;'
+        f'  ed.setPosition({{ lineNumber: {line}, column: {col} }});'
+        "  ed.trigger('test', 'editor.action.rename', {}); return 'T'; })()"
+    )
+
+
+def _js_rename_probe(expect_prefill: str) -> str:
+    """Состояние rename-виджета: 'READY' + предзаполненное имя, 'NOT_YET' иначе."""
+    return (
+        '(() => {'
+        "  const c = window.qtmonaco.editor.getContribution("
+        "'editor.contrib.renameController');"
+        '  const w = c && c._renameWidget;'
+        '  if (!w || !w._currentAcceptInput) return \'NOT_YET\';'
+        '  const v = w._inputWithButton.input.value;'
+        f"  return v === '{expect_prefill}' ? 'READY' : 'WRONG:' + v; }}"
+        ')()'
+    )
+
+
+def _js_rename_accept(new_name: str) -> str:
+    """Заменить текст во поле ввода и принять (RenameAction.acceptRenameInput)."""
+    return (
+        '(() => {'
+        "  const c = window.qtmonaco.editor.getContribution("
+        "'editor.contrib.renameController');"
+        '  const w = c && c._renameWidget;'
+        '  if (!w || !w._currentAcceptInput) return \'GONE\';'
+        f"  w._inputWithButton.input.value = '{new_name}';"
+        '  c.acceptRenameInput(false);'
+        "  return 'ACCEPTED'; })()"
+    )
+
+
+def _rename_round(
+    widget: Monaco, line: int, col: int, prefill: str, new_name: str,
+) -> Any:
+    """Один шаг rename: виджет готов -> задать имя и принять; иначе — заново
+    поднять виджет. Возвращает 'ACCEPTED' либо '' (нужен ещё заход)."""
+    probe = run_js(widget, _js_rename_probe(prefill))
+    if probe != 'READY':
+        run_js(widget, _js_rename_trigger(line, col))
+        return ''
+    return run_js(widget, _js_rename_accept(new_name)) == 'ACCEPTED'
+
+
+def test_stage82_rename_same_document(editor_pair, qtbot) -> None:
+    """F2 на своём символе: prepareRename + textDocument/rename, правки в модели.
+
+    basedpyright объявляет ``renameProvider.prepareProvider`` — JS-сторона
+    регистрирует ``resolveRenameLocation`` (подсветка переименуемого), сам
+    ответ сервера лежит целиком в текущей модели и применяется batch'ем
+    Monaco (bulkEditService, одна undo-точка).
+    """
+    hub, widget = editor_pair(RENAME_SRC, registry_json=BP_ONLY_REGISTRY)
+    wait_editor_ready(qtbot, widget)
+
+    wait_for(
+        qtbot,
+        lambda: _rename_round(widget, 1, 5, 'greet', 'howdy'),
+        timeout=90.0,
+        poll=1.0,
+        message='rename-виджет так и не принял новое имя',
+    )
+    wait_for(
+        qtbot,
+        lambda: run_js(widget, JS_VALUE) == RENAME_EXPECTED,
+        timeout=30.0,
+        poll=1.0,
+        message='rename не применил правки к модели',
+    )
+    # вся правка — в текущей модели: basedpyright заведён процессом хаба
+    assert any(
+        'basedpyright' in cmd for cmd in {key[0] for key in hub._instances}
+    )
+
+
+def test_stage82_rename_cross_document(editor_pair, qtbot) -> None:
+    """F2 кросс-документный: своя часть — Monaco, чужая — мост в Python.
+
+    Прайминг F12 нужен, чтобы basedpyright проиндексировал helper.py (ленивая
+    программа по импорту из main.py). Ответ сервера — documentChanges в двух
+    файлах: main.py (текущая модель) Monaco применяет сам, helper.py уходит
+    в Python сигналом ``workspace_edit_requested``; сам тест применяет чужую
+    часть чистыми хелперами и проверяет, что диск не тронут.
+    """
+    hub, widget = editor_pair(
+        CROSS_SRC,
+        registry_json=BP_ONLY_REGISTRY,
+        extra_files={'helper.py': HELPER_SRC},
+    )
+    wait_editor_ready(qtbot, widget)
+
+    goto_hits: list[dict] = []
+    widget.open_uri_requested.connect(goto_hits.append)
+    edit_hits: list[dict] = []
+    widget.workspace_edit_requested.connect(edit_hits.append)
+
+    # прайминг: revealDefinition на 'finx()' (строка 3) — без ed.focus(),
+    # иначе последующий rename-виджет отменится на blur (см. _js_rename_trigger)
+    def _goto_round() -> bool:
+        run_js(widget, """
+(() => {
+  const ed = window.qtmonaco.editor;
+  ed.setPosition({ lineNumber: 3, column: 1 });
+  ed.trigger('test', 'editor.action.revealDefinition', {});
+  return 'GOTO_TRIGGERED';
+})()
+""")
+        qtbot.wait(2000)  # basedpyright lazily индексирует helper.py
+        return bool(goto_hits)
+
+    wait_for(
+        qtbot,
+        _goto_round,
+        timeout=120.0,
+        poll=1.0,
+        message='прайминг F12 не проиндексировал helper.py (нет open_uri_requested)',
+    )
+
+    wait_for(
+        qtbot,
+        lambda: _rename_round(widget, 3, 1, 'finx', 'finy'),
+        timeout=90.0,
+        poll=1.0,
+        message='rename-виджет так и не принял новое имя (кросс-документ)',
+    )
+    wait_for(
+        qtbot,
+        lambda: run_js(widget, JS_VALUE)
+        == 'from helper import finy\n\nfiny()\n',
+        timeout=30.0,
+        poll=1.0,
+        message='локальная часть кросс-документного rename не применилась',
+    )
+
+    wait_for(
+        qtbot,
+        lambda: bool(edit_hits),
+        timeout=30.0,
+        poll=0.5,
+        message='чужая часть WorkspaceEdit не пришла в Python',
+    )
+    payload = edit_hits[0]
+    assert payload.get('origin') == 'rename', payload
+    assert payload.get('sourceUri') == widget.file_path.as_uri(), payload
+    changes = normalize_document_changes(payload.get('workspaceEdit'))
+    helper_uri = (widget.file_path.parent / 'helper.py').as_uri()
+    helper_edits = [
+        c['edits']
+        for c in changes
+        if is_text_document_edit(c) and c['textDocument']['uri'] == helper_uri
+    ]
+    assert helper_edits, payload
+    # чужой файл на диске остаётся нетронутым (здесь нет DocumentManager —
+    # сам сигнал и есть граница маршрута)
+    assert (widget.file_path.parent / 'helper.py').read_text(
+        encoding='utf-8'
+    ) == HELPER_SRC
+    # чистое применение чужой части (тот же код, что в DocumentManager)
+    new_helper = apply_text_edits_to_text(HELPER_SRC, helper_edits[0])
+    assert new_helper == 'def finy():\n    return 1\n', new_helper
+
+
+def test_stage82_formatting_document(editor_pair, qtbot) -> None:
+    """editor.action.formatDocument: ruff server -> одна undo-точка в модели."""
+    fmt_src = 'x=1\nprint( x )\n'
+    # getValue() сохраняет хвостовой EOL; ruff отдаёт один whole-document
+    # TextEdit с newText 'x = 1\nprint(x)\n' (проверено stdio-пробой)
+    fmt_expected = 'x = 1\nprint(x)\n'
+    hub, widget = editor_pair(fmt_src, registry_json=RUFF_ONLY_REGISTRY)
+    wait_editor_ready(qtbot, widget)
+
+    def _fmt_round() -> bool:
+        run_js(widget, "(() => { window.qtmonaco.editor.trigger("
+        "'test', 'editor.action.formatDocument', {}); return 'F'; })()")
+        return run_js(widget, JS_VALUE) == fmt_expected
+
+    wait_for(
+        qtbot,
+        _fmt_round,
+        timeout=90.0,
+        poll=2.0,
+        message='форматирование ruff не применилось к модели',
+    )
+    assert any('ruff' in cmd for cmd in {key[0] for key in hub._instances})
+
+    # одна undo-точка: bulkEditService оборачивает правки pushStackElement
+    run_js(widget, "(() => { window.qtmonaco.editor.getModel().undo();"
+    " return 'U'; })()")
+    wait_for(
+        qtbot,
+        lambda: run_js(widget, JS_VALUE) == fmt_src,
+        timeout=30.0,
+        poll=1.0,
+        message='undo не откатил форматирование целиком (не одна точка?)',
+    )
+
+
+# --- codeAction / quickfix (editor.action.codeAction) ---
+
+CA_SRC = 'print(path)\n'
+
+JS_CODE_ACTION_DUMP = """
+(() => {
+  const c = window.qtmonaco.editor.getContribution(
+    'editor.contrib.codeActionController');
+  if (!c) return 'NO_CONTRIB';
+  const st = c._activeCodeActions.value;
+  if (!st || !Array.isArray(st.allActions)) return '';
+  return JSON.stringify(st.allActions.map(i => ({
+    title: i.action.title,
+    kind: i.action.kind || null,
+    hasEdit: !!(i.action.edit && i.action.edit.edits
+      && i.action.edit.edits.length),
+    cmd: i.action.command ? i.action.command.id : null,
+  })));
+})()
+"""
+
+
+def _js_code_action(line: int, col: int, apply_mode: str) -> str:
+    return (
+        '(() => { const ed = window.qtmonaco.editor;'
+        f'  ed.setPosition({{ lineNumber: {line}, column: {col} }});'
+        "  ed.trigger('test', 'editor.action.codeAction',"
+        f"  {{ kind: 'quickfix', apply: '{apply_mode}' }}); return 'T'; }}"
+        ')()'
+    )
+
+
+def _ca_undef_marker(widget: Monaco) -> bool:
+    return any(
+        'not defined' in str(m.get('message', ''))
+        for m in read_markers(widget)
+    )
+
+
+def test_stage82_code_action_quickfix(editor_pair, qtbot) -> None:
+    """Ctrl+. на undefined-имени: список fixed от basedpyright + применение.
+
+    basedpyright для ``print(path)`` отдаёт (проверено stdio-пробой):
+    «from os import path», «from sys import path», две ignore-комменты.
+    Сначала ``apply:'never'`` — пулим список без применения, затем
+    ``apply:'first'`` — первый фикс применяется в модель, диагностика после
+    перезапуска линтера уходит.
+    """
+    hub, widget = editor_pair(CA_SRC, registry_json=BP_ONLY_REGISTRY)
+    wait_editor_ready(qtbot, widget)
+
+    foreign: list[dict] = []
+    widget.workspace_edit_requested.connect(foreign.append)
+
+    # холодный basedpyright нестабилен в выдаче диагностик — запас по времени
+    wait_for(
+        qtbot,
+        lambda: _ca_undef_marker(widget),
+        timeout=180.0,
+        poll=2.0,
+        message='basedpyright так и не выдал «is not defined» для path',
+    )
+
+    run_js(widget, _js_code_action(1, 7, 'never'))
+    actions: list[dict] = []
+
+    def _actions_ready() -> bool:
+        raw = run_js(widget, JS_CODE_ACTION_DUMP)
+        if not isinstance(raw, str) or not raw.startswith('['):
+            return False
+        actions.clear()
+        actions.extend(json.loads(raw))
+        return any('import path' in str(a.get('title')) for a in actions)
+
+    wait_for(
+        qtbot,
+        _actions_ready,
+        timeout=90.0,
+        poll=2.0,
+        message='basedpyright не вернул quickfix-действия для path',
+    )
+    titles = [str(a.get('title')) for a in actions]
+    assert 'from os import path' in titles, titles
+    assert 'from sys import path' in titles, titles
+    assert any('pyright: ignore' in t for t in titles), titles
+    assert all(a.get('kind') == 'quickfix' for a in actions), titles
+    # основную часть правок сервер кладёт в edit (провайдер перекладывает её
+    # в Monaco-формат), своих команд у pyright в действиях нет
+    assert actions[0].get('hasEdit') and not actions[0].get('cmd'), titles
+    # 'never' ничего не применил и не дёргал чужую часть
+    assert 'import path' not in str(run_js(widget, JS_VALUE))
+    assert not foreign
+
+    # применяем первое действие (fixed-порядок сервера -> сверяем по titles[0])
+    run_js(widget, _js_code_action(1, 7, 'first'))
+    first_title = str(actions[0]['title'])
+
+    def _applied() -> bool:
+        val = run_js(widget, JS_VALUE)
+        return isinstance(val, str) and val.startswith(first_title)
+
+    wait_for(
+        qtbot,
+        _applied,
+        timeout=60.0,
+        poll=2.0,
+        message=f'quickfix «{first_title}» не применился к модели',
+    )
+    # после didChange basedpyright перезапускается — диагностика уходит
+    def _diag_gone() -> bool:
+        if _ca_undef_marker(widget):
+            run_js(widget, _js_code_action(1, 7, 'never'))  # пнуть перезапуск
+            return False
+        return True
+
+    wait_for(
+        qtbot,
+        _diag_gone,
+        timeout=120.0,
+        poll=3.0,
+        message='после quickfix диагностика «is not defined» не ушла',
+    )
+    assert not foreign
+
+
+# --- прямое применение чужих правок: apply_lsp_text_edits (мост Python -> JS) ---
+
+
+def test_stage82_apply_lsp_text_edits_direct(editor_pair, qtbot, caplog) -> None:
+    """Сообщение ``apply_lsp_text_edits``: правка чужой модели + uri-фартук.
+
+    Так DocumentManager доставляет чужую часть WorkspaceEdit в файл, который
+    ОТКРЫТ в другом редакторе: JS проверяет uri модели, правит через
+    model.applyEdits (одна undo-точка) и отвечает ``_workspace_edit_applied``;
+    на несовпадении uri — ok:false и warning в bcad.med.
+    """
+    src = 'a = 1\nb = a\n'
+    hub, widget = editor_pair(src, registry_json=RUFF_ONLY_REGISTRY)
+    wait_editor_ready(qtbot, widget)
+
+    # LSP-координаты (0-based), как их присылает сервер
+    edits = [{
+        'range': {
+            'start': {'line': 1, 'character': 0},
+            'end': {'line': 1, 'character': 1},
+        },
+        'newText': 'c',
+    }]
+    widget.apply_lsp_text_edits(widget.file_path.as_uri(), edits)
+    wait_for(
+        qtbot,
+        lambda: run_js(widget, JS_VALUE) == 'a = 1\nc = a\n',
+        timeout=30.0,
+        poll=1.0,
+        message='apply_lsp_text_edits не изменил модель',
+    )
+    run_js(widget, "(() => { window.qtmonaco.editor.getModel().undo();"
+    " return 'U'; })()")
+    wait_for(
+        qtbot,
+        lambda: run_js(widget, JS_VALUE) == 'a = 1\nb = a\n',
+        timeout=30.0,
+        poll=1.0,
+        message='undo не откатил apply_lsp_text_edits (не одна точка?)',
+    )
+
+    # несовпадение uri: правка не применяется, JS отвечает ok:false,
+    # Python пишет warning (bcad.med)
+    caplog.set_level(logging.WARNING, logger='bcad.med')
+    widget.apply_lsp_text_edits('file:///pyqtp-nonexistent/other.py', edits)
+    wait_for(
+        qtbot,
+        lambda: any(
+            'Monaco не применил workspace edit' in r.getMessage()
+            for r in caplog.records
+        ),
+        timeout=30.0,
+        poll=1.0,
+        message='нет warning на отклонённый uri в apply_lsp_text_edits',
+    )
+    assert run_js(widget, JS_VALUE) == 'a = 1\nb = a\n'

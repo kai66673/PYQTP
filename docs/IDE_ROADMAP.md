@@ -144,6 +144,81 @@ Python, find/replace, folding, smart select, история переходов, 
 (formatting/rename+applyEdit/codeAction — 8.2) отдельным заходом;
 `workspace/symbol` — за этой же чертой (связан с этапом 9).
 
+#### Этап 8.2 — rename, formatting, codeAction + WorkspaceEdit через мост ✅ (готово)
+- общий разбор WorkspaceEdit (`splitWorkspaceEdit`/`foreignWorkspaceEditPayload`
+  в `providers.ts`): ответ сервера режется на **локальную** часть (текущая
+  модель — формат Monaco `{edits:[{resource, textEdit:{range,text}}]}`,
+  `versionId` намеренно опущен: сервер строил правки по своему снимку, проверка
+  версии у bulkEditService отменила бы всю правку целиком) и **чужую**
+  (закрытые/чужие документы и file-ops Create/Rename/Delete) — она уходит в
+  Python сообщением `_apply_workspace_edit_request` `{origin, sourceUri,
+  workspaceEdit:{documentChanges}}`; форма `changes` нормализуется в
+  `documentChanges` на JS-стороне, порядок сохраняется (сервер мог создать
+  файл и сразу его править);
+  причина разделения именно такая: `StandaloneBulkEditService.apply` —
+  all-or-nothing («bad edit - model not found» на отсутствующей модели,
+  file-ops не умеет вовсе);
+- `textDocument/rename` (+`prepareRename`) → `createRenameProvider`,
+  single-owner (`claimProvider("rename")` — правка rename применяется одним
+  batch'ем, второй сервер удвоил бы правки). Встроенный F2-виджет Monaco
+  (`editor.action.rename`): `resolveRenameLocation` разбирает `PrepareRenameResult`
+  (Range | {range,placeholder}), в этом билде Monaco передаёт `(model, position,
+  token)` без options — аргументы разбираются хвостом. Своя часть применяется
+  Monaco; чужая (переименование импорта в другом файле) шлётся в Python сразу
+  после ответа сервера (F2 уже подтверждён пользователем), с последующей
+  правкой модели по одной undo-точке;
+- `textDocument/formatting` + `rangeFormatting` → `createFormattingProviders`
+  (команды `editor.action.formatDocument`/`formatSelection` — штатные contrib
+  Monaco, своих биндов не добавляли), single-owner под общим claim
+  «formatting» (второй форматтер переписал бы результат первого), ответ —
+  обычный `TextEdit[]` в текущую модель;
+- `textDocument/codeAction` (quickfix/refactor/source) →
+  `createCodeActionProvider`: регистрируется **каждым** сервером стека без
+  claim (Monaco объединяет меню фиксов; у pyright/ruff наборы непересекаются).
+  Контекст диагностики берётся из кэша **сырых** `publishDiagnostics` в
+  `LspClient` (`publishedDiagnostics`), а не из маркеров Monaco: MarkerService
+  вырезает неизвестные поля, а basedpyright требует roundtrip своего `data`.
+  `codeAction/resolve` регистрируется всегда (сервер может отдать действие без
+  `edit`). Отложенная чужая часть: токен в `pendingForeignEdits` (main.ts) +
+  `action.command = qtmonaco.lsp.applyForeignEdit(token)` — Monaco в
+  `applyCodeAction` исполняет `action.edit` (bulkEditService), **затем**
+  command, порядок local→foreign гарантирован; действие только с чужими
+  правками остаётся в меню без `edit`;
+- применение чужой части на Python (`pyqtp/controls/doc_control/
+  workspace_edit.py` — чистые хелперы + оркестрация в
+  `DocumentManager.on_workspace_edit_requested`): открытый чужой документ
+  получает сообщение `apply_lsp_text_edits` в свой редактор (проверка uri
+  модели, `model.pushEditOperations` — одна undo-точка; обычный
+  `model.applyEdits` не подошёл: он по умолчанию не undoable), ответ
+  `_workspace_edit_applied`, dirty-трекинг работает через `_current_text`
+  автоматом); закрытый — чтение диска + `apply_text_edits_to_text` (колонки
+  LSP — единицы UTF-16, учтены суррогатные пары) + файловые операции с
+  `overwrite`/`ignoreIfExists`/`recursive`;
+- `workspace/applyEdit` в хабе — осознанная заглушка `applied:false`
+  (`applyEdit: False` в `HUB_CAPABILITIES`): серверы (pyright/ruff/clangd)
+  кладут правки в `edit` действий/ответов, server-initiated применение им не
+  нужно; сервер с `workspace/executeCommand` вместо `edit` на этой версии не
+  поддерживается (действие попадает в меню, но edit у него отсутствует).
+**Ограничения v1 (приняты как данность):**
+  чужой **открытый dirty**-документ может получить правки по устаревшему
+  снимку сервера (debounce `didChange` 300 мс); `versionId` в локальных
+  правках опущен (см. выше); ресурсные операции над открытыми документами
+  выполняются на диске без переименования/закрытия вкладок (в журнал —
+  warning).
+**Приёмка:** юнит-тесты `tests/test_workspace_edit_apply.py` (16 — разбор
+форм, UTF-16-колонки, файловые операции) + live-тесты
+`test_stage82_rename_same_document` (F2 целиком в модели, виджет переживает
+offscreen без Qt-фокуса — rename-прогоны намеренно без `ed.focus()`),
+`test_stage82_rename_cross_document` (прайминг F12, локальная часть в буфере,
+чужая — сигнал `workspace_edit_requested` + применение чистыми хелперами,
+диск чужого файла не тронут), `test_stage82_formatting_document` (ruff
+whole-document edit + одна undo-точка), `test_stage82_code_action_quickfix`
+(список фиксов basedpyright через `apply:'never'`, применение первого,
+уход диагностики), `test_stage82_apply_lsp_text_edits_direct` (мост
+Python→JS: uri-фартук, одна undo-точка, warning `bcad.med` на ok:false).
+Остаток этапа — `workspace/symbol` (этап 9); `inlayHint`/`codeLens`/
+`documentColor` сознательно не брали.
+
 ### Этап 9 — проект и сессии
 - панель дерева проекта (QTreeView, lazy, reveal активного файла, контекстное меню);
 - «Открыть папку» + сессия проекта (вкладки/активная/раскладка; хранение —

@@ -35,6 +35,9 @@ class QtMonacoEditorWidget(Monaco):
 
     modification_changed = Signal(bool)
     open_uri_requested = Signal(dict)  # этап 6: Monaco-навигация на другой ресурс
+    # этап 8.2: чужая (по текущей модели) часть LSP WorkspaceEdit
+    # (rename/quickfix затронул другие файлы)
+    workspace_edit_requested = Signal(dict)
 
     def __init__(
         self, file_path: Path, /, *, lsp_host: str | list[dict] | None = None
@@ -96,3 +99,42 @@ class QtMonacoEditorWidget(Monaco):
             med_log.warning('Monaco прислал запрос открытия без uri: %r', value)
             return
         self.open_uri_requested.emit(value)
+
+    def _apply_workspace_edit_request(self, value: dict) -> None:
+        """Обработчик ``_apply_workspace_edit_request`` из JS-стороны (этап 8.2).
+
+        rename/quickfix затронул файлы вне текущей модели: JS разрезал ответ
+        сервера (локальную часть применил сам), чужую часть шлёт сюда в форме
+        ``{'origin', 'sourceUri', 'workspaceEdit': {'documentChanges': [...]}}``.
+        Сам редактор чужие файлы не правит — прокидываем запрос наверх через
+        ``workspace_edit_requested`` (см.
+        ``DocumentManager.on_workspace_edit_requested``).
+        """
+        if not isinstance(value, dict) or not isinstance(
+            value.get('workspaceEdit'), dict
+        ):
+            med_log.warning('Monaco прислал workspace edit без workspaceEdit: %r', value)
+            return
+        self.workspace_edit_requested.emit(value)
+
+    def apply_lsp_text_edits(self, uri: str, edits: list[dict]) -> None:
+        """Применить TextEdit'ы к модели этого редактора (этап 8.2).
+
+        Так DocumentManager доставляет правки в файл, который ОТКРЫТ в другом
+        редакторе: JS-сторона проверяет uri модели, правит через
+        ``model.applyEdits`` (undo-группа через pushStackElement) и отвечает
+        ``_workspace_edit_applied``. Сообщение буферизуется ``Connector`` до
+        инициализации моста — можно слать сразу после открытия документа.
+        """
+        self._connector.send('apply_lsp_text_edits', {'uri': uri, 'edits': edits})
+
+    def _workspace_edit_applied(self, value: dict) -> None:
+        """Ответ JS о применении чужих правок (``apply_lsp_text_edits``)."""
+        if not isinstance(value, dict):
+            return
+        if not value.get('ok'):
+            med_log.warning(
+                'Monaco не применил workspace edit к %s: %s',
+                value.get('uri'),
+                value.get('error'),
+            )
