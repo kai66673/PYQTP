@@ -55,6 +55,9 @@ if TYPE_CHECKING:
 
 prj_log = logging.getLogger('bcad.project')
 
+# ключ проектной области окна настроек (этап 9.6B2, см. SettingsControl)
+SCOPE_PROJECT = 'project'
+
 
 class _ScanSignals(QObject):
     """Мост «фоновый поток -> поток GUI» для результатов скана файлов."""
@@ -205,6 +208,14 @@ class ProjectControl(BaseControl):
             self._main_wnd.theme_manager.icon('io/open.svg')
         )
         self.project_root_changed.connect(self._on_root_for_scan)
+        # область «Проект» в окне настроек (этап 9.6B2): доступна, пока
+        # открыт проект; окно пересобирает селектор на смене корня
+        self._main_wnd.settings_scope_register(
+            SCOPE_PROJECT, 'Проект', lambda: self._project_root is not None
+        )
+        self.project_root_changed.connect(
+            lambda _root: self._main_wnd.settings_scopes_refresh()
+        )
         # API проекта для Python-консоли (этап 9.1; расширение — этап 12)
         self._main_wnd.api_ctrl.register_variables(
             {
@@ -588,6 +599,32 @@ class ProjectControl(BaseControl):
             raise ValueError(error_message)
         self._validate_project_setting(section, key, value)
         updated = overlay_set(self._project_settings, section, key, value)
+        try:
+            write_project_settings(self._project_root, updated)
+        except OSError as exc:
+            error_message = f'Не удалось записать настройки проекта: {exc}'
+            raise ValueError(error_message) from exc
+        self._project_settings = updated
+        self._apply_project_layers()
+        self.project_settings_changed.emit()
+
+    def project_settings_update(
+        self, section: str, values: dict[str, Any]
+    ) -> None:
+        """Задаёт (``value is None`` — снимает) набор ключей одной секции.
+
+        Тот же контракт, что у ``project_settings_set``, но валидация всех
+        ключей и запись файла — один раз (страница «Редактор» применяет
+        сразу 5 ключей; при ошибке любого из них источник не тронут).
+        """
+        if self._project_root is None:
+            error_message = 'Проект не открыт — настройки проекта недоступны'
+            raise ValueError(error_message)
+        for key, value in values.items():
+            self._validate_project_setting(section, key, value)
+        updated = self._project_settings
+        for key, value in values.items():
+            updated = overlay_set(updated, section, key, value)
         try:
             write_project_settings(self._project_root, updated)
         except OSError as exc:

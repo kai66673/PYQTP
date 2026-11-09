@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 
 from PySide6.QtCore import QByteArray, Qt, Slot
 from PySide6.QtWidgets import (
+    QComboBox,
     QDialog,
     QHBoxLayout,
     QLabel,
@@ -18,6 +19,8 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+from pyqtp.controls.settings_control.settings_page import SCOPE_APP
 
 if TYPE_CHECKING:
     from PySide6.QtGui import QCloseEvent, QShowEvent
@@ -51,6 +54,7 @@ class SettingsWindow(QDialog):
         self.resize(880, 600)
 
         root_layout = QVBoxLayout(self)
+        self._root_layout = root_layout
 
         self._splitter = QSplitter(Qt.Orientation.Horizontal, self)
         root_layout.addWidget(self._splitter, stretch=1)
@@ -69,15 +73,31 @@ class SettingsWindow(QDialog):
         left_layout.addWidget(self._pages_list, stretch=1)
         self._pages_list.setMinimumWidth(180)
 
-        # Правая панель: стек виджетов страниц
-        self._stack = QStackedWidget(self._splitter)
+        # Правая панель: селектор области (этап 9.6B) + стек виджетов страниц
+        right = QWidget(self._splitter)
+        right_layout = QVBoxLayout(right)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        self._scope_row = self._build_scope_row(right)
+        right_layout.addWidget(self._scope_row)
+        self._stack = QStackedWidget(right)
+        right_layout.addWidget(self._stack, stretch=1)
+        # программная пересборка наполнения комбика не должна грузить страницу
+        self._scope_syncing = False
+
         self._splitter.addWidget(left)
-        self._splitter.addWidget(self._stack)
+        self._splitter.addWidget(right)
         self._splitter.setStretchFactor(1, 1)
 
         # Нижняя панель: статус + кнопки применения
+        self._build_bottom_bar()
+
+        self._restore_window_state()
+        self.reload_pages()
+
+    def _build_bottom_bar(self) -> None:
+        """Нижняя панель окна: лейбл статуса + кнопки применения."""
         bottom = QHBoxLayout()
-        root_layout.addLayout(bottom)
+        self._root_layout.addLayout(bottom)
         self._status_label = QLabel('', self)
         self._status_label.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse
@@ -96,8 +116,18 @@ class SettingsWindow(QDialog):
         self._close_btn.clicked.connect(self._hide_window)
         bottom.addWidget(self._close_btn)
 
-        self._restore_window_state()
-        self.reload_pages()
+    def _build_scope_row(self, parent: QWidget) -> QWidget:
+        """Строка «Область: [селектор]» над стеком страниц (этап 9.6B)."""
+        row = QWidget(parent)
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(QLabel('Область:', row))
+        self._scope_combo = QComboBox(row)
+        self._scope_combo.currentIndexChanged.connect(self._on_scope_changed)
+        layout.addWidget(self._scope_combo)
+        layout.addStretch(1)
+        row.setVisible(False)  # показываем только для scope-страниц
+        return row
 
     ###################
     # Синхронизация   #
@@ -129,6 +159,9 @@ class SettingsWindow(QDialog):
             self._pages_list.setCurrentRow(row)
         else:
             self._on_row_selected(-1)
+        # если строка не менялась, сигнала не будет — синхронизируем сами
+        # (селектор области мог устареть)
+        self._sync_scope_row(self._current_page())
 
     def sync_pages_values(self) -> None:
         """Прогоняет ``load()`` по всем уже созданным страницам."""
@@ -168,6 +201,7 @@ class SettingsWindow(QDialog):
             self._apply_btn.setEnabled(False)
             self._revert_btn.setEnabled(False)
             self._reset_btn.setEnabled(False)
+            self._scope_row.setVisible(False)
             return
         widget = page.widget  # ленивое создание виджета страницы
         if self._stack.indexOf(widget) < 0:
@@ -177,6 +211,57 @@ class SettingsWindow(QDialog):
         self._apply_btn.setEnabled(page.supports_apply)
         self._revert_btn.setEnabled(page.supports_apply)
         self._reset_btn.setEnabled(page.supports_reset)
+        self._set_status('')
+        self._sync_scope_row(page)
+
+    ##################
+    # Область        #
+    # (этап 9.6B)    #
+    ##################
+
+    def _sync_scope_row(self, page: SettingsPage | None) -> None:
+        """Пересобирает селектор области под текущую страницу.
+
+        Для несcope-страниц строка скрывается; если текущая область
+        страницы стала недоступна (проект закрыли) — откат на 'app' с
+        перезагрузкой значений страницы.
+        """
+        applicable = page is not None and page.scope_applicable
+        self._scope_row.setVisible(applicable)
+        if page is None:
+            return
+        options = self._control.scope_options()
+        available = [(key, label) for key, label, ok in options if ok]
+        if not any(key == page.scope for key, _label in available):
+            page.scope_set(SCOPE_APP)
+            page.load()  # значения теперь из слоя приложения
+        self._scope_syncing = True
+        try:
+            self._scope_combo.clear()
+            for key, label in available:
+                self._scope_combo.addItem(label, key)
+            self._scope_combo.setCurrentIndex(
+                max(self._scope_combo.findData(page.scope), 0)
+            )
+        finally:
+            self._scope_syncing = False
+
+    def scopes_refresh(self) -> None:
+        """Публичный хук: пересобрать селектор (смена доступности областей)."""
+        self._sync_scope_row(self._current_page())
+
+    @Slot(int)
+    def _on_scope_changed(self, index: int) -> None:
+        if self._scope_syncing:
+            return
+        page = self._current_page()
+        if page is None or index < 0:
+            return
+        scope = self._scope_combo.itemData(index)
+        if not isinstance(scope, str) or scope == page.scope:
+            return
+        page.scope_set(scope)
+        page.load()  # значения новой области
         self._set_status('')
 
     def _apply_filter(self, text: str) -> None:

@@ -462,9 +462,10 @@ regression хаба + 5 offscreen — набор меню (файл/катало
   LSP — `LspHub._registry_app_json/_registry_project_json` +
   `_effective_registry` (проект > приложение > дефолт), `registry_app_json()`
   для страницы, `registry_apply_json/reset` трогают только слой приложения;
-- страницы настроек (9.6B2 пока нет) грузят СЛОЙ ПРИЛОЖЕНИЯ (`theme_app_name`
+- страницы настроек грузят СЛОЙ ПРИЛОЖЕНИЯ (`theme_app_name`
   / `editor_ux_options_app` / `registry_app_json`), чтобы «Применить» не
-  копировал перекрытие проекта в QSettings.
+  копировал перекрытие проекта в QSettings (с 9.6B2 это поведение —
+  область «Приложение», у scope-aware страниц появилась и проектная область).
 
 **Приёмка:** `tests/test_project_settings.py` (21: 10 юнитов project_settings
 + 2 юнита coerce/merge editor_options + 9 offscreen — старт с персистнутым
@@ -474,10 +475,49 @@ regression хаба + 5 offscreen — набор меню (файл/катало
 страница «Редактор» грузит слой приложения, слои LSP-реестра без утечек,
 валидность API (нет проекта/секции/ключа/значения) + сигнал + копия get).
 
+#### 9.6 (часть B2) — селектор области «Приложение/Проект» — ГОТОВО
+- ядро остаётся про проекту-агностичным: `SettingsControl.scope_register(
+  key, label, is_available)` + `scope_options()` (ленивая проверка
+  доступности) + `scopes_refresh()`; область `'app'` («Приложение»)
+  регистрирует само ядро, `'project'` («Проект») — `ProjectControl.setup`
+  (доступна с открытым проектом), пересборка селектора — на
+  `project_root_changed`; фасады `settings_scope_register/
+  settings_scopes_refresh` на BaseMainWindow;
+- `SettingsPage`: `scope_applicable` (окно показывает строку «Область»
+  только для таких страниц), `scope`/`scope_set()` (по умолчанию `'app'`,
+  константа `SCOPE_APP` в `settings_page.py`, `SCOPE_PROJECT` — в
+  `project_control.py`); страница в `load/apply/reset_defaults` сама
+  выбирает слой по `self.scope`;
+- `SettingsWindow`: строка «Область: [QComboBox]» над стеком страниц,
+  `_sync_scope_row` при выборе страницы/смене доступности; если текущая
+  область страницы стала недоступна (проект закрыли при открытом окне) —
+  откат на `'app'` с `page.load()`; программная пересборка комбика
+  защищена флагом `_scope_syncing` (не грузит страницу повторно);
+- страницы стали scope-aware на своих местах (та же клавиша/порядок):
+  «Редактор» в проектной области грузит ЭФФЕКТИВные значения, «Применить»
+  пишет весь набор ключей в секцию `editor` оверлея (пакетный
+  `ProjectControl.project_settings_update` — валидация всех ключей до
+  записи, одна запись файла, один сигнал), «Сбросить» снимает секцию;
+  «LSP» — то же для `lsp.registry_json` (load = эффективный реестр);
+  core-страницу «Внешний вид» в IDE заменил `AppearanceScopePage`
+  (`main_wnd/appearance_scope_page.py`, та же key/order): в проектной
+  области без перекрытия показывается тема приложения, apply — оверлей
+  `appearance.theme_name`, reset — снимает оверлей (а не пишет «Светлая»);
+- console-API дополнен: `project_settings_update` (в `ProjectControl`,
+  не в console-списке — тот же `project_settings_set` покрывает одиночные
+  ключи).
+
+**Приёмка:** `tests/test_settings_scope.py` (9 offscreen — реестр областей
+и ленивая доступность + отказ дубликата, видимость строки «Область» только
+у scope-страниц (plain-страница прячет) + автопересборка селектора на смене
+корня, редактор: load 14/20 по областям, пакетный apply в оверлей при целом
+слое приложения + broadcast в фейк-редактор, reset снимает секцию; откат
+области при закрытии проекта с перезагрузкой значений; замена страницы
+темы на scope-aware + apply/reset темы через оверлей при целостном
+`theme_app_name`; LSP load/apply/reset по слоям; `project_settings_update`
+— либо все ключи либо ничего, один сигнал, снятие ключа `None`).
+
 #### Остаток этапа 9
-- 9.6B2: селектор области «Приложение/Проект» в окне настроек +
-  scope-aware страницы (сейчас страницы редактируют только слой приложения,
-  проектный слой доступен console-API);
 - закладки: Monaco decorations + `.pyqtp/bookmarks.json` + панель закладок.
 **Приёмка:** webengine-тест закладок (юниты rg-парсера — уже закрыты в 9.3).
 

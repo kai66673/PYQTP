@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -12,6 +12,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from pyqtp.controls.project_control.project_control import SCOPE_PROJECT
+from pyqtp.controls.project_control.project_settings import SECTION_EDITOR
 from pyqtp.controls.settings_control.settings_page import SettingsPage
 from pyqtp.web.editor_options import (
     EDITOR_THEME_AUTO,
@@ -22,31 +24,42 @@ from pyqtp.web.editor_options import (
 
 if TYPE_CHECKING:
     from pyqtp.controls.doc_control.document_manager import DocumentManager
+    from pyqtp.controls.project_control.project_control import ProjectControl
+    from pyqtp.main_wnd.ide_main_window import IdeMainWindow
 
 
 class EditorSettingsPage(SettingsPage):
     """
-    Страница «Редактор» (этап 7).
+    Страница «Редактор» (этап 7, области — этап 9.6B2).
 
     UX-настройки Monaco: мини-карта, сворачивание блоков, зум колесом с
     ctrl, размер шрифта, тема редактора (следовать теме приложения /
-    светлая / тёмная). Страница редактирует слой настроек ПРИЛОЖЕНИЯ
-    (QSettings, группа ``EditorOptions``); «Применить» пишет его и мгновенно
-    доводит эффективные значения до всех открытых редакторов
+    светлая / тёмная).
+
+    Область ``app`` — слой настроек ПРИЛОЖЕНИЯ (QSettings, группа
+    ``EditorOptions``); «Применить» пишет его и мгновенно доводит
+    эффективные значения до всех открытых редакторов
     (``update_editor_options``), новые редакторы подхватывают их при
-    создании. Если открытый проект перекрывает какие-то из этих значений
-    (``.pyqtp/settings.json``), перекрытие остаётся старше.
+    создании. Область ``project`` — перекрытия открытого проекта
+    (``.pyqtp/settings.json``, секция ``editor``): в виджетах показываются
+    эффективные значения (перекрытие, а где его нет — значения приложения),
+    «Применить» пишет весь набор ключей в слой проекта, «Сбросить» снимает
+    секцию (значения приложения снова становятся видимыми). Перекрытие
+    проекта всегда старше слоя приложения.
     """
 
     title = 'Редактор'
     order = 10
+    scope_applicable = True
 
     _HINT = (
-        'Настройки применяются ко всем открытым редакторам сразу и '
-        'сохраняются для новых. Остальное поведение по умолчанию: '
-        'поиск ctrl+F, замена ctrl+H, сворачивание ctrl+K, увеличение '
-        'выделения ctrl+Shift+., умные переходы alt+стрелки, зум шрифта '
-        'ctrl+= / ctrl+- / ctrl+0.'
+        'Настройки применяются ко всем открытым редакторам сразу. '
+        'Область «Проект» — перекрытия для открытого проекта '
+        '(.pyqtp/settings.json), они старше настроек приложения; '
+        'область «Приложение» — общие настройки для всех проектов. '
+        'Остальное поведение по умолчанию: поиск ctrl+F, замена ctrl+H, '
+        'сворачивание ctrl+K, увеличение выделения ctrl+Shift+., умные '
+        'переходы alt+стрелки, зум шрифта ctrl+= / ctrl+- / ctrl+0.'
     )
 
     def __init__(self, doc_ctrl: DocumentManager) -> None:
@@ -98,9 +111,13 @@ class EditorSettingsPage(SettingsPage):
         assert self._font_size_spin is not None
         assert self._theme_combo is not None
 
-        # слой настроек приложения, а не эффективные значения: страница не
-        # должна копировать проектное перекрытие в настройки приложения (9.6B)
-        options = self._doc_ctrl.editor_ux_options_app()
+        if self.scope == SCOPE_PROJECT:
+            # эффективные значения: перекрытие проекта, а где его нет —
+            # слой приложения (иначе страница копировала бы перекрытие
+            # в настройки приложения — 9.6B)
+            options = self._doc_ctrl.editor_ux_options()
+        else:
+            options = self._doc_ctrl.editor_ux_options_app()
         self._minimap_check.setChecked(bool(options['minimap']))
         self._folding_check.setChecked(bool(options['folding']))
         self._wheel_zoom_check.setChecked(bool(options['mouse_wheel_zoom']))
@@ -125,8 +142,24 @@ class EditorSettingsPage(SettingsPage):
             'theme': str(self._theme_combo.currentData()),
         }
         # ValueError/TypeError уходит в окно настроек; источник не тронут
-        self._doc_ctrl.apply_editor_ux_options(options)
+        if self.scope == SCOPE_PROJECT:
+            # один проход: валидация всех ключей + одна запись файла
+            # + одно переприменение слоёв (project_settings_update)
+            self._project_ctrl().project_settings_update(
+                SECTION_EDITOR, options
+            )
+        else:
+            self._doc_ctrl.apply_editor_ux_options(options)
 
     def reset_defaults(self) -> None:
-        self._doc_ctrl.reset_editor_ux_options()
+        if self.scope == SCOPE_PROJECT:
+            # снимает секцию editor из перекрытий проекта
+            self._project_ctrl().project_settings_reset(SECTION_EDITOR)
+        else:
+            self._doc_ctrl.reset_editor_ux_options()
         self.load()
+
+    def _project_ctrl(self) -> ProjectControl:
+        # страница живёт в IDE: главное окно здесь всегда IdeMainWindow
+        # (cast — чтобы не тянуть рантайм-импорт и не ловить цикл)
+        return cast('IdeMainWindow', self.main_wnd).project_ctrl

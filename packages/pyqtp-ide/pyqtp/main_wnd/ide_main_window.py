@@ -10,6 +10,7 @@ from pyqtp.controls.project_control.project_settings import (
     KEY_THEME_NAME,
     SECTION_APPEARANCE,
 )
+from pyqtp.main_wnd.appearance_scope_page import AppearanceScopePage
 
 if TYPE_CHECKING:
     from pyqtp.base.docking_system.base_views_manager import ViewsManagerType
@@ -34,6 +35,10 @@ class IdeMainWindow(BaseMainWindow):
 
     def init_controls(self) -> None:
         super().init_controls()
+        # «Внешний вид» core — это страница только слоя приложения; в IDE
+        # та же клавиша/порядок у scope-aware подкласса (этап 9.6B2)
+        self.settings_page_unregister('appearance')
+        self.settings_page_register(AppearanceScopePage())
         self.lsp_hub = self.plug_register(LspHub())
         self.doc_ctrl = self.plug_register(DocumentManager())
         self.project_ctrl = self.plug_register(ProjectControl())

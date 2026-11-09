@@ -21,6 +21,8 @@ from pyqtp.utils.styles.style_value_editors import QssStringValueEditBehavior
 from pyqtp.utils.styles.styled_app import StyledApplication
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from pyqtp.controls.settings_control.settings_page import SettingsPage
 
 
@@ -54,6 +56,19 @@ class BaseMainWindow(PluggableMainWindow):
     def settings_page_unregister(self, key: str) -> None:
         """Снимает страницу настроек с регистрации."""
         self.settings_ctrl.page_unregister(key)
+
+    def settings_scope_register(
+        self,
+        key: str,
+        label: str,
+        is_available: Callable[[], bool] | None = None,
+    ) -> None:
+        """Объявляет область настроек для селектора окна (этап 9.6B)."""
+        self.settings_ctrl.scope_register(key, label, is_available)
+
+    def settings_scopes_refresh(self) -> None:
+        """Пересобирает селектор области открытого окна настроек."""
+        self.settings_ctrl.scopes_refresh()
 
     def setup(self) -> None:
         super().setup()

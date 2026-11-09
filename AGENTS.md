@@ -56,11 +56,12 @@ Verify in this order: **ruff → pyright → tests → run the app**.
    + stage-9.4 workspace/symbol (test_workspace_symbol.py: юниты разбора ответа/гейтов/`sample_file_for` без GUI + live hub с basedpyright + live offscreen диалог)
    + stage-9.5 project fileops (test_project_fileops.py: юниты fileops/file_rename без GUI + offscreen меню/обработчики с фейковым хабом + live basedpyright end-to-end rename)
    + stage-9.6 project session (test_project_session.py: юниты project_session без GUI + offscreen вкладки/сессия с фейковой вьюхой без WebEngine)
-   + stage-9.6B project settings (test_project_settings.py: юниты project_settings/coerce/merge без GUI + offscreen двухслойность темы/редактора/LSP с фейковым edit_widget-рекордером без WebEngine)). Markers `live`
+   + stage-9.6B project settings (test_project_settings.py: юниты project_settings/coerce/merge без GUI + offscreen двухслойность темы/редактора/LSP с фейковым edit_widget-рекордером без WebEngine)
+   + stage-9.6B2 settings scope selector (test_settings_scope.py: offscreen реестр областей/видимость строки «Область»/откат области при закрытии проекта + scope-aware apply/reset страниц «Редактор»/«Внешний вид»/«LSP» + пакетный project_settings_update, без WebEngine)). Markers `live`
   (real LSP server processes) and
-  `webengine` (real QWebEngineView/Monaco) are deselected by default via `addopts` → 147 passed / 34
+  `webengine` (real QWebEngineView/Monaco) are deselected by default via `addopts` → 156 passed / 34
   deselected; run them with `uv run pytest -m 'live or webengine'` (~2 min, they work offscreen) or
-  all 181 in one
+  all 190 in one
   process with `uv run pytest -m ''` (~2 min, full run keeps passing despite `os._exit` in
   `pytest_sessionfinish` eating the summary line — count the dots; NB the stage81
   document-symbols/document-highlight webengine tests are cold-start flaky under full-suite
@@ -358,9 +359,35 @@ Verify in this order: **ruff → pyright → tests → run the app**.
    (проект > приложение > дефолт, битый слой раскрывается в нижележащий),
    `registry_app_json()` для страницы, `registry_apply_json/reset` трогают
    только слой приложения, `registry_set_project_overlay(text|None)` — от
-   ProjectControl. Страницы настроек грузят СЛОЙ ПРИЛОЖЕНИЯ (`theme_app_name`/
-   `editor_ux_options_app`/`registry_app_json`) — 9.6B2 (селектор области в
-   окне) ещё нет. Запись строгая: `ProjectControl.project_settings_set/reset`
+   ProjectControl. Страницы настроек в области «Приложение» грузят СЛОЙ
+   ПРИЛОЖЕНИЯ (`theme_app_name`/`editor_ux_options_app`/`registry_app_json`).
+   Двухслойность видна и в GUI (9.6B2): реестр областей
+   `SettingsControl.scope_register(key, label, is_available)` +
+   `scope_options()`/`scopes_refresh()` — `'app'` («Приложение») регистрирует
+   ядро в `__init__`, `'project'` («Проект») — `ProjectControl.setup`
+   (доступность = корень открыт, пересборка селектора на
+   `project_root_changed`); фасады `settings_scope_register/
+   settings_scopes_refresh` на BaseMainWindow. У `SettingsPage` —
+   `scope_applicable` (окно показывает строку «Область» только для таких
+   страниц) и `scope`/`scope_set()` (константы `SCOPE_APP` в
+   `settings_page.py`, `SCOPE_PROJECT` в `project_control.py`); страница
+   сама смотрит на `self.scope` в `load/apply/reset_defaults`. В
+   `SettingsWindow` строка «Область: [QComboBox]» над стеком
+   (`_build_scope_row`), `_sync_scope_row` при выборе страницы и
+   `scopes_refresh()` (публичный хук) при смене доступности; если текущая
+   область страницы пропала (проект закрыли при открытом окне) — откат на
+   `'app'` + `page.load()`; программная пересборка комбика под флагом
+   `_scope_syncing` не грузит страницу. Scope-aware страницы на своих
+   местах (тот же key/order): «Редактор»/«LSP» в проектной области грузят
+   ЭФФЕКТИВные значения, apply пишет слой проекта (редактор — все 5 ключей
+   одним пакетом через новый `ProjectControl.project_settings_update(
+   section, values)` — валидация ВСЕХ ключей до записи, одна запись файла,
+   один emit), reset снимает секцию и сам зовёт `load()`; core-страницу
+   «Внешний вид» в IDE заменил `AppearanceScopePage`
+   (`main_wnd/appearance_scope_page.py`, та же key `appearance`/order 0,
+   регистрация через `settings_page_unregister('appearance')` +
+   `settings_page_register` в `IdeMainWindow.init_controls`): reset в
+   проектной области снимает оверлей темы, а не пишет «Светлая». Запись строгая: `ProjectControl.project_settings_set/reset`
    валидируют секцию/ключ/значение (`ValueError`/`TypeError`; `font_size`-не
    строка -> TypeError, вне диапазона -> ValueError), затем файл -> состояние
    -> `_apply_project_layers()` (тема override-или-откат -> broadcast опций ->

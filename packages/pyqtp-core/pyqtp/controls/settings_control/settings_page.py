@@ -7,6 +7,9 @@ if TYPE_CHECKING:
 
     from pyqtp.base.pluggable_main_window import PluggableMainWindow
 
+# ключ области настроек по умолчанию (слой приложения, QSettings)
+SCOPE_APP = 'app'
+
 
 class SettingsPage:
     """
@@ -32,15 +35,26 @@ class SettingsPage:
     Страницы мгновенного действия (меняющие настройки сразу в своих
     элементах управления) могут не реализовывать ``apply()``, тогда кнопка
     «Применить» на этой странице недоступна.
+
+    Страницы с ``scope_applicable = True`` работают в двух областях:
+    ``'app'`` (настройки приложения) и ``'project'`` (настройки открытого
+    проекта, см. ``SettingsControl.scope_register``). Такая страница в
+    ``load()``/``apply()``/``reset_defaults()`` сама смотрит на
+    ``self.scope`` и читает/пишет соответствующий слой.
     """
 
     title: ClassVar[str] = 'Настройка'
     order: ClassVar[int] = 0
+    # страница умеет переключать область (Приложение/Проект)? окно настроек
+    # показывает селектор области только для таких страниц
+    scope_applicable: ClassVar[bool] = False
 
     def __init__(self, key: str | None = None) -> None:
         self._key = key
         self._main_wnd: PluggableMainWindow | None = None
         self._widget: QWidget | None = None
+        # текущая область страницы ('app' — настройки приложения)
+        self._scope: str = SCOPE_APP
 
     @property
     def key(self) -> str:
@@ -81,6 +95,15 @@ class SettingsPage:
 
     def reset_defaults(self) -> None:
         """Сбрасывает настройки страницы к значениям по умолчанию."""
+
+    @property
+    def scope(self) -> str:
+        """Текущая область страницы ('app' — настройки приложения)."""
+        return self._scope
+
+    def scope_set(self, scope: str) -> None:
+        """Переключает область страницы (окно зовёт перед ``load()``)."""
+        self._scope = scope
 
     ###############################
     # Служебное API для окна настроек #

@@ -7,10 +7,13 @@ from PySide6.QtCore import Signal, Slot
 from PySide6.QtGui import QAction, QIcon, QKeySequence, Qt
 
 from pyqtp.controls.base_control import BaseControl
+from pyqtp.controls.settings_control.settings_page import SCOPE_APP
 from pyqtp.controls.settings_control.settings_window import SettingsWindow
 from pyqtp.utils.priority_menu import PriorityMenu
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from pyqtp.base.base_main_window import BaseMainWindow
     from pyqtp.controls.settings_control.settings_page import SettingsPage
 
@@ -29,6 +32,13 @@ class SettingsControl(BaseControl):
       - пункт меню «Настройки...» (Ctrl+,).
 
     Конкретные страницы регистрируют свои контролы-владельцы.
+
+    Реестр областей (этап 9.6B): ``scope_register`` объявляет области
+    настроек (``'app'`` — настройки приложения, ``'project'`` — настройки
+    открытого проекта). Видимые области собираются окном настроек через
+    ``scope_options()``; доступность области проверяется лениво callback'ом
+    (например, ``'project'`` доступен только с открытым проектом). Ядро
+    ничего не знает о проектах — области объявляет приложение (IDE).
     """
 
     _main_wnd: BaseMainWindow
@@ -39,6 +49,11 @@ class SettingsControl(BaseControl):
     def __init__(self) -> None:
         super().__init__()
         self._pages: dict[str, SettingsPage] = {}
+        # key -> (метка для селектора, ленивая проверка доступности)
+        self._scopes: dict[str, tuple[str, Callable[[], bool]]] = {}
+        # область приложения даёт само ядро; прочие (например 'project')
+        # объявляет приложение (IDE) через scope_register
+        self.scope_register(SCOPE_APP, 'Приложение')
         self._window: SettingsWindow | None = None
         self._settings_action: QAction | None = None
         self._settings_menu: PriorityMenu | None = None
@@ -77,6 +92,43 @@ class SettingsControl(BaseControl):
         """Страницы в порядке отображения (по ``order``, затем по key)."""
         return sorted(self._pages.values(), key=lambda p: (p.order, p.key))
 
+    ##############################
+    # API реестра областей настроек #
+    ##############################
+
+    def scope_register(
+        self,
+        key: str,
+        label: str,
+        is_available: Callable[[], bool] | None = None,
+    ) -> None:
+        """Объявляет область настроек (``label`` — текст селектора окна).
+
+        ``is_available`` — ленивая проверка доступности (например,
+        «проект открыт»); ``None`` — область доступна всегда. Порядок
+        регистраций — порядок отображения в селекторе.
+        """
+        if key in self._scopes:
+            error_message = f'settings scope "{key}" already registered!'
+            raise ValueError(error_message)
+        if is_available is None:
+            def _always_available() -> bool:
+                return True
+            is_available = _always_available
+        self._scopes[key] = (label, is_available)
+
+    def scope_options(self) -> list[tuple[str, str, bool]]:
+        """Области в порядке регистрации: ``(key, label, доступна)``."""
+        return [
+            (key, label, available())
+            for key, (label, available) in self._scopes.items()
+        ]
+
+    def scopes_refresh(self) -> None:
+        """Пересобирает селектор области открытого окна (смена доступности)."""
+        if self._window is not None:
+            self._window.scopes_refresh()
+
     #####################
     # API окна настроек #
     #####################
@@ -88,6 +140,8 @@ class SettingsControl(BaseControl):
         # Синхронизируем значения созданных страниц с актуальными
         # настройками (могли поменяться извне, например тема из уголков меню)
         self._window.sync_pages_values()
+        # и доступность областей (проект могли открыть/закрыть из консоли)
+        self._window.scopes_refresh()
         self._window.show()
         self._window.raise_()
         self._window.activateWindow()
