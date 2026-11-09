@@ -35,10 +35,12 @@ clone). Rebuild after cloning or touching `backend/` TS:
 
 Verify in this order: **ruff → pyright → tests → run the app**.
 
-- `uv run ruff check <path>` — configs live per package (`[tool.ruff]` in each package's pyproject).
-  **`fix = true` is set, so a plain `ruff check` rewrites files**; use `--no-fix` to only report.
-  Baseline failure is expected: 12 errors repo-wide (9 in the pyqtp packages, 3 in `qtmonaco`).
-  Ruff only lints `pyqtp/**/*.py` — `examples/` and `tests/` are not linted.
+- `uv run ruff check <path>` — configs live per package (`[tool.ruff]` in each pyqtp package's
+  pyproject: `include` is only `pyqtp/**/*.py`, so `examples/` and `tests/` are not linted;
+  `qtmonaco` has no ruff config). **`fix = true` is set, so a plain `ruff check` rewrites files**;
+  use `--no-fix` to only report. Baseline failure is expected: 13 errors repo-wide (9 in the pyqtp
+  packages, 3 in `qtmonaco` via ruff defaults, 1 in root `conftest.py`) — the root pyproject has no
+  `[tool.ruff]`, so `ruff check` from the repo root lints root-level files with ruff DEFAULT config.
 - `cd packages && uv run pyright` — uses `packages/pyrightconfig.json` (`venvPath: ".."`), so run it
   from `packages/`. Baseline: 18 pre-existing errors (stale `bcad.*` imports + missing `PySide6QtAds`).
   The `tests/` dirs sit inside the checked package dirs, so they must stay type-clean (helper modules
@@ -61,9 +63,9 @@ Verify in this order: **ruff → pyright → tests → run the app**.
    + stage-9.7 bookmarks (test_bookmarks.py: юниты чистого bookmarks.py без GUI + offscreen контрол/панель с фейк-редактором (gutter-сигнал, зеркало каретки, next/prev, панель) без WebEngine + 4 webengine-пробы: DOM-глифы `.pyqtp-bookmark-glyph`, смена модели, `_current_cursor`-зеркало, `_toggle_bookmark_request`→сигнал)). Markers `live`
   (real LSP server processes) and
   `webengine` (real QWebEngineView/Monaco) are deselected by default via `addopts` → 177 passed / 38
-  deselected; run them with `uv run pytest -m 'live or webengine'` (~2 min, they work offscreen) or
+  deselected; run them with `uv run pytest -m 'live or webengine'` (~3½ min, they work offscreen) or
   all 215 in one
-  process with `uv run pytest -m ''` (~2 min, full run keeps passing despite `os._exit` in
+  process with `uv run pytest -m ''` (~3½ min, full run keeps passing despite `os._exit` in
   `pytest_sessionfinish` eating the summary line — count the dots; NB the stage81
   document-symbols/document-highlight webengine tests are cold-start flaky under full-suite
   load — basedpyright answers `[]`/extra word-highlights while still indexing; re-run or run
@@ -659,6 +661,13 @@ Verify in this order: **ruff → pyright → tests → run the app**.
 
 ## Conventions
 
+- **ЖЁСТКИЙ ЗАПРЕТ НА VISION (обработку изображений)** — сессии в этом репозитории работают без
+  зрения: не читать и не анализировать изображения модели (PNG/JPEG/WebP/скриншоты, «визуальная»
+  проверка GUI через Read-картинку, сравнение скриншотов, генерация изображений — запрещены).
+  Любую проверку GUI/редактора делать программными пробами: `runJavaScript` со строковыми
+  маркерами, DOM-классы (`.pyqtp-bookmark-glyph`, `.monaco-editor-background`), computed-стили/цвета,
+  сигналы и состояния Qt, файлы на диске. Чтение текстовых файлов (в т.ч. `.svg` как XML,
+  стили, QSS) — НЕ vision, разрешено.
 - Перед `git commit`/`git push` — всегда спрашивать подтверждение пользователя
   (показать что коммитится/пушится и сообщение коммита, внести свои предложения
   по составу среза и сообщению); пользователь может
