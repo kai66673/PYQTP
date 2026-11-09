@@ -57,11 +57,12 @@ Verify in this order: **ruff → pyright → tests → run the app**.
    + stage-9.5 project fileops (test_project_fileops.py: юниты fileops/file_rename без GUI + offscreen меню/обработчики с фейковым хабом + live basedpyright end-to-end rename)
    + stage-9.6 project session (test_project_session.py: юниты project_session без GUI + offscreen вкладки/сессия с фейковой вьюхой без WebEngine)
    + stage-9.6B project settings (test_project_settings.py: юниты project_settings/coerce/merge без GUI + offscreen двухслойность темы/редактора/LSP с фейковым edit_widget-рекордером без WebEngine)
-   + stage-9.6B2 settings scope selector (test_settings_scope.py: offscreen реестр областей/видимость строки «Область»/откат области при закрытии проекта + scope-aware apply/reset страниц «Редактор»/«Внешний вид»/«LSP» + пакетный project_settings_update, без WebEngine)). Markers `live`
+   + stage-9.6B2 settings scope selector (test_settings_scope.py: offscreen реестр областей/видимость строки «Область»/откат области при закрытии проекта + scope-aware apply/reset страниц «Редактор»/«Внешний вид»/«LSP» + пакетный project_settings_update, без WebEngine)
+   + stage-9.7 bookmarks (test_bookmarks.py: юниты чистого bookmarks.py без GUI + offscreen контрол/панель с фейк-редактором (gutter-сигнал, зеркало каретки, next/prev, панель) без WebEngine + 4 webengine-пробы: DOM-глифы `.pyqtp-bookmark-glyph`, смена модели, `_current_cursor`-зеркало, `_toggle_bookmark_request`→сигнал)). Markers `live`
   (real LSP server processes) and
-  `webengine` (real QWebEngineView/Monaco) are deselected by default via `addopts` → 156 passed / 34
+  `webengine` (real QWebEngineView/Monaco) are deselected by default via `addopts` → 177 passed / 38
   deselected; run them with `uv run pytest -m 'live or webengine'` (~2 min, they work offscreen) or
-  all 190 in one
+  all 215 in one
   process with `uv run pytest -m ''` (~2 min, full run keeps passing despite `os._exit` in
   `pytest_sessionfinish` eating the summary line — count the dots; NB the stage81
   document-symbols/document-highlight webengine tests are cold-start flaky under full-suite
@@ -400,6 +401,50 @@ Verify in this order: **ruff → pyright → tests → run the app**.
    `options_calls`/`theme_calls`; у PySide6 6.6-стабов `findChild` НЕ generic —
    тип сужать `isinstance`, а не `is not None` (в core-тестах это не видно —
    там `wnd` без аннотации -> Any).
+   Закладки проекта (этап 9.7): чистый `controls/bookmark_control/bookmarks.py`
+   — формат `<root>/.pyqtp/bookmarks.json` = `{"bookmarks":[{"path","line"}]}`,
+   толерантный разбор, канонический порядок (path,line)+дедуп на записи,
+   атомарная запись, пустой набор снимает файл и пустой `.pyqtp/` (не трогая
+   `session.json`/`settings.json`); `filter_bookmarks` срезает записи
+   пропа́вших файлов (при открытии проекта срезка сразу уходит обратно в
+   файл), `toggle_bookmark`/`bookmarks_for`/`next_bookmark_line` (цикл).
+   Единый владелец состояния — `BookmarkControl` (`controls/bookmark_control/
+   bookmark_control.py`, регистрируется в `IdeMainWindow.init_controls` после
+   `ProjectControl`, `bookmark_ctrl`): файл пишется сразу при каждом
+   изменении (`toggle_at`/`remove_at`/`clear_project_bookmarks`; отказы — нет
+   проекта / вне корня / файла нет), закладки живут вместе с проектом
+   (`project_root_changed` -> `_on_root`; закрытие проекта файл на диске НЕ
+   трогает); меню «Закладки» (PriorityMenu priority=-7) — toggle Ctrl+Alt+L /
+   next Ctrl+Alt+K / prev Ctrl+Alt+J (связки VS Code); каретка для
+   toggle/next/prev берётся из python-зеркала `edit_widget.current_cursor`
+   (это property у `qtmonaco.Monaco`), переход — `set_cursor(...,
+   move_to_position='center')`; console-API `bookmarks_show`; логгер
+   `bcad.book` (группа «Проект»). Панель `BookmarksView`
+   (`views/bookmarks_view.py`, `widget_area='right'`) пассивная: только
+   `set_bookmarks(root, items)`, намерения наружу (`navigate_requested` в
+   форме payload `open_definition_uri`, `remove_requested`,
+   `clear_all_requested`; Delete по child-элементам, заголовки файлов —
+   нет). Раздача строк редакторам: `_wire_doc_view` на `document_opened`
+   пушит строки своего файла и один раз вешает `edit_widget.
+   bookmark_toggle_requested -> toggle_at` (флаг `_pyqtp_bookmark_wired` на
+   объекте вьюхи, как `_pyqtp_close_filter` у доков; `MonacoDocumentView` не
+   трогали — и бы двойное переключение); любое изменение набора —
+   `_apply_new_bookmarks` -> панель + broadcast ВСЕМ открытым документам
+   проекта (дешево и всегда согласно). Порядок при смене корня (принят и
+   закреплен тестами): сессия (9.6) поднимает вкладки раньше — первой им
+   приходит пустая раздача, финальные строки доносит `_on_root` broadcast.
+   JS-сторона (vendored-patch `main.ts`+`style.css`): свой `bookmarkCollection`
+   (отдельно от `decorationsCollection` из `highlight_lines`), глиф
+   `.pyqtp-bookmark-glyph` + подсветка строки, bridge-случай `set_bookmarks`
+   (raw list, буферизуется коннектором), переприменение в `setActiveEditor` и
+   во всех трёх ветвях `set_text`, отсечка строк за концом текста; клик по
+   дорожке (`GUTTER_LINE_DECORATIONS`) -> `_toggle_bookmark_request {line}`
+   -> Python `QtMonacoEditorWidget.bookmark_toggle_requested` (отсев bool /
+   line<1); плюс `_current_cursor`-эхо на каждом `onDidChangeCursorPosition`
+   (апстрим обновлял зеркало только echo-`set_cursor` — реальная каретка была
+   не видна). В offscreen-тестах фейк-редактор обязан давать
+   `bookmark_toggle_requested` (Signal(int)), `set_bookmarks`-рекордер,
+   `set_cursor`-рекордер и атрибут `current_cursor` (dict).
 
 ## Runtime gotchas
 
@@ -594,6 +639,17 @@ Verify in this order: **ruff → pyright → tests → run the app**.
   a single STRING in Monaco but LSP wants `string[]` (basedpyright crashed on
   `.some()`), and cold-start codeAction fetches racing diagnostics make
   basedpyright error «parserOutput» (harmless, provider catches it).
+  stage 9.7 bookmarks (`main.ts` + `style.css`) — separate `bookmarkCollection`
+  (upstream `decorationsCollection` stays owned by `highlight_lines`),
+  `applyBookmarks()`/`setBookmarks()` + bridge case `set_bookmarks` (raw list
+  payload, buffered by the Connector) and `window.qtmonaco.bookmarkLines`;
+  glyphs re-applied in `setActiveEditor` and all three `set_text` branches,
+  lines past the model end are dropped; gutter clicks via
+  `GUTTER_LINE_DECORATIONS` (`onLineDecorationClicked`) send
+  `_toggle_bookmark_request {line}` to Python; cursor echo — `_current_cursor`
+  is sent on EVERY `onDidChangeCursorPosition` (upstream mirrored it only on
+  the `set_cursor` echo, so the real caret was invisible to Python); CSS
+  classes `.pyqtp-bookmark-glyph` (#e5a64b) + `.pyqtp-bookmark-line`.
   python patch in `monaco.py` —
   `Monaco.__init__` takes an `lsp_host` param and no longer eagerly spawns
   `get_pylsp_host()` (lazy `_resolve_lsp_host()` fallback keeps standalone

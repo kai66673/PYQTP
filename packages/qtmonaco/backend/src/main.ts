@@ -49,6 +49,13 @@ let contentChangeDisposable: monaco.IDisposable | null = null;
 // vendored-patch (этап 7): слушатель каретки для истории переходов
 let cursorChangeDisposable: monaco.IDisposable | null = null;
 
+// vendored-patch (этап 9.7, закладки): отдельная decorations-коллекция закладок —
+// не смешиваем с апстримной decorationsCollection (её использует highlight_lines);
+// клик по дорожке закладок в gutter — запрос переключения на python-сторону
+let bookmarkCollection: monaco.editor.IEditorDecorationsCollection | null = null;
+let bookmarkLines: number[] = [];
+let gutterClickDisposable: monaco.IDisposable | null = null;
+
 (window as any).qtmonaco = {
   editor: editor,
   diffEditor: diffEditor,
@@ -107,6 +114,47 @@ monaco.editor.registerCommand("qtmonaco.lsp.applyForeignEdit", (_accessor: unkno
 // разбору WorkspaceEdit (зонд stage82 split в тестах)
 Object.defineProperty(qtmonaco, "lspManager", { get: () => lspManager });
 qtmonaco.splitWorkspaceEdit = splitWorkspaceEdit;
+
+// vendored-patch (этап 9.7, закладки): рисование закладок decorations'ами Monaco.
+// Состояние живёт на python-стороне (.pyqtp/bookmarks.json), сюда приходят только
+// номера строк текущего документа. Коллекция своя: апстримная decorationsCollection
+// занята highlight_lines; decorations гибнут вместе с моделью/редактором — поэтому
+// переприменение после каждой смены модели, подмены текста и пересоздания редактора.
+function applyBookmarks() {
+  const model = editor.getModel();
+  const decorations: monaco.editor.IModelDeltaDecoration[] = [];
+  if (model) {
+    const total = model.getLineCount();
+    for (const line of bookmarkLines) {
+      if (line >= 1 && line <= total) {
+        decorations.push({
+          range: new monaco.Range(line, 1, line, 1),
+          options: {
+            isWholeLine: true,
+            className: "pyqtp-bookmark-line",
+            linesDecorationsClassName: "pyqtp-bookmark-glyph",
+          },
+        });
+      }
+    }
+  }
+  if (bookmarkCollection) {
+    bookmarkCollection.set(decorations);
+  } else {
+    bookmarkCollection = editor.createDecorationsCollection(decorations);
+  }
+}
+
+function setBookmarks(lines: unknown) {
+  bookmarkLines = Array.isArray(lines)
+    ? lines.filter((line) => Number.isInteger(line) && line >= 1)
+    : [];
+  applyBookmarks();
+}
+
+// для live-тестов/отладки: установка закладок и чтение текущего набора строк
+qtmonaco.setBookmarks = setBookmarks;
+Object.defineProperty(qtmonaco, "bookmarkLines", { get: () => bookmarkLines });
 
 let decorationsCollection: monaco.editor.IEditorDecorationsCollection | null = null;
 
@@ -202,7 +250,34 @@ function attachEditorListeners(target: monaco.editor.IStandaloneCodeEditor) {
     }
   });
   // запись крупных прыжков каретки в историю переходов (этап 7)
-  cursorChangeDisposable = target.onDidChangeCursorPosition(onNavCursorPositionChanged);
+  cursorChangeDisposable = target.onDidChangeCursorPosition((e) => {
+    onNavCursorPositionChanged(e);
+    // vendored-patch (этап 9.7, закладки): зеркалим каретку в python — штатное
+    // зеркало _current_cursor у qtmonaco обновляется только на эхо set_cursor,
+    // а переключению закладки и переходам next/prev нужна реальная строка
+    sendToPython("_current_cursor", {
+      line: e.position.lineNumber,
+      column: e.position.column,
+    });
+  });
+  // vendored-patch (этап 9.7, закладки): клик по дорожке закладок (справа от
+  // номеров строк) — запрос переключения; состояние на python, он пришлёт строки
+  gutterClickDisposable = target.onMouseDown((e) => {
+    if (e.target.type !== monaco.editor.MouseTargetType.GUTTER_LINE_DECORATIONS) {
+      return;
+    }
+    const line = e.target.position ? e.target.position.lineNumber : undefined;
+    if (line) {
+      sendToPython("_toggle_bookmark_request", { line });
+    }
+  });
+}
+
+function disposeBookmarkListener() {
+  if (gutterClickDisposable) {
+    gutterClickDisposable.dispose();
+    gutterClickDisposable = null;
+  }
 }
 
 function setActiveEditor(newEditor: monaco.editor.IStandaloneCodeEditor) {
@@ -216,10 +291,13 @@ function setActiveEditor(newEditor: monaco.editor.IStandaloneCodeEditor) {
   resetNavHistory();
   clearPendingCursor(); // vendored-patch (этап 6): pending reveal старого редактора не нужен
   decorationsCollection = null;
+  bookmarkCollection = null; // vendored-patch (этап 9.7): коллекция привязана к редактору
+  disposeBookmarkListener(); // vendored-patch (этап 9.7): слушатель тоже привязан к редактору
   editor = newEditor;
   qtmonaco.editor = editor;
   attachEditorListeners(editor);
   seedNavHistory();
+  applyBookmarks(); // vendored-patch (этап 9.7): закладки переприменяем к новому редактору
 }
 
 function switchToStandaloneEditor() {
@@ -568,6 +646,7 @@ function updateFromPython(name: string, value: string) {
           lspManager?.setModel(new_model); // vendored-patch: LSP должен знать текущую модель
           resetNavHistory(); // vendored-patch (этап 7): позиции старой модели неактуальны
           seedNavHistory(); // vendored-patch (этап 7): старт истории от новой позиции
+          applyBookmarks(); // vendored-patch (этап 9.7): decorations с model'ю сбрасываются
           sendToPython("_current_uri", new_model.uri.toString());
           break;
         }
@@ -586,6 +665,7 @@ function updateFromPython(name: string, value: string) {
         // модели неактуальны, историю отсчитываем от текущего курсора
         resetNavHistory();
         seedNavHistory();
+        applyBookmarks(); // vendored-patch (этап 9.7): строки за пределами нового текста — в мусор
         break;
       } else {
         // If no model exists, create a new one
@@ -597,6 +677,7 @@ function updateFromPython(name: string, value: string) {
         lspManager?.setModel(new_model); // vendored-patch: LSP должен знать текущую модель
         resetNavHistory(); // vendored-patch (этап 7): новая модель — новая история переходов
         seedNavHistory(); // vendored-patch (этап 7): старт истории от текущей позиции
+        applyBookmarks(); // vendored-patch (этап 9.7): закладки на новую модель
         sendToPython("_current_uri", new_model.uri.toString());
         break;
       }
@@ -733,6 +814,11 @@ function updateFromPython(name: string, value: string) {
       if (decorationsCollection) {
         decorationsCollection.clear(); // Clear all decorations
       }
+      break;
+    case "set_bookmarks":
+      // vendored-patch (этап 9.7, закладки): номера строк-закладок текущего
+      // документа (состояние хранит python, сюда приходит только список строк)
+      setBookmarks(data);
       break;
     case "delete_line": {
       // Delete a specific line in the editor

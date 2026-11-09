@@ -38,6 +38,8 @@ class QtMonacoEditorWidget(Monaco):
     # этап 8.2: чужая (по текущей модели) часть LSP WorkspaceEdit
     # (rename/quickfix затронул другие файлы)
     workspace_edit_requested = Signal(dict)
+    # этап 9.7: клик по дорожке закладок в gutter — переключение строки ``line``
+    bookmark_toggle_requested = Signal(int)
 
     def __init__(
         self, file_path: Path, /, *, lsp_host: str | list[dict] | None = None
@@ -116,6 +118,31 @@ class QtMonacoEditorWidget(Monaco):
             med_log.warning('Monaco прислал workspace edit без workspaceEdit: %r', value)
             return
         self.workspace_edit_requested.emit(value)
+
+    def set_bookmarks(self, lines: list[int]) -> None:
+        """Прислать в Monaco номера строк-закладок этого документа (этап 9.7).
+
+        Состояние (набор закладок проекта) живёт на python-стороне в
+        ``.pyqtp/bookmarks.json``; редактору сообщаются только строки его
+        файла — JS-сторона перекрашивает дорожку в gutter (своя
+        decorations-коллекция, см. ``applyBookmarks`` в main.ts). Сообщение
+        буферизуется ``Connector`` до инициализации моста — можно слать сразу
+        после создания виджета.
+        """
+        self._connector.send('set_bookmarks', sorted({int(line) for line in lines}))
+
+    def _toggle_bookmark_request(self, value: dict) -> None:
+        """Обработчик ``_toggle_bookmark_request`` из JS-стороны (этап 9.7).
+
+        Клик по дорожке закладок (справа от номеров строк) в gutter Monaco;
+        сам редактор состояние не ведёт — прокидываем намерение наверх через
+        ``bookmark_toggle_requested`` (см. ``BookmarkControl.toggle_at``).
+        """
+        line = value.get('line') if isinstance(value, dict) else None
+        if not isinstance(line, int) or isinstance(line, bool) or line < 1:
+            med_log.warning('Monaco прислал запрос переключения закладки без строки: %r', value)
+            return
+        self.bookmark_toggle_requested.emit(line)
 
     def apply_lsp_text_edits(self, uri: str, edits: list[dict]) -> None:
         """Применить TextEdit'ы к модели этого редактора (этап 8.2).

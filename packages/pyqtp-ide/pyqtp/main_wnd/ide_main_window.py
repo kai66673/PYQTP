@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from pyqtp.base.base_main_window import BaseMainWindow
+from pyqtp.controls.bookmark_control.bookmark_control import BookmarkControl
 from pyqtp.controls.doc_control.document_manager import DocumentManager
 from pyqtp.controls.lsp_control.lsp_hub import LspHub
 from pyqtp.controls.project_control.project_control import ProjectControl
@@ -20,6 +21,7 @@ class IdeMainWindow(BaseMainWindow):
     doc_ctrl: DocumentManager
     lsp_hub: LspHub
     project_ctrl: ProjectControl
+    bookmark_ctrl: BookmarkControl
 
     @staticmethod
     def dbus_iface_name() -> str:
@@ -42,6 +44,8 @@ class IdeMainWindow(BaseMainWindow):
         self.lsp_hub = self.plug_register(LspHub())
         self.doc_ctrl = self.plug_register(DocumentManager())
         self.project_ctrl = self.plug_register(ProjectControl())
+        # закладки (этап 9.7) — после проекта: его корень определяет, живы ли закладки
+        self.bookmark_ctrl = self.plug_register(BookmarkControl())
 
     #############################################
     # Тема: два слоя (этап 9.6B, см. ThemeMainWindow) #

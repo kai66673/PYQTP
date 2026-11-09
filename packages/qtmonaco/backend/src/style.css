@@ -24,3 +24,15 @@ body {
   width: 5px !important;
   margin-left: 3px;
 }
+
+/* vendored-patch (этап 9.7, закладки): метка в дорожке справа от номеров строк
+   + лёгкая подсветка всей строки (полупрозрачная — не перекрывает выделения) */
+.pyqtp-bookmark-glyph {
+  background-color: #e5a64b;
+  width: 5px !important;
+  margin-left: 3px;
+}
+
+.pyqtp-bookmark-line {
+  background-color: rgba(229, 166, 75, 0.12);
+}
