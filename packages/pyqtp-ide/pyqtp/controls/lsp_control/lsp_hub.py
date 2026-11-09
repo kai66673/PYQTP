@@ -36,7 +36,7 @@ import json
 import logging
 import os
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import quote, unquote, urlparse
@@ -63,6 +63,10 @@ from pyqtp.controls.lsp_control.lsp_settings_page import (
 from pyqtp.controls.lsp_control.workspace_symbol import (
     parse_workspace_symbols,
     spec_supports_workspace_symbol,
+)
+from pyqtp.controls.problems_control.problems import (
+    Problem,
+    diagnostics_from_publish,
 )
 
 if TYPE_CHECKING:
@@ -234,6 +238,19 @@ class _ClientConnection:
     opened_uris: set[str] = field(default_factory=set)
 
 
+@dataclass
+class DiagHooks:
+    """Крюки стора диагностик хаба для экземпляра сервера (этап 10.1).
+
+    Оба колбэка вызываются из потока event-loop хаба: ``publish`` пишет
+    очередной ``publishDiagnostics`` сервера в стор, ``purge`` снимает весь
+    вклад сервера (смерть процесса).
+    """
+
+    publish: Callable[[str, str, tuple[Problem, ...]], None]
+    purge: Callable[[str], None]
+
+
 class _ServerInstance:
     """Экземпляр LSP-процесса и подключения редакторов к нему."""
 
@@ -243,10 +260,13 @@ class _ServerInstance:
         spec: ServerSpec,
         root_uri: str,
         command: list[str],
+        diag: DiagHooks | None = None,
     ) -> None:
         self.key = key
         self.spec = spec
         self.root_uri = root_uri
+        # этап 10.1: стор диагностик хаба (публикация/снимание вклада сервера)
+        self.diag = diag
         self.proc = StdioLspProcess(
             command, Path(unquote(urlparse(root_uri).path))
         )
@@ -402,6 +422,14 @@ class _ServerInstance:
         if method in BROADCAST_NOTIFICATIONS:
             text = json.dumps(msg)
             params = msg.get('params') or {}
+            if (method == 'textDocument/publishDiagnostics'
+                    and self.diag is not None):
+                # этап 10.1: тот же payload — в python-стор хаба (панель
+                # «Проблемы»); пустой список снимает вклад этого сервера;
+                # не-файловые uri парсер отсекает
+                uri, problems = diagnostics_from_publish(params, self.spec.name)
+                if uri:
+                    self.diag.publish(self.spec.name, uri, tuple(problems))
             srv_log.info(
                 '%s: broadcast %s %s (%s шт.)', self.spec.name, method,
                 params.get('uri'), len(params.get('diagnostics', [])),
@@ -472,6 +500,10 @@ class _ServerInstance:
             self.pending.pop(mid, None)
             with contextlib.suppress(ConnectionClosed):
                 await conn.ws.send(json.dumps({**error_response, 'id': original}))
+        if self.diag is not None:
+            # этап 10.1: диагностики мёртвого сервера протухли — снимаем его
+            # вклад (панель не должна показывать призраков)
+            self.diag.purge(self.spec.name)
 
 
 class LspHub(BaseControl):
@@ -501,6 +533,14 @@ class LspHub(BaseControl):
         # root_uri -> [(spec, sample_uri)] (сбрасывается при смене реестра)
         self._wsym_gen = 0
         self._wsym_samples: dict[str, list[tuple[ServerSpec, str]]] = {}
+        # стор диагностик (этап 10.1): последние publishDiagnostics каждого
+        # сервера по каждому uri — ключ (uri, имя сервера), как owner маркеров
+        # Monaco (basedpyright и ruff публикуют в один uri независимо). Пустой
+        # список — снять ключ («файл чист»). Пишется из потока event-loop
+        # хаба; читается/подписывается из GUI-потока под тем же замком.
+        self._diag_lock = threading.Lock()
+        self._diag_store: dict[tuple[str, str], tuple[Problem, ...]] = {}
+        self._diag_observers: list[Callable[[], None]] = []
 
     ###############################
     # Жизненный цикл контрола #
@@ -655,6 +695,76 @@ class LspHub(BaseControl):
         self._registry_project_json = text
         self._reapply_effective_registry()
 
+    ##################################
+    # Стор диагностик (этап 10.1) #
+
+    def add_diagnostics_observer(self, cb: Callable[[], None]) -> None:
+        """Подписка на изменения стора диагностик.
+
+        ``cb`` вызывается ИЗ ПОТОКА event-loop хаба (GUI-стороне цеплять
+        свой queued-мост, паттерн ``_ScanSignals``); дубликат не добавляет.
+        """
+        with self._diag_lock:
+            if cb not in self._diag_observers:
+                self._diag_observers.append(cb)
+
+    def remove_diagnostics_observer(self, cb: Callable[[], None]) -> None:
+        """Снимает подписку (несуществующая — молча)."""
+        with self._diag_lock:
+            if cb in self._diag_observers:
+                self._diag_observers.remove(cb)
+
+    def diagnostics_snapshot(self) -> dict[str, list[Problem]]:
+        """Последние диагностики: uri -> слитые проблемы всех серверов.
+
+        Списки отсортированы (строка, колонка, ...); «чистых» файлов в
+        снимке нет — пустой вклад ключа снимается при публикации.
+        """
+        with self._diag_lock:
+            merged: dict[str, list[Problem]] = {}
+            for (uri, _owner), problems in self._diag_store.items():
+                merged.setdefault(uri, []).extend(problems)
+        for items in merged.values():
+            items.sort()
+        return merged
+
+    def _record_diagnostics(
+        self, owner: str, uri: str, problems: tuple[Problem, ...]
+    ) -> None:
+        """Запись очередной публикации сервера (поток event-loop хаба).
+
+        ``owner`` проставляется каждой проблеме — панель и статус-бар должны
+        видеть, какой сервер опубликовал диагностику (basedpyright и ruff
+        публикуют в один uri независимо).
+        """
+        if not uri:
+            return
+        with self._diag_lock:
+            if problems:
+                self._diag_store[(uri, owner)] = tuple(
+                    p if p.owner == owner else replace(p, owner=owner)
+                    for p in problems
+                )
+            else:
+                self._diag_store.pop((uri, owner), None)
+        self._notify_diag_observers()
+
+    def _drop_diagnostics_of(self, owner: str) -> None:
+        """Снимает весь вклад сервера (смерть процесса, поток event-loop)."""
+        with self._diag_lock:
+            stale = [key for key in self._diag_store if key[1] == owner]
+            for key in stale:
+                del self._diag_store[key]
+        if stale:
+            self._notify_diag_observers()
+
+    def _notify_diag_observers(self) -> None:
+        with self._diag_lock:
+            observers = list(self._diag_observers)
+        for cb in observers:
+            with contextlib.suppress(Exception):
+                cb()
+
     def ws_host_for(self, file_uri: str) -> str:
         """Хост+путь для WebSocket-подключения к хабу по uri файла (первый
         сервер реестра, без имени — для старых одиночных клиентов).
@@ -775,6 +885,13 @@ class LspHub(BaseControl):
             srv_log.warning('Поток LSP hub не завершился корректно')
         self._thread = None
         self._port = None
+        # этап 10.1: процессов серверов больше нет — стор диагностик гасим
+        # вместе с хабом, чтобы в панели не оставалось призраков
+        with self._diag_lock:
+            had_diags = bool(self._diag_store)
+            self._diag_store.clear()
+        if had_diags:
+            self._notify_diag_observers()
 
     ###############################
     # Внутренности: отдельный asyncio-поток #
@@ -922,7 +1039,16 @@ class LspHub(BaseControl):
         if command is None:
             msg = f'LSP-сервер не найден: {spec.command[0]}'
             raise RuntimeError(msg)
-        inst = _ServerInstance(key, spec, root_uri, command)
+        inst = _ServerInstance(
+            key,
+            spec,
+            root_uri,
+            command,
+            diag=DiagHooks(
+                publish=self._record_diagnostics,
+                purge=self._drop_diagnostics_of,
+            ),
+        )
         self._instances[key] = inst
         try:
             await inst.start()

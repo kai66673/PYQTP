@@ -61,10 +61,11 @@ Verify in this order: **ruff → pyright → tests → run the app**.
    + stage-9.6B project settings (test_project_settings.py: юниты project_settings/coerce/merge без GUI + offscreen двухслойность темы/редактора/LSP с фейковым edit_widget-рекордером без WebEngine)
    + stage-9.6B2 settings scope selector (test_settings_scope.py: offscreen реестр областей/видимость строки «Область»/откат области при закрытии проекта + scope-aware apply/reset страниц «Редактор»/«Внешний вид»/«LSP» + пакетный project_settings_update, без WebEngine)
    + stage-9.7 bookmarks (test_bookmarks.py: юниты чистого bookmarks.py без GUI + offscreen контрол/панель с фейк-редактором (gutter-сигнал, зеркало каретки, next/prev, панель) без WebEngine + 4 webengine-пробы: DOM-глифы `.pyqtp-bookmark-glyph`, смена модели, `_current_cursor`-зеркало, `_toggle_bookmark_request`→сигнал)). Markers `live`
+   + stage-10.1 problems (test_lsp_hub_store.py: юниты чистого problems.py + python-stора диагностик LspHub без процессов + 3 live: детерминированный фейковый LSP-сервер `python <скрипт>` через реестр с ws-клиентом и publishDiagnostics, плюс live basedpyright skipif; test_problems_panel.py: offscreen панель «Проблемы» с фейк-документами из харнеса test_bookmarks — переиспользование импортом, для этого `pyqtp-ide/tests` в extraPaths pyrightconfig)
   (real LSP server processes) and
-  `webengine` (real QWebEngineView/Monaco) are deselected by default via `addopts` → 177 passed / 38
+  `webengine` (real QWebEngineView/Monaco) are deselected by default via `addopts` → 195 passed / 41
   deselected; run them with `uv run pytest -m 'live or webengine'` (~3½ min, they work offscreen) or
-  all 215 in one
+  all 236 in one
   process with `uv run pytest -m ''` (~3½ min, full run keeps passing despite `os._exit` in
   `pytest_sessionfinish` eating the summary line — count the dots; NB the stage81
   document-symbols/document-highlight webengine tests are cold-start flaky under full-suite
@@ -447,6 +448,28 @@ Verify in this order: **ruff → pyright → tests → run the app**.
    не видна). В offscreen-тестах фейк-редактор обязан давать
    `bookmark_toggle_requested` (Signal(int)), `set_bookmarks`-рекордер,
    `set_cursor`-рекордер и атрибут `current_cursor` (dict).
+   Панель «Проблемы» (этап 10.1): агрегация — на python-стороне хаба, НЕ
+   чтением модели маркеров Monaco из JS (хаб видит весь `publishDiagnostics`;
+   без вендорного TS-патча; проблемы живут и для закрытых документов). Чистый
+   `controls/problems_control/problems.py` — frozen `Problem` (Monaco 1-based:
+   LSP +1, `lsp_header` в живом IDE не вызывается), толерантный
+   `diagnostics_from_publish` (нет `severity` = Ошибка, `code` int -> str,
+   не-файловые uri -> `('', [])`), подписи серьёзности. Стор `LspHub`:
+   `dict[(uri, server_name)] -> tuple[Problem, ...]` под `_diag_lock` +
+   `add/remove_diagnostics_observer` + `diagnostics_snapshot()` (слитые по uri
+   списки); сервер пишет через `DiagHooks(publish,purge)` из своего loop-потока
+   (пустой список снимает пару, смерть процесса — весь вклад сервера, `shutdown()`
+   — весь стор с оповещением); `owner` проставляется в сторе через
+   `dataclasses.replace`. `ProblemsControl` (после `bookmark_ctrl`) —
+   queued-мост `_DiagSignals` в GUI + обновление на `project_root_changed`;
+   вьюха `views/problems_view.py` (`widget_area='bottom'`): двойной клик ->
+   payload `{'uri','range':{'startLineNumber','startColumn'}}` ->
+   `open_definition_uri`; console-API `problems_show`; экшены/F8/статус-бар —
+   10.2. В live-тестах stора — детерминированный фейковый LSP-сервер
+   (`python <скрипт>` в реестре) + ws-клиент `websockets.sync.client.connect
+   (f'ws://{hub.ws_hosts_for(uri)[N]}')` (хост от хаба БЕЗ схемы `ws://`);
+   GUI-тесты панели переиспользуют фейк-документы `test_bookmarks` импортом
+   (тесты одного каталога — соседство в sys.path pytest).
 
 ## Runtime gotchas
 

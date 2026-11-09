@@ -25,6 +25,7 @@
         "pyqtp-common",
         "pyqtp-core",
         "pyqtp-ide",
+        "pyqtp-ide/tests",
       ]
     }
   ]
