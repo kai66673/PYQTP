@@ -6,6 +6,7 @@ from pyqtp.base.base_main_window import BaseMainWindow
 from pyqtp.controls.bookmark_control.bookmark_control import BookmarkControl
 from pyqtp.controls.doc_control.document_manager import DocumentManager
 from pyqtp.controls.lsp_control.lsp_hub import LspHub
+from pyqtp.controls.lsp_control.lsp_monitor_control import LspMonitorControl
 from pyqtp.controls.problems_control.problems_control import ProblemsControl
 from pyqtp.controls.project_control.project_control import ProjectControl
 from pyqtp.controls.project_control.project_settings import (
@@ -24,6 +25,7 @@ class IdeMainWindow(BaseMainWindow):
     project_ctrl: ProjectControl
     bookmark_ctrl: BookmarkControl
     problems_ctrl: ProblemsControl
+    lsp_monitor_ctrl: LspMonitorControl
 
     @staticmethod
     def dbus_iface_name() -> str:
@@ -50,6 +52,8 @@ class IdeMainWindow(BaseMainWindow):
         self.bookmark_ctrl = self.plug_register(BookmarkControl())
         # панель «Проблемы» (этап 10.1) — агрегирует стор диагностик хаба
         self.problems_ctrl = self.plug_register(ProblemsControl())
+        # «Монитор LSP» (этап 10.3) — кольцо трафика того же хаба
+        self.lsp_monitor_ctrl = self.plug_register(LspMonitorControl())
 
     #############################################
     # Тема: два слоя (этап 9.6B, см. ThemeMainWindow) #

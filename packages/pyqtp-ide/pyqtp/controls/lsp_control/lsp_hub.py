@@ -51,6 +51,21 @@ from pyqtp.controls.lsp_control.file_rename import (
     rename_files_params,
     supports_will_rename,
 )
+from pyqtp.controls.lsp_control.lsp_monitor import (
+    KIND_HUB_REPLY,
+    TrafficEvent,
+    TrafficRecord,
+    TrafficRing,
+    ev_client_request,
+    ev_from_server,
+    ev_hub_error,
+    ev_hub_reply_to_client,
+    ev_hub_reply_to_server,
+    ev_notification_to,
+    ev_request,
+    summarize_error,
+    summarize_result,
+)
 from pyqtp.controls.lsp_control.lsp_process_wrapper import StdioLspProcess
 from pyqtp.controls.lsp_control.lsp_registry import (
     LspRegistry,
@@ -240,18 +255,20 @@ class _ClientConnection:
 
 @dataclass
 class DiagHooks:
-    """Крюки сторов хаба (диагностики + состояния) для экземпляра сервера.
+    """Крюки сторов хаба (диагностики + состояния + трафик) для экземпляра.
 
     Все колбэки вызываются из потока event-loop хаба: ``publish`` пишет
     очередной ``publishDiagnostics`` сервера в стор, ``purge`` снимает весь
     вклад сервера (смерть процесса), ``state_gone`` (этап 10.2) снимает
     состояние инстанса из стора состояний — индикатор статус-бара не должен
-    показывать «готов» у мёртвого процесса.
+    показывать «готов» у мёртвого процесса, ``traffic`` (этап 10.3) пишет
+    строку монитора LSP (кольцо трафика).
     """
 
     publish: Callable[[str, str, tuple[Problem, ...]], None]
     purge: Callable[[str], None]
     state_gone: Callable[[tuple[str, str]], None] | None = None
+    traffic: Callable[[TrafficEvent], None] | None = None
 
 
 # состояния инстансов LSP-процессов для индикатора статус-бара (этап 10.2)
@@ -281,8 +298,9 @@ class _ServerInstance:
         )
         self.init_result: dict[str, Any] = {}
         self.clients: list[_ClientConnection] = []
-        # new_id -> (client, original_id): маршрутизация ответов сервера
-        self.pending: dict[str, tuple[_ClientConnection, Any]] = {}
+        # new_id -> (client, original_id, method): маршрутизация ответов сервера
+        # (метод — чтобы строка ответа в мониторе этапа 10.3 была подписана)
+        self.pending: dict[str, tuple[_ClientConnection, Any, str]] = {}
         self.dying = False
         self._local_futures: dict[str, asyncio.Future[dict]] = {}
         self._id_seq = itertools.count(1)
@@ -297,6 +315,11 @@ class _ServerInstance:
         # пустые ответы не должны «съедать» общий бюджет — второй ждёт чужой
         # прогрев и переспрашивает сам (гонка из test_live_workspace_symbols_cb)
         self.cold_inflight: set[str] = set()
+
+    def _traffic(self, ev: TrafficEvent) -> None:
+        """Строка монитора LSP (этап 10.3): подставляем имя сервера, зовём хук."""
+        if self.diag is not None and self.diag.traffic is not None:
+            self.diag.traffic(replace(ev, server=self.spec.name))
 
     async def start(self) -> None:
         try:
@@ -323,6 +346,7 @@ class _ServerInstance:
         await self.proc.send(
             {'jsonrpc': '2.0', 'method': 'initialized', 'params': {}}
         )
+        self._traffic(ev_notification_to(self.spec.name, 'initialized', {}))
         srv_log.info(
             'LSP-сервер %s готов (root=%s)', self.spec.name, self.root_uri
         )
@@ -338,6 +362,11 @@ class _ServerInstance:
                     'method': 'textDocument/didClose',
                     'params': {'textDocument': {'uri': uri}},
                 })
+                # этап 10.3: корректное гашение процессов видно в мониторе
+                self._traffic(ev_notification_to(
+                    self.spec.name, 'textDocument/didClose',
+                    {'textDocument': {'uri': uri}},
+                ))
             except (ConnectionResetError, BrokenPipeError):
                 break
         try:
@@ -345,6 +374,10 @@ class _ServerInstance:
                 {'jsonrpc': '2.0', 'method': 'shutdown', 'params': {}}
             )
             await self.proc.send({'jsonrpc': '2.0', 'method': 'exit'})
+            self._traffic(ev_notification_to(
+                self.spec.name, 'shutdown', {}))
+            self._traffic(ev_notification_to(
+                self.spec.name, 'exit', None))
         except (ConnectionResetError, BrokenPipeError):
             pass
         await self.proc.stop()
@@ -358,7 +391,16 @@ class _ServerInstance:
             await self.proc.send(
                 {'jsonrpc': '2.0', 'id': mid, 'method': method, 'params': params}
             )
-            return await fut
+            # этап 10.3: локальный запрос хаба виден в мониторе на обоих
+            # концах — отправка сюда, ответ из futures обратно сюда же
+            # (в _handle_server_response локальные id не пишутся)
+            self._traffic(ev_request(self.spec.name, mid, method, params,
+                                     from_hub=True))
+            response = await fut
+            # ответ на свой запрос — тоже «ответ хаба» (пара к «запрос хаба»)
+            self._traffic(ev_from_server(
+                response, method, kind=KIND_HUB_REPLY))
+            return response
         finally:
             self._local_futures.pop(mid, None)
 
@@ -428,6 +470,9 @@ class _ServerInstance:
 
     async def _handle_server_notification(self, msg: dict) -> None:
         method = msg.get('method')
+        # этап 10.3: входящая строка пишется до разбора — и broadcast, и
+        # проглоченные хабом нотификации сервера процесс реально прислал
+        self._traffic(ev_from_server(msg))
         if method in BROADCAST_NOTIFICATIONS:
             text = json.dumps(msg)
             params = msg.get('params') or {}
@@ -455,6 +500,8 @@ class _ServerInstance:
         """Запросы сервера обрабатывает хаб; в редактор они не идут."""
         method = msg.get('method')
         mid = msg.get('id')
+        # этап 10.3: запрос сервера + ответ хаба — обе строки направления ↔/←
+        self._traffic(ev_from_server(msg))
         if method == 'workspace/configuration':
             items = (msg.get('params') or {}).get('items', [])
             response: dict[str, Any] = {
@@ -479,18 +526,26 @@ class _ServerInstance:
                 },
             }
         srv_log.debug('%s: хаб ответил на запрос %s', self.spec.name, method)
+        if 'error' in response:
+            reply_summary = summarize_error(response['error'])
+        else:
+            reply_summary = summarize_result(response.get('result'))
+        self._traffic(ev_hub_reply_to_server(
+            self.spec.name, str(method), mid, reply_summary))
         await self.proc.send(response)
 
     async def _handle_server_response(self, msg: dict) -> None:
         mid = msg['id']
         if mid in self._local_futures:
+            # этап 10.3: на локальные id строку пишет сам request_local
             self._local_futures[mid].set_result(msg)
             return
         target = self.pending.pop(mid, None)
         if target is None:
             srv_log.debug('%s: безадресный ответ %s', self.spec.name, mid)
             return
-        conn, original = target
+        conn, original, method = target
+        self._traffic(ev_from_server(msg, method))
         await conn.ws.send(json.dumps({**msg, 'id': original}))
 
     async def _on_process_dead(self) -> None:
@@ -505,8 +560,12 @@ class _ServerInstance:
             'jsonrpc': '2.0',
             'error': {'code': -32000, 'message': 'LSP server process terminated'},
         }
-        for mid, (conn, original) in list(self.pending.items()):
+        for mid, (conn, original, method) in list(self.pending.items()):
             self.pending.pop(mid, None)
+            # этап 10.3: оборванный запрос виден в мониторе как ошибка хаба
+            # (процесс умер, ответа на провод не будет)
+            self._traffic(ev_hub_error(
+                self.spec.name, mid, error_response['error'], method))
             with contextlib.suppress(ConnectionClosed):
                 await conn.ws.send(json.dumps({**error_response, 'id': original}))
         if self.diag is not None:
@@ -561,6 +620,14 @@ class LspHub(BaseControl):
         self._state_lock = threading.Lock()
         self._srv_states: dict[tuple[str, str], str] = {}
         self._state_observers: list[Callable[[], None]] = []
+        # кольцо трафика монитора LSP (этап 10.3): строки протокола хаба с
+        # процессами серверов + ответы, порождённые самим хабом. Пишется из
+        # потока event-loop, читается/подписывается из GUI. Кольцо ПЕРЕЖИВАЕТ
+        # shutdown хаба — историю разбираемой сессии удобно смотреть именно
+        # после останова; очищается только явно (монитор/консоль).
+        self._monitor_lock = threading.Lock()
+        self._monitor_ring = TrafficRing()
+        self._monitor_observers: list[Callable[[], None]] = []
 
     ###############################
     # Жизненный цикл контрола #
@@ -840,6 +907,60 @@ class LspHub(BaseControl):
         for cb in observers:
             with contextlib.suppress(Exception):
                 cb()
+
+    ############################################
+    # Кольцо трафика монитора LSP (этап 10.3) #
+
+    def add_monitor_observer(self, cb: Callable[[], None]) -> None:
+        """Подписка на изменения кольца трафика.
+
+        ``cb`` вызывается ИЗ ПОТОКА event-loop хаба (GUI-стороне цеплять
+        свой queued-мост, паттерн ``_ScanSignals``); дубликат не добавляет.
+        """
+        with self._monitor_lock:
+            if cb not in self._monitor_observers:
+                self._monitor_observers.append(cb)
+
+    def remove_monitor_observer(self, cb: Callable[[], None]) -> None:
+        """Снимает подписку (несуществующая — молча)."""
+        with self._monitor_lock:
+            if cb in self._monitor_observers:
+                self._monitor_observers.remove(cb)
+
+    def monitor_records(self) -> tuple[TrafficRecord, ...]:
+        """Снимок кольца монитора: записи от старых к новым."""
+        return self._monitor_ring.records()
+
+    def monitor_total_seen(self) -> int:
+        """Сколько всего записей появилось (кольцо вытесняет старые)."""
+        return self._monitor_ring.total_seen()
+
+    def monitor_clear(self) -> None:
+        """Очищает кольцо монитора (нумерация seq продолжается)."""
+        self._monitor_ring.clear()
+        self._notify_monitor_observers()
+
+    def _record_traffic(self, ev: TrafficEvent) -> None:
+        """Запись строки трафика в кольцо (поток event-loop хаба)."""
+        self._monitor_ring.add_event(ev)
+        self._notify_monitor_observers()
+
+    def _notify_monitor_observers(self) -> None:
+        with self._monitor_lock:
+            observers = list(self._monitor_observers)
+        for cb in observers:
+            with contextlib.suppress(Exception):
+                cb()
+
+    def live_server_names(self) -> list[str]:
+        """Имена серверов живых (не угасающих) инстансов процессов —
+        для комбика фильтра панели монитора поверх имён из записей.
+        """
+        return sorted({
+            inst.spec.name
+            for inst in list(self._instances.values())
+            if not inst.dying
+        })
 
     def ws_host_for(self, file_uri: str) -> str:
         """Хост+путь для WebSocket-подключения к хабу по uri файла (первый
@@ -1130,6 +1251,7 @@ class LspHub(BaseControl):
                 publish=self._record_diagnostics,
                 purge=self._drop_diagnostics_of,
                 state_gone=self._drop_server_state,
+                traffic=self._record_traffic,
             ),
         )
         self._instances[key] = inst
@@ -1324,6 +1446,9 @@ class LspHub(BaseControl):
                         'method': 'workspace/didRenameFiles',
                         'params': params,
                     })
+                    # этап 10.3: fire-and-forget нотификация тоже на проводе
+                    inst._traffic(ev_notification_to(
+                        inst.spec.name, 'workspace/didRenameFiles', params))
                 except (ConnectionResetError, BrokenPipeError, OSError):
                     continue
 
@@ -1408,19 +1533,32 @@ class LspHub(BaseControl):
         mid = msg.get('id')
         if method is not None and mid is not None:  # запрос клиента
             if method == 'initialize':
+                # этап 10.3: хаб отвечает сам — обе строки направления ↔
+                inst._traffic(ev_client_request(
+                    inst.spec.name, method, mid, msg.get('params')))
+                inst._traffic(ev_hub_reply_to_client(
+                    inst.spec.name, method, mid,
+                    summarize_result(inst.init_result)))
                 await conn.ws.send(json.dumps({
                     'jsonrpc': '2.0', 'id': mid, 'result': inst.init_result
                 }))
                 return
             if method == 'shutdown':
                 # общий процесс не гасим, отвечаем клиенту напрямую
+                inst._traffic(ev_client_request(
+                    inst.spec.name, method, mid, msg.get('params')))
+                inst._traffic(ev_hub_reply_to_client(
+                    inst.spec.name, method, mid))
                 await conn.ws.send(
                     json.dumps({'jsonrpc': '2.0', 'id': mid, 'result': None})
                 )
                 return
             new_id = inst.client_request_id(conn, mid)
-            inst.pending[new_id] = (conn, mid)
+            inst.pending[new_id] = (conn, mid, str(method))
             await inst.proc.send({**msg, 'id': new_id})
+            # этап 10.3: id на проводе переписан — в мониторе он и виден
+            inst._traffic(ev_request(inst.spec.name, new_id, str(method),
+                                     msg.get('params')))
             return
         if method is None and mid is not None:  # ответ клиента (не ожидаем)
             srv_log.debug('LSP hub: неожиданный ответ клиента %s', mid)
@@ -1430,10 +1568,12 @@ class LspHub(BaseControl):
             return
         if method == '$/cancelRequest':
             params = msg.get('params') or {}
+            rewritten = {'id': inst.client_request_id(conn, params.get('id'))}
             await inst.proc.send({
-                'jsonrpc': '2.0', 'method': method,
-                'params': {'id': inst.client_request_id(conn, params.get('id'))},
+                'jsonrpc': '2.0', 'method': method, 'params': rewritten,
             })
+            inst._traffic(ev_notification_to(
+                inst.spec.name, str(method), rewritten))
             return
         if method == 'textDocument/didOpen':
             uri = ((msg.get('params') or {}).get('textDocument') or {}).get('uri')
@@ -1448,6 +1588,10 @@ class LspHub(BaseControl):
                 srv_log.info('%s: didClose %s (conn#%s)',
                              inst.spec.name, uri, conn.seq)
         await inst.proc.send(msg)
+        # этап 10.3: проглоченные выше нотификации не пишутся — сервер их
+        # не получил; всё, что реально ушло на провод, — пишется
+        inst._traffic(ev_notification_to(
+            inst.spec.name, str(method), msg.get('params')))
 
     async def _detach(
         self, inst: _ServerInstance, conn: _ClientConnection
@@ -1460,11 +1604,16 @@ class LspHub(BaseControl):
                     'method': 'textDocument/didClose',
                     'params': {'textDocument': {'uri': uri}},
                 })
+                # этап 10.3: принудительные didClose отстыкованного редактора
+                inst._traffic(ev_notification_to(
+                    inst.spec.name, 'textDocument/didClose',
+                    {'textDocument': {'uri': uri}},
+                ))
             except (ConnectionResetError, BrokenPipeError):
                 break
         conn.opened_uris.clear()
         if conn in inst.clients:
             inst.clients.remove(conn)
-        for mid, (target, _original) in list(inst.pending.items()):
+        for mid, (target, _original, _method) in list(inst.pending.items()):
             if target is conn:
                 inst.pending.pop(mid, None)

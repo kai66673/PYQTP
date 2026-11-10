@@ -64,9 +64,10 @@ Verify in this order: **ruff → pyright → tests → run the app**.
    + stage-10.1 problems (test_lsp_hub_store.py: юниты чистого problems.py + python-stора диагностик LspHub без процессов + 3 live: детерминированный фейковый LSP-сервер `python <скрипт>` через реестр с ws-клиентом и publishDiagnostics, плюс live basedpyright skipif; test_problems_panel.py: offscreen панель «Проблемы» с фейк-документами из харнеса test_bookmarks — переиспользование импортом, для этого `pyqtp-ide/tests` в extraPaths pyrightconfig)
    + stage-10.2 status/nav (test_problems_status_nav.py: юниты без GUI — цикл `next_problem` и стор состояний голого `LspHub` (без окна, треды не подняты) + 6 offscreen: счётчики статус-бара текст/тултип/enabled, клик открывает панель (`ensure_visible_requested`), индикатор LSP через `_set/_drop_server_state`+queued-мост, F8-цикл через два файла с зеркалом каретки фейка, фильтр «только текущий файл» меняет набор F8/доступность экшенов (счётчики статуса — нет), порядок `document_activated` на открытиях/повторах/закрытиях; фикстуры переиспользуются импортом из test_problems_panel)
   (real LSP server processes) and
-  `webengine` (real QWebEngineView/Monaco) are deselected by default via `addopts` → 203 passed / 41
+    + stage-10.3 LSP monitor (test_lsp_monitor.py: 15 юнитов без GUI и без процессов — чистый lsp_monitor.py (кольцо: продолжение `seq` после `clear`, вытеснение по ёмкости, потокобезопасность; сводки didOpen/обрезка/результаты; фабрики; `filter_records`) + API кольца на голом `LspHub` (наблюдатели/очистка/жизнь после `shutdown`) + точки записи на `_ServerInstance` с фейковыми процессом/сокетом (`_make_inst()` возвращает хаб+инстанс+события, `proc`/`ws` подменяются атрибутами, `isinstance`-сужение хелперами `_fake`/`_fake_ws`; `_route_from_client`/`_detach` — методы хаба, `asyncio.run`) + 6 offscreen панель «Монитор LSP» (фикстуры `org_app`/`fake_docs`/`wnd` импортом из test_problems_panel) + 2 live через ws-хаб (харнес test_lsp_hub_store: `fake_server_script`/`fake_registry_json`/`client_open`/ `wait_for` импортом, своя фикстура `fake_hub` поверх локальной `hub`))
+  `webengine` (real QWebEngineView/Monaco) are deselected by default via `addopts` → 226 passed / 43
   deselected; run them with `uv run pytest -m 'live or webengine'` (~3½ min, they work offscreen) or
-  all 244 in one
+  all 269 in one
   process with `uv run pytest -m ''` (~3½ min, full run keeps passing despite `os._exit` in
   `pytest_sessionfinish` eating the summary line — count the dots; NB the stage81
   document-symbols/document-highlight webengine tests are cold-start flaky under full-suite
@@ -516,6 +517,52 @@ Verify in this order: **ruff → pyright → tests → run the app**.
    (`_on_doc_activated`), а не через `active_document_get()`; закрытие
    вкладки -> переснимок через `QTimer.singleShot(0, _sync_current_doc)`.
    Логгер `bcad.prob` (группа «LSP»).
+
+   Монитор LSP (этап 10.3, то же окно/тот же хаб): кольцо трафика — чистый
+   `lsp_control/lsp_monitor.py` (stdlib, пишется из потока event-loop хаба под
+   замком, читается из GUI): `TrafficEvent` -> `TrafficRecord` (seq+ts+сводка),
+   `TrafficRing` (ёмкость 1000, вытеснение старых, `seq` продолжается ПОСЛЕ
+   `clear()`), сводки `summarize_params/summarize_error/summarize_result`
+   (срезка 160 симв., ТЕКСТ ДОКУМЕНТА НЕ ДАМПИТСЯ НИКОГДА: didOpen/didChange/
+   willSave/didSave -> только `uri vN`), фабрики событий по точкам записи,
+   `MonitorFilter`/`filter_records`. Направления: `DIRECTION_TO` '→' (хаб->
+   процесс, реальный провод), `DIRECTION_FROM` '←' (процесс->хаб),
+   `DIRECTION_HUB` '↔' (породил сам хаб, процесс не видел); типов 9, в т.ч.
+   `KIND_HUB_REQUEST`/`KIND_CLIENT_REQUEST`/`KIND_HUB_REPLY`/
+   `KIND_SERVER_NOTIFICATION`. Семантика записей: пишется только РЕАЛЬНЫЙ
+   провод + ответы, порождённые хабом — проглоченные клиентские нотификации
+   (`initialized`/`exit`/`$/setTrace`) НЕ пишутся (сервер их не получил),
+   проглоченные нотификации СЕРВЕРА (`window/logMessage`/`$/progress`) пишутся
+   (процесс реально присылал); id в строке клиента — уже ПЕРЕПИСАННЫЙ
+   `c{conn}:{id}`; `pending` инстанса расширен до `(conn, original_id, method)`
+   — им подписываются ответы (в ответе метода нет); локальные id `hub{N}` в
+   `_handle_server_response` пропускаются, их пишет `request_local` парой
+   '→ запрос хаба' + '← ответ хаба' (`ev_from_server(..., kind=KIND_HUB_REPLY)`);
+   `_on_process_dead` — ошибка хаба (-32000) на каждый висящий запрос. Traffic-
+   хук — 4-е поле `DiagHooks` (`traffic`), не новый параметр `_ServerInstance`
+   (PLR0913). API хаба: `add/remove_monitor_observer` (колбэк ИЗ loop-потока —
+   GUI-стороне свой queued-мост), `monitor_records()`, `monitor_total_seen()`,
+   `monitor_clear()`, `live_server_names()`; кольцо ЖИВЁТ ПОСЛЕ `shutdown()`
+   хаба (разбор истории разбираемой сессии post-mortem), снимается только
+   `monitor_clear()`. Контрол `LspMonitorControl` (в `init_controls` после
+   `problems_ctrl`, key по qualname) — queued-мост `_MonitorSignals` +
+   КОАЛЕСЦИРУЮЩИЙ сброс панели (`QTimer.singleShot(_FLUSH_MS=200)` + флаг
+   `_pending_refresh`, шквал completion/hover не гоняет QTreeWidget на каждую
+   строку); меню «LSP» (PriorityMenu priority=-4, после «Вид» -5), console-API
+   `lsp_monitor_records`/`lsp_monitor_open`, логгер `bcad.mon` (группа «LSP»).
+   Панель `views/lsp_monitor_view.py` (key `LspMonitorControl_monitor_view`,
+   `widget_area='bottom'`, пассивная — паттерн 9.x/10.x): 7 колонок
+   Время/Сервер/Направление/Тип/Метод/Id/Детали, строка итога, фильтры текст+
+   комбики сервер/направление/тип+чекбокс нотификаций (по умолчанию ВЫКЛ),
+   «Пауза» (снимки копятся, дерево заморожено), «Очистить» (дерево гасится
+   сразу, историю кольца снимает хаб по сигналу `clear_requested` — он её
+   единственный владелец), умный автоскролл (вниз только если ползунок был у
+   конца). Фильтр: явный выбор «нотификация» в комбике типа ПЕРЕКРЫВАЕТ галку
+   нотификаций (иначе пункт комбика не матчился бы никогда). В тестах фейки
+   подменяют атрибуты `inst.proc`/`conn.ws` (типы сужаются `isinstance`-
+   хелперами `_fake`/`_fake_ws`), `_route_from_client`/`_detach` — методы ХАБА
+   (не инстанса), `hub.shutdown()` в `finally` — хаб в юнитах поднимается
+   реальный (треды не стартуют без `ensure_started`).
 
 ## Runtime gotchas
 
