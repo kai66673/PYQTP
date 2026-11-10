@@ -240,15 +240,23 @@ class _ClientConnection:
 
 @dataclass
 class DiagHooks:
-    """Крюки стора диагностик хаба для экземпляра сервера (этап 10.1).
+    """Крюки сторов хаба (диагностики + состояния) для экземпляра сервера.
 
-    Оба колбэка вызываются из потока event-loop хаба: ``publish`` пишет
+    Все колбэки вызываются из потока event-loop хаба: ``publish`` пишет
     очередной ``publishDiagnostics`` сервера в стор, ``purge`` снимает весь
-    вклад сервера (смерть процесса).
+    вклад сервера (смерть процесса), ``state_gone`` (этап 10.2) снимает
+    состояние инстанса из стора состояний — индикатор статус-бара не должен
+    показывать «готов» у мёртвого процесса.
     """
 
     publish: Callable[[str, str, tuple[Problem, ...]], None]
     purge: Callable[[str], None]
+    state_gone: Callable[[tuple[str, str]], None] | None = None
+
+
+# состояния инстансов LSP-процессов для индикатора статус-бара (этап 10.2)
+SERVER_STATE_STARTING = 'запуск'
+SERVER_STATE_READY = 'готов'
 
 
 class _ServerInstance:
@@ -265,7 +273,8 @@ class _ServerInstance:
         self.key = key
         self.spec = spec
         self.root_uri = root_uri
-        # этап 10.1: стор диагностик хаба (публикация/снимание вклада сервера)
+        # этап 10.1/10.2: сторы хаба — диагностики (публикация/снимание
+        # вклада сервера) и состояния инстансов (снимание при смерти)
         self.diag = diag
         self.proc = StdioLspProcess(
             command, Path(unquote(urlparse(root_uri).path))
@@ -504,6 +513,10 @@ class _ServerInstance:
             # этап 10.1: диагностики мёртвого сервера протухли — снимаем его
             # вклад (панель не должна показывать призраков)
             self.diag.purge(self.spec.name)
+            if self.diag.state_gone is not None:
+                # этап 10.2: мёртвый процесс больше не «готов» — индикатор
+                # статус-бара снимает состояние этого инстанса
+                self.diag.state_gone(self.key)
 
 
 class LspHub(BaseControl):
@@ -541,6 +554,13 @@ class LspHub(BaseControl):
         self._diag_lock = threading.Lock()
         self._diag_store: dict[tuple[str, str], tuple[Problem, ...]] = {}
         self._diag_observers: list[Callable[[], None]] = []
+        # состояния LSP-процессов (этап 10.2): тот же ключ инстанса, что у
+        # ``_instances``, значение 'запуск'/'готов'. Пишется из потока
+        # event-loop; читается/подписывается из GUI под своим замком —
+        # индикатор инициализации в статус-баре.
+        self._state_lock = threading.Lock()
+        self._srv_states: dict[tuple[str, str], str] = {}
+        self._state_observers: list[Callable[[], None]] = []
 
     ###############################
     # Жизненный цикл контрола #
@@ -765,6 +785,62 @@ class LspHub(BaseControl):
             with contextlib.suppress(Exception):
                 cb()
 
+    #############################################
+    # Стор состояний серверов (этап 10.2) #
+
+    def add_server_state_observer(self, cb: Callable[[], None]) -> None:
+        """Подписка на изменения состояний LSP-процессов.
+
+        ``cb`` вызывается ИЗ ПОТОКА event-loop хаба (GUI-стороне цеплять
+        свой queued-мост); дубликат не добавляет.
+        """
+        with self._state_lock:
+            if cb not in self._state_observers:
+                self._state_observers.append(cb)
+
+    def remove_server_state_observer(self, cb: Callable[[], None]) -> None:
+        """Снимает подписку (несуществующая — молча)."""
+        with self._state_lock:
+            if cb in self._state_observers:
+                self._state_observers.remove(cb)
+
+    def server_states(self) -> dict[tuple[str, str], str]:
+        """Копия стора состояний: ключ инстанса (команда, root_uri) -> 'запуск'/'готов'."""
+        with self._state_lock:
+            return dict(self._srv_states)
+
+    def _set_server_state(
+        self, key: tuple[str, str], state: str
+    ) -> None:
+        """Выставляет состояние инстанса (поток event-loop хаба)."""
+        with self._state_lock:
+            if self._srv_states.get(key) == state:
+                return
+            self._srv_states[key] = state
+        self._notify_state_observers()
+
+    def _drop_server_state(self, key: tuple[str, str]) -> None:
+        """Снимает состояние инстанса (смерть процесса, поток event-loop)."""
+        with self._state_lock:
+            existed = self._srv_states.pop(key, None) is not None
+        if existed:
+            self._notify_state_observers()
+
+    def _clear_server_states(self) -> None:
+        """Гасит весь стор состояний (остановка хаба)."""
+        with self._state_lock:
+            had = bool(self._srv_states)
+            self._srv_states.clear()
+        if had:
+            self._notify_state_observers()
+
+    def _notify_state_observers(self) -> None:
+        with self._state_lock:
+            observers = list(self._state_observers)
+        for cb in observers:
+            with contextlib.suppress(Exception):
+                cb()
+
     def ws_host_for(self, file_uri: str) -> str:
         """Хост+путь для WebSocket-подключения к хабу по uri файла (первый
         сервер реестра, без имени — для старых одиночных клиентов).
@@ -892,6 +968,8 @@ class LspHub(BaseControl):
             self._diag_store.clear()
         if had_diags:
             self._notify_diag_observers()
+        # этап 10.2: процессов больше нет — индикатор инициализации гасим
+        self._clear_server_states()
 
     ###############################
     # Внутренности: отдельный asyncio-поток #
@@ -934,6 +1012,7 @@ class LspHub(BaseControl):
                     'Ошибка остановки LSP-процесса %s', inst.spec.name
                 )
         self._instances.clear()
+        self._clear_server_states()
 
     async def _client_handler(self, ws: ServerConnection) -> None:
         request = ws.request
@@ -1034,6 +1113,9 @@ class LspHub(BaseControl):
                         '(параллельный старт завершился ошибкой)'
                     )
                     raise RuntimeError(msg)
+            # reuse/дожидание: состояние готово (до этого мог стоять «запуск»
+            # от создавшей инстанс сопрограммы, ещё не дошедшей до READY)
+            self._set_server_state(key, SERVER_STATE_READY)
             return inst
         command = resolve_command(spec.command)
         if command is None:
@@ -1047,15 +1129,20 @@ class LspHub(BaseControl):
             diag=DiagHooks(
                 publish=self._record_diagnostics,
                 purge=self._drop_diagnostics_of,
+                state_gone=self._drop_server_state,
             ),
         )
         self._instances[key] = inst
+        # этап 10.2: индикатор статус-бара показывает идущий хендшейк
+        self._set_server_state(key, SERVER_STATE_STARTING)
         try:
             await inst.start()
         except (OSError, RuntimeError):
             self._instances.pop(key, None)
+            self._drop_server_state(key)
             await inst.proc.stop()
             raise
+        self._set_server_state(key, SERVER_STATE_READY)
         return inst
 
     ###############################

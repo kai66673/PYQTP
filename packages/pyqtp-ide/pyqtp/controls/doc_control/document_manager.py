@@ -62,6 +62,9 @@ class DocumentManager(BaseControl):
 
     document_opened = Signal(BaseDocumentView)
     document_closed = Signal(BaseDocumentView)
+    # этап 10.2: смена активной вкладки (фильтр «только текущий файл» в
+    # панели «Проблемы» и F8-навигация смотрят на неё)
+    document_activated = Signal(BaseDocumentView)
 
     def __init__(self) -> None:
         super().__init__()
@@ -296,8 +299,17 @@ class DocumentManager(BaseControl):
     #      вкладок и реально его активируем (как в браузере).
 
     def _note_activated(self, view_key: str) -> None:
-        """Вьюха стала последней активированной (слот ``ensure_visible_requested``)."""
+        """Вьюха стала последней активированной (слот ``ensure_visible_requested``).
+
+        При реальной смене (та же вкладка повторно не «активируется») —
+        сигнал ``document_activated`` (этап 10.2: панель «Проблемы»).
+        """
+        if view_key == self._last_activated_key:
+            return
         self._last_activated_key = view_key
+        view = self._opened_docs.get(view_key)
+        if view is not None:
+            self.document_activated.emit(view)
 
     def _focused_doc_view(self) -> BaseDocumentView | None:
         """Открытая вьюха, внутри которой сейчас фокус главного окна.

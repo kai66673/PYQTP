@@ -62,10 +62,11 @@ Verify in this order: **ruff → pyright → tests → run the app**.
    + stage-9.6B2 settings scope selector (test_settings_scope.py: offscreen реестр областей/видимость строки «Область»/откат области при закрытии проекта + scope-aware apply/reset страниц «Редактор»/«Внешний вид»/«LSP» + пакетный project_settings_update, без WebEngine)
    + stage-9.7 bookmarks (test_bookmarks.py: юниты чистого bookmarks.py без GUI + offscreen контрол/панель с фейк-редактором (gutter-сигнал, зеркало каретки, next/prev, панель) без WebEngine + 4 webengine-пробы: DOM-глифы `.pyqtp-bookmark-glyph`, смена модели, `_current_cursor`-зеркало, `_toggle_bookmark_request`→сигнал)). Markers `live`
    + stage-10.1 problems (test_lsp_hub_store.py: юниты чистого problems.py + python-stора диагностик LspHub без процессов + 3 live: детерминированный фейковый LSP-сервер `python <скрипт>` через реестр с ws-клиентом и publishDiagnostics, плюс live basedpyright skipif; test_problems_panel.py: offscreen панель «Проблемы» с фейк-документами из харнеса test_bookmarks — переиспользование импортом, для этого `pyqtp-ide/tests` в extraPaths pyrightconfig)
+   + stage-10.2 status/nav (test_problems_status_nav.py: юниты без GUI — цикл `next_problem` и стор состояний голого `LspHub` (без окна, треды не подняты) + 6 offscreen: счётчики статус-бара текст/тултип/enabled, клик открывает панель (`ensure_visible_requested`), индикатор LSP через `_set/_drop_server_state`+queued-мост, F8-цикл через два файла с зеркалом каретки фейка, фильтр «только текущий файл» меняет набор F8/доступность экшенов (счётчики статуса — нет), порядок `document_activated` на открытиях/повторах/закрытиях; фикстуры переиспользуются импортом из test_problems_panel)
   (real LSP server processes) and
-  `webengine` (real QWebEngineView/Monaco) are deselected by default via `addopts` → 195 passed / 41
+  `webengine` (real QWebEngineView/Monaco) are deselected by default via `addopts` → 203 passed / 41
   deselected; run them with `uv run pytest -m 'live or webengine'` (~3½ min, they work offscreen) or
-  all 236 in one
+  all 244 in one
   process with `uv run pytest -m ''` (~3½ min, full run keeps passing despite `os._exit` in
   `pytest_sessionfinish` eating the summary line — count the dots; NB the stage81
   document-symbols/document-highlight webengine tests are cold-start flaky under full-suite
@@ -457,19 +458,64 @@ Verify in this order: **ruff → pyright → tests → run the app**.
    не-файловые uri -> `('', [])`), подписи серьёзности. Стор `LspHub`:
    `dict[(uri, server_name)] -> tuple[Problem, ...]` под `_diag_lock` +
    `add/remove_diagnostics_observer` + `diagnostics_snapshot()` (слитые по uri
-   списки); сервер пишет через `DiagHooks(publish,purge)` из своего loop-потока
+   списки); сервер пишет через `DiagHooks(publish,purge,state_gone)` из своего
+   loop-потока
    (пустой список снимает пару, смерть процесса — весь вклад сервера, `shutdown()`
    — весь стор с оповещением); `owner` проставляется в сторе через
    `dataclasses.replace`. `ProblemsControl` (после `bookmark_ctrl`) —
    queued-мост `_DiagSignals` в GUI + обновление на `project_root_changed`;
    вьюха `views/problems_view.py` (`widget_area='bottom'`): двойной клик ->
    payload `{'uri','range':{'startLineNumber','startColumn'}}` ->
-   `open_definition_uri`; console-API `problems_show`; экшены/F8/статус-бар —
-   10.2. В live-тестах stора — детерминированный фейковый LSP-сервер
+   `open_definition_uri`; console-API `problems_show`. В live-тестах stора —
+   детерминированный фейковый LSP-сервер
    (`python <скрипт>` в реестре) + ws-клиент `websockets.sync.client.connect
    (f'ws://{hub.ws_hosts_for(uri)[N]}')` (хост от хаба БЕЗ схемы `ws://`);
    GUI-тесты панели переиспользуют фейк-документы `test_bookmarks` импортом
    (тесты одного каталога — соседство в sys.path pytest).
+   Этап 10.2 (статус-бар/F8/фильтр, тот же контрол и вьюха): второй стор
+   `LspHub` — состояния инстансов `_srv_states: dict[(команда, root_uri)] ->
+   SERVER_STATE_STARTING('запуск')/SERVER_STATE_READY('готов')` под
+   `_state_lock` + `add/remove_server_state_observer` + `server_states()`;
+   ведётся в `_ensure_instance` (новый инстанс — «запуск» до хендшейка,
+   «готов» после; ветка переиспользования/параллелного ожидания тоже
+   выставляет «готов» — закрывает гонку холодного старта индикатора; сбой
+   старта снимает запись), смерть процесса снимает запись через третье поле
+   `DiagHooks.state_gone` (не отдельный параметр `_ServerInstance` — лимит
+   ruff PLR0913), `_kill_instances`/`shutdown` гасят весь стор. Виджеты
+   статус-бара (`controls/problems_control/status_bar_widgets.py`,
+   `addPermanentWidget` справа, текстовые символы вместо иконок — темобезопасно
+   и проверяемо программно): `ProblemsCountWidget` — кликабельная кнопка
+   `'✕ N  ⚠ M'` (два пробела; нули всегда; disabled при нуле — и `click()`
+   на disabled-кнопке не работает; клик = `ensure_visible()` панели;
+   счётчики ВСЕГДА по полному набору, фильтр панели их не касается) и
+   `LspInitWidget` («LSP: инициализация… (a/b)…» + busy-`QProgressBar
+   `setRange(0,0)`, виден только при «запуск»; программная проверка —
+   `active_count()`, Qt-видимость в offscreen не годится). Доступы для
+   тестов/консоли: свойства `ProblemsControl.status_counts_widget` /
+   `status_lsp_widget`. F8/Shift+F8 — простые `QAction` (обёртка
+   `pyqtp.utils.action.Action` не годится: её конструктор форсит
+   ApplicationShortcut; нужен WindowShortcut — в вебвью Monaco свои связки)
+   + меню «Проблемы» (PriorityMenu priority=-6: между «Закладками» -7 и
+   «Вид» -5). Цикл — чистый `problems.next_problem(entries, current, *,
+   forward)` по точкам `(путь, строка, колонка)` (тот же порядок, что у
+   дерева): вперёд — первая строго после каретки иначе цикл в начало; назад
+   — последняя строго перед, на точном совпадении — предыдущая точка списка
+   (не к себе), за началом — цикл в конец. Каретка для F8 — python-зеркало
+   `edit_widget.current_cursor` (9.7), переход — `open_definition_uri` +
+   `Path(target[0]).as_uri()`. Набор F8 (`problem_entries()`) уважает
+   фильтр панели: чекбокс «Только текущий файл» в `ProblemsView`
+   (`is_current_file_only`/`current_file_only_changed`; вьюха держит полный
+   снимок + `set_current_document()`, фильтр без активной вкладки = пусто и
+   в панели, и в F8-наборе). Активная вкладка — новый сигнал
+   `DocumentManager.document_activated` (эмит только при реальной смене ключа
+   в `_note_activated`; при закрытии активной сосед получает его через свой
+   `ensure_visible`). ГОЧКА, найденная тестами: в момент эмита
+   `document_activated` Qt-фокус ещё в прошлой вкладке (наш lambda на
+   `ensure_visible_requested` подключен ДО слота менеджера, поднимающего
+   фокус новой вкладки) — панель/экшены берут ключ прямо из сигнала
+   (`_on_doc_activated`), а не через `active_document_get()`; закрытие
+   вкладки -> переснимок через `QTimer.singleShot(0, _sync_current_doc)`.
+   Логгер `bcad.prob` (группа «LSP»).
 
 ## Runtime gotchas
 

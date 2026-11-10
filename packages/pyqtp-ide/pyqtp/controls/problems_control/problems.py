@@ -29,7 +29,7 @@ from typing import TYPE_CHECKING
 from urllib.parse import unquote, urlparse
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Iterable, Sequence
 
 SEVERITY_ERROR = 1
 SEVERITY_WARNING = 2
@@ -137,6 +137,49 @@ def problem_label(problem: Problem) -> str:
     if problem.source:
         return f'{label} [{problem.source}]'
     return label
+
+
+# --- F8-цикл по проблемам (этап 10.2) ---
+
+# сплющенная точка проблемы для навигации: (путь файла, строка, колонка);
+# порядок сравнения — путь, затем строка/колонка (тот же порядок, что у
+# дерева панели: файлы по пути, внутри файла — по координатам)
+ProblemEntry = tuple[str, int, int]
+
+
+def next_problem(
+    entries: Sequence[ProblemEntry],
+    current: ProblemEntry | None,
+    *,
+    forward: bool = True,
+) -> ProblemEntry | None:
+    """Следующая/предыдущая проблема в списке по каретке (циклически).
+
+    ``entries`` — отсортированный список точек (путь, строка, колонка);
+    ``current`` — положение каретки ( ``(путь, строка, колонка)`` ) или None.
+    Точного совпадения с ``current`` в списке может не быть (каретка между
+    проблемами, файл без проблем) — выбирается первая точка строго после /
+    перед ним в лексикографическом порядке. Пустой список — ``None``;
+    ``current`` вне диапазона — с конца (цикл, как ``next_bookmark_line``).
+    """
+    if not entries:
+        return None
+    if current is None:
+        return entries[0] if forward else entries[-1]
+    if forward:
+        for entry in entries:
+            if entry > current:
+                return entry
+        return entries[0]
+    before: ProblemEntry | None = None
+    for index in range(len(entries) - 1, -1, -1):
+        if entries[index] == current:
+            # каретка точно на проблеме: назад — к предыдущей, не к себе
+            return entries[index - 1] if index > 0 else entries[-1]
+        if entries[index] < current:
+            before = entries[index]
+            break
+    return before if before is not None else entries[-1]
 
 
 # --- внутренности разбора ---
