@@ -338,13 +338,17 @@ def test_breakpoints_for_sorted_lines() -> None:
 # Скрипт-адаптер (только stdlib): отвечает initialize → initialized → ждёт
 # launch (сам ответ launch — только после configurationDone, как debugpy) →
 # setBreakpoints (верифицирует все строки) → configurationDone → stopped →
-# stackTrace (кадр на program из launch, строка 1 при stopOnEntry иначе 3,
-# +1 за каждый шаг) → next/step*/continue → terminated/exited → выход 0.
+# stackTrace (2 кадра на program из launch: frame0 строка 1 при stopOnEntry
+# иначе 3, +1 за каждый шаг; кадр1 — строка 1; у кадров потоков свои id) →
+# threads (2 потока) → scopes (Locals/Globals для кадров с файлом, один
+# Globals у кадра без источника) → variables (вложенный items) →
+# next/step*/continue → terminated/exited → выход 0.
 # Режимы (env PYQTP_FAKE_DAP_MODE): no_initialized (не шлёт initialized),
 # launch_fail (ответ launch success=False), crash (смерть с кодом 7 после
 # первого stopped), dead (умирает сразу, не прочитав ни одного запроса),
-# no_frames (stackTrace пустой). Каждый запрос — строка в JSONL-журнал
-# (env PYQTP_FAKE_DAP_JOURNAL) — порядок ритуала проверяется по нему.
+# no_frames (stackTrace пустой), no_scopes (scopes с success=False).
+# Каждый запрос — строка в JSONL-журнал (env PYQTP_FAKE_DAP_JOURNAL) —
+# порядок ритуала проверяется по нему.
 FAKE_ADAPTER_SOURCE = r"""
 # Фейковый stdio DAP-адаптер (тестовый харнес, только stdlib).
 import json
@@ -401,13 +405,15 @@ def read_message():
     return json.loads(body.decode('utf-8'))
 
 
-def respond(request_seq, command, body=None, success=True):
+def respond(request_seq, command, body=None, success=True, message=None):
     msg = {
         'type': 'response', 'request_seq': request_seq,
         'command': command, 'success': success,
     }
     if body is not None:
         msg['body'] = body
+    if message:
+        msg['message'] = message
     send(msg)
 
 
@@ -423,12 +429,64 @@ def finish():
     time.sleep(0.3)
 
 
+# наборы переменных по variablesReference (Locals потока 1 раскрывается
+# вложенным items -> ref 20; Globals — одна строка)
+_VARIABLES = {
+    10: [
+        {'name': 'x', 'value': '42', 'type': 'int', 'variablesReference': 0,
+         'evaluateName': 'x'},
+        {'name': 'counter', 'value': '3', 'type': 'int',
+         'variablesReference': 0, 'evaluateName': 'counter'},
+        {'name': 'items', 'value': '[1, 2, 3]', 'type': 'list',
+         'variablesReference': 20, 'namedVariables': 3,
+         'evaluateName': 'items'},
+    ],
+    11: [{'name': '__name__', 'value': "'__main__'", 'type': 'str',
+          'variablesReference': 0, 'evaluateName': '__name__'}],
+    30: [{'name': 'ticket', 'value': "'w2'", 'type': 'str',
+          'variablesReference': 0, 'evaluateName': 'ticket'}],
+    31: [{'name': '__name__', 'value': "'__main__'", 'type': 'str',
+          'variablesReference': 0, 'evaluateName': '__name__'}],
+    20: [
+        {'name': '0', 'value': '1', 'type': 'int', 'variablesReference': 0,
+         'evaluateName': 'items[0]'},
+        {'name': '1', 'value': '2', 'type': 'int', 'variablesReference': 0,
+         'evaluateName': 'items[1]'},
+        {'name': '2', 'value': '3', 'type': 'int', 'variablesReference': 0,
+         'evaluateName': 'items[2]'},
+    ],
+}
+
+
 def main():
     if MODE == 'dead':
         sys.exit(3)
     launch_seq = None
     program = ''
+    # cur_line — строка потока 1 (его и показывает D1-маршрут); шаги +1
     cur_line = 3
+    # строки потоков для stackTrace: свои id кадров и строки (D2-панели)
+    thread_lines = {2: 7}
+
+    def thread_frames(tid):
+        if tid == 1:
+            line = cur_line
+            base = 100
+        else:
+            line = thread_lines.get(tid, 7)
+            base = 200
+        frames = [
+            {'id': base, 'name': '<module>', 'line': line, 'column': 1,
+             'source': {'name': os.path.basename(program), 'path': program}},
+            {'id': base + 1, 'name': 'main', 'line': 1, 'column': 1,
+             'source': {'name': os.path.basename(program), 'path': program}},
+        ]
+        if tid == 1:
+            # кадр без источника — проверка «переход недоступен»
+            frames.append({'id': base + 2, 'name': 'builtins.range',
+                           'line': 0, 'column': 1})
+        return frames
+
     while True:
         msg = read_message()
         if msg is None:
@@ -476,16 +534,44 @@ def main():
                 time.sleep(0.3)
                 sys.exit(7)
         elif command == 'stackTrace':
-            journal('stackTrace')
+            journal('stackTrace', {'threadId': args.get('threadId')})
             if MODE == 'no_frames':
                 respond(seq, command, {'stackFrames': [], 'totalFrames': 0})
             else:
-                respond(seq, command, {'stackFrames': [
-                    {'id': 1, 'name': '<module>', 'line': cur_line,
-                     'column': 1,
-                     'source': {'name': os.path.basename(program),
-                                'path': program}}
-                ], 'totalFrames': 1})
+                frames = thread_frames(int(args.get('threadId') or 1))
+                respond(seq, command, {'stackFrames': frames,
+                                       'totalFrames': len(frames)})
+        elif command == 'threads':
+            journal('threads')
+            respond(seq, command, {'threads': [
+                {'id': 1, 'name': 'MainThread'},
+                {'id': 2, 'name': 'Worker'},
+            ]})
+        elif command == 'scopes':
+            journal('scopes', {'frameId': args.get('frameId')})
+            if MODE == 'no_scopes':
+                respond(seq, command, success=False,
+                        message='scopes недоступны')
+            else:
+                fid = int(args.get('frameId') or 0)
+                tid = 2 if fid >= 200 else 1
+                locals_ref = 10 if tid == 1 else 30
+                globals_ref = 11 if tid == 1 else 31
+                if fid in (102, 202):
+                    # кадр без файла: только Globals
+                    respond(seq, command, {'scopes': [
+                        {'name': 'Globals', 'variablesReference': globals_ref},
+                    ]})
+                else:
+                    respond(seq, command, {'scopes': [
+                        {'name': 'Locals', 'variablesReference': locals_ref,
+                         'namedVariables': 3},
+                        {'name': 'Globals', 'variablesReference': globals_ref},
+                    ]})
+        elif command == 'variables':
+            ref = int(args.get('variablesReference') or 0)
+            journal('variables', {'variablesReference': ref})
+            respond(seq, command, {'variables': _VARIABLES.get(ref, [])})
         elif command in ('next', 'stepIn', 'stepOut'):
             journal(command)
             respond(seq, command)

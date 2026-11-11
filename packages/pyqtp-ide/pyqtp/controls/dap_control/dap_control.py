@@ -26,7 +26,7 @@ import concurrent.futures
 import contextlib
 import logging
 import threading
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -35,6 +35,7 @@ from PySide6.QtGui import QAction, QIcon, QKeySequence
 
 from pyqtp.controls.base_control import BaseControl
 from pyqtp.controls.dap_control import breakpoints as bp_mod
+from pyqtp.controls.dap_control import debug_tree as dt
 from pyqtp.controls.dap_control.dap_process import adapter_command
 from pyqtp.controls.dap_control.dap_session import DapError, DapSession
 from pyqtp.controls.dap_control.launch_config import (
@@ -46,11 +47,20 @@ from pyqtp.controls.dap_control.launch_config import (
 )
 from pyqtp.utils.priority_menu import PriorityMenu
 from pyqtp.views.debug_console_view import DebugConsoleView
+from pyqtp.views.debug_stack_view import DebugStackView
+from pyqtp.views.debug_variables_view import DebugVariablesView
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from PySide6.QtWidgets import QToolBar
+
     from pyqtp.controls.dap_control.breakpoints import Breakpoint
+    from pyqtp.controls.dap_control.debug_tree import (
+        FrameRow,
+        ScopeRow,
+        ThreadRow,
+    )
     from pyqtp.main_wnd.ide_main_window import IdeMainWindow
 
 dbg_log = logging.getLogger('bcad.dbg')
@@ -92,6 +102,13 @@ class _DapSignals(QObject):
     dap_event = Signal(int, str, dict)
     stopped_revealed = Signal(int, str, int, int)
     session_gone = Signal(int, str)
+    # D2 — зеркала панелей (списки frozen-датаклассов debug_tree):
+    # gen, thread_id, ThreadRow-список, FrameRow-список кадра этого потока
+    stack_ready = Signal(int, int, list, list)
+    # gen, frame_id кадра, ScopeRow-список областей
+    scopes_ready = Signal(int, int, list)
+    # gen, variablesReference родителя, VariableRow-список детей
+    variables_ready = Signal(int, int, list)
 
 
 @dataclass
@@ -117,6 +134,9 @@ class DapControl(BaseControl):
     def __init__(self) -> None:
         super().__init__()
         self.debug_console_view: DebugConsoleView | None = None
+        self.stack_view: DebugStackView | None = None
+        self.variables_view: DebugVariablesView | None = None
+        self.debug_toolbar: QToolBar | None = None
         self._signals = _DapSignals()
 
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -132,6 +152,16 @@ class DapControl(BaseControl):
         # GUI-зеркало строки останова (путь/строка; 0 — подсветки нет)
         self._exec_path = ''
         self._exec_line = 0
+
+        # D2 — GUI-зеркала панелей «живого» останова (пусто вне STOPPED)
+        self._frames: list[FrameRow] = []
+        self._threads: list[ThreadRow] = []
+        self._scopes: list[ScopeRow] = []
+        self._current_frame_id: int | None = None
+        self._current_thread_id = 1
+        # variablesReference, по которым детей уже запрашивали в этом останове
+        # (дедуп повторных раскрытий; чистится на смене кадра/останова/сессии)
+        self._fetched_child_refs: set[int] = set()
 
         self._breakpoints: list[Breakpoint] = []
 
@@ -200,6 +230,9 @@ class DapControl(BaseControl):
         self._signals.dap_event.connect(self._on_dap_event)
         self._signals.stopped_revealed.connect(self._on_stopped_revealed)
         self._signals.session_gone.connect(self._on_session_gone)
+        self._signals.stack_ready.connect(self._on_stack_ready)
+        self._signals.scopes_ready.connect(self._on_scopes_ready)
+        self._signals.variables_ready.connect(self._on_variables_ready)
 
         self._main_wnd.api_ctrl.register_variables({
             'debug_start': self.start_debugging,
@@ -210,6 +243,10 @@ class DapControl(BaseControl):
             'debug_step_out': self.step_out,
             'debug_status': self.debug_status,
             'debug_breakpoints_show': self.breakpoints_snapshot,
+            'debug_stack_show': self.stack_snapshot,
+            'debug_threads_show': self.threads_snapshot,
+            'debug_scopes_show': self.scopes_snapshot,
+            'debug_frame_select': self.select_frame,
         })
         self._update_actions_enabled()
 
@@ -239,6 +276,21 @@ class DapControl(BaseControl):
         view.clear_requested.connect(self.clear_console)
         view.set_status_text(_STATUS_TEXT.get(self._state, self._state))
 
+        self.stack_view = stack_view = DebugStackView(
+            self._main_wnd, key=f'{self.key}_stack_view',
+        )
+        self._main_wnd.view_register(stack_view, widget_area='left')
+        stack_view.frame_activated.connect(self._on_frame_activated)
+        stack_view.thread_selected.connect(self._on_thread_selected)
+
+        self.variables_view = variables_view = DebugVariablesView(
+            self._main_wnd, key=f'{self.key}_variables_view',
+        )
+        self._main_wnd.view_register(variables_view, widget_area='right')
+        variables_view.children_requested.connect(self._on_children_requested)
+
+        self._setup_debug_toolbar()
+
         self._main_wnd.doc_ctrl.document_opened.connect(self._wire_doc_view)
 
         root = self._main_wnd.project_ctrl.project_root
@@ -247,11 +299,42 @@ class DapControl(BaseControl):
             self._broadcast_breakpoints()
         self._update_actions_enabled()
 
+    def _setup_debug_toolbar(self) -> None:
+        """Тулбар «Отладка» (срез D2) поверх уже готовых экшенов меню.
+
+        Те же ``QAction`` (текст только, иконок нет — темобезопасно и
+        проверяемо программно ``actions()``); гейтинг enabled общий со стат-
+        машиной. Тулбар виден всегда: кнопка запуска должна быть доступна
+        и в IDLE (VS Code прячет тулбар вне отладки — у нас кнопка старта
+        тогда осталась бы только в меню).
+        """
+        toolbar = self._main_wnd.addToolBar('Отладка')
+        toolbar.setObjectName('debug_toolbar')
+        toolbar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+        toolbar.setMovable(False)
+        toolbar.addAction(self.action_debug_start)
+        toolbar.addSeparator()
+        toolbar.addAction(self.action_debug_step_over)
+        toolbar.addAction(self.action_debug_step_into)
+        toolbar.addAction(self.action_debug_step_out)
+        toolbar.addSeparator()
+        toolbar.addAction(self.action_debug_stop)
+        self.debug_toolbar = toolbar
+
     def teardown_views(self) -> None:
         super().teardown_views()
         if self.debug_console_view is not None:
             self._main_wnd.view_deregister(self.debug_console_view.key)
             self.debug_console_view = None
+        if self.stack_view is not None:
+            self._main_wnd.view_deregister(self.stack_view.key)
+            self.stack_view = None
+        if self.variables_view is not None:
+            self._main_wnd.view_deregister(self.variables_view.key)
+            self.variables_view = None
+        if self.debug_toolbar is not None:
+            self._main_wnd.removeToolBar(self.debug_toolbar)
+            self.debug_toolbar = None
 
     def on_shutdown(self) -> bool:
         self._stop_session_blocking(terminate=True)
@@ -509,6 +592,7 @@ class DapControl(BaseControl):
         gen = self._gen
         self._exec_path = ''
         self._exec_line = 0
+        self._clear_debug_panels()
         self.clear_console()
         self._console_line(f'[Отладка] Запуск «{config.name}»: {config.program}')
         loop = self._loop
@@ -660,10 +744,12 @@ class DapControl(BaseControl):
         # разбор останова/завершения — ниже по stackTrace и session_gone
 
     def _request_stopped_info(self, gen: int) -> None:
-        """На «stopped»: кадр ``stackTrace`` в loop-потоке, наружу — queued-сигнал.
+        """На «stopped»: кадр и потоки в loop-потоке, наружу — queued-сигналы.
 
         У ``stopped``-события НЕТ строки останова (проверено debugpy 1.8.21) —
-        строка/путь/колонка берутся из первого кадра ``stackTrace``.
+        строка/путь/колонка берутся из первого кадра ``stackTrace``. Один
+        ``stackTrace`` кормит и show-переход (D1), и панель «Стек вызовов» (D2);
+        ``threads`` — отдельный запрос, сбой не мешает разбору кадра.
         """
         rt = self._runtime
         loop = self._loop
@@ -671,28 +757,36 @@ class DapControl(BaseControl):
             return
 
         async def _coro() -> None:
+            if self._runtime is not rt:
+                return
+            frames: list[FrameRow] = []
             try:
-                frames = await rt.session.stack_trace(rt.thread_id)
+                stack_body = await rt.session.request_body(
+                    'stackTrace',
+                    {'threadId': rt.thread_id, 'startFrame': 0, 'levels': 32},
+                    timeout=_CMD_WAIT_S,
+                )
+                frames = dt.frames_from_response(stack_body)
             except (DapError, ConnectionError, OSError) as exc:
                 dbg_log.warning('stackTrace не снят: %s', exc)
                 return
+            threads: list[ThreadRow] = []
+            try:
+                threads_body = await rt.session.request_body(
+                    'threads', {}, timeout=_CMD_WAIT_S,
+                )
+                threads = dt.threads_from_response(threads_body)
+            except (DapError, ConnectionError, OSError) as exc:
+                dbg_log.debug('threads не снят (панель потоков промолчит): %s', exc)
+            if self._runtime is not rt:
+                return
+            self._signals.stack_ready.emit(gen, rt.thread_id, threads, frames)
             if not frames:
                 return
             frame = frames[0]
-            source = frame.get('source')
-            path = ''
-            if isinstance(source, dict):
-                raw_path = source.get('path')
-                if isinstance(raw_path, str):
-                    path = raw_path
-            line = frame.get('line')
-            column = frame.get('column')
-            rt.current_path = path
-            rt.current_line = line if isinstance(line, int) else 0
-            self._signals.stopped_revealed.emit(
-                gen, path, rt.current_line,
-                column if isinstance(column, int) else 1,
-            )
+            rt.current_path = frame.path
+            rt.current_line = frame.line
+            self._signals.stopped_revealed.emit(gen, frame.path, frame.line, frame.column)
 
         asyncio.run_coroutine_threadsafe(_coro(), loop).add_done_callback(
             _log_future_error,
@@ -720,6 +814,229 @@ class DapControl(BaseControl):
             'range': {'startLineNumber': line, 'startColumn': column},
         })
 
+    # ------------------------------------------------------------------ #
+    # Панели «Стек вызовов»/«Переменные» (срез D2)                       #
+    # ------------------------------------------------------------------ #
+
+    def stack_snapshot(self) -> list[dict[str, Any]]:
+        """Снимок кадров текущего останова (console API/тесты)."""
+        return [asdict(row) for row in self._frames]
+
+    def threads_snapshot(self) -> list[dict[str, Any]]:
+        """Снимок потоков сессии (console API/тесты)."""
+        return [asdict(row) for row in self._threads]
+
+    def scopes_snapshot(self) -> list[dict[str, Any]]:
+        """Снимок областей текущего кадра (console API/тесты)."""
+        return [asdict(row) for row in self._scopes]
+
+    def select_frame(self, frame_id: int) -> str:
+        """Сделать кадр текущим для панели «Переменные» (только STOPPED)."""
+        if self._state != STATE_STOPPED:
+            return 'Выбор кадра доступен в останове'
+        if not any(row.frame_id == frame_id for row in self._frames):
+            return 'Кадр не найден в стеке'
+        self._set_current_frame(frame_id)
+        return ''
+
+    def _set_current_frame(self, frame_id: int) -> None:
+        """(GUI) Кадр для переменных: зеркало + подсветка панели + scopes."""
+        self._current_frame_id = frame_id
+        self._scopes = []
+        self._fetched_child_refs.clear()
+        if self.stack_view is not None:
+            self.stack_view.set_current_frame(frame_id)
+        if self.variables_view is not None:
+            self.variables_view.set_scopes([])
+        self._request_scopes(frame_id, self._gen)
+
+    def _on_stack_ready(
+        self, gen: int, thread_id: int, threads: list, frames: list,
+    ) -> None:
+        """(GUI) Кадры/потоки останова: зеркала + панели + scopes нового кадра.
+
+        При каждом новом останове выбирается первый кадр (как в VS Code);
+        список потоков показывается комбиком только при >1 потока.
+        """
+        if gen != self._gen or self._state == STATE_IDLE:
+            return
+        self._threads = list(threads)
+        self._frames = list(frames)
+        self._current_thread_id = thread_id
+        root = self._main_wnd.project_ctrl.project_root
+        if self.stack_view is not None:
+            self.stack_view.set_threads(self._threads, thread_id)
+            self.stack_view.set_frames(self._frames, root)
+        frame_id = self._frames[0].frame_id if self._frames else None
+        self._current_frame_id = frame_id
+        self._scopes = []
+        self._fetched_child_refs.clear()
+        if self.stack_view is not None:
+            self.stack_view.set_current_frame(frame_id)
+        if self.variables_view is not None:
+            self.variables_view.set_scopes([])
+        if frame_id is not None:
+            self._request_scopes(frame_id, gen)
+
+    def _on_scopes_ready(self, gen: int, frame_id: int, scopes: list) -> None:
+        """(GUI) Область кадра: принимается, только кадр ещё текущий."""
+        if gen != self._gen or frame_id != self._current_frame_id:
+            return
+        self._scopes = list(scopes)
+        if self.variables_view is not None:
+            self.variables_view.set_scopes(self._scopes)
+
+    def _on_variables_ready(self, gen: int, parent_ref: int, rows: list) -> None:
+        """(GUI) Дети ячейки переменных; чужое поколение уже не нужно.
+
+        Метку «запрашивали» НЕ снимаем: повторное раскрытие уже выгруженной
+        ячейки не должно второй раз гонять ``variables`` (снимется только со
+        сменой кадра/останова/сессии вместе с самим множеством).
+        """
+        if gen != self._gen or self._state == STATE_IDLE:
+            return
+        if self.variables_view is not None:
+            self.variables_view.replace_children(parent_ref, list(rows))
+
+    def _on_frame_activated(self, frame_id: int) -> None:
+        """Двойной клик по кадру: вскрыть файл кадра + сделать его текущим."""
+        frame = next(
+            (row for row in self._frames if row.frame_id == frame_id), None,
+        )
+        if frame is None:
+            return
+        payload = dt.frame_reveal_payload(frame)
+        if payload is None:
+            dbg_log.info('Кадр без вскрываемого файла: %s', frame.name)
+            self._console_line('[Отладка] Кадр без файла — переход недоступен')
+        else:
+            self._main_wnd.doc_ctrl.open_definition_uri(payload)
+        if self._state == STATE_STOPPED:
+            self._set_current_frame(frame_id)
+
+    def _on_thread_selected(self, thread_id: int) -> None:
+        """Комбик потоков: снять кадр выбранного потока (D1-маршрут команд
+        не трогаем — шаги/F5 работают по потоку останова, как в D1).
+        """
+        if self._state != STATE_STOPPED or thread_id == self._current_thread_id:
+            return
+        if not any(row.thread_id == thread_id for row in self._threads):
+            return
+        self._current_thread_id = thread_id
+        self._fetch_stack(thread_id, self._gen, reveal=False)
+
+    def _on_children_requested(self, ref: int) -> None:
+        """Первое раскрытие ячейки/области: ``variables`` по ref (с дедумпом)."""
+        if self._state != STATE_STOPPED or ref in self._fetched_child_refs:
+            return
+        rt = self._runtime
+        loop = self._loop
+        if rt is None or loop is None:
+            return
+        self._fetched_child_refs.add(ref)
+        gen = self._gen
+
+        async def _coro() -> None:
+            if self._runtime is not rt or rt.session.closed:
+                return
+            try:
+                body = await rt.session.request_body(
+                    'variables', {'variablesReference': ref}, timeout=_CMD_WAIT_S,
+                )
+            except (DapError, ConnectionError, OSError) as exc:
+                dbg_log.warning('variables (ref %s) не выгружены: %s', ref, exc)
+                return
+            rows = dt.variables_from_response(body)
+            self._signals.variables_ready.emit(gen, ref, rows)
+
+        asyncio.run_coroutine_threadsafe(_coro(), loop).add_done_callback(
+            _log_future_error,
+        )
+
+    def _request_scopes(self, frame_id: int, gen: int) -> None:
+        """(GUI→loop) ``scopes`` кадра; ответ фильтруется по текущему кадру."""
+        rt = self._runtime
+        loop = self._loop
+        if rt is None or loop is None:
+            return
+
+        async def _coro() -> None:
+            if self._runtime is not rt or rt.session.closed:
+                return
+            try:
+                body = await rt.session.request_body(
+                    'scopes', {'frameId': frame_id}, timeout=_CMD_WAIT_S,
+                )
+            except (DapError, ConnectionError, OSError) as exc:
+                dbg_log.warning('scopes кадра %s не сняты: %s', frame_id, exc)
+                return
+            self._signals.scopes_ready.emit(
+                gen, frame_id, dt.scopes_from_response(body),
+            )
+
+        asyncio.run_coroutine_threadsafe(_coro(), loop).add_done_callback(
+            _log_future_error,
+        )
+
+    def _fetch_stack(self, thread_id: int, gen: int, *, reveal: bool) -> None:
+        """(GUI→loop) Кадр выбранного потока без show-перехода (D2-комбик)."""
+        rt = self._runtime
+        loop = self._loop
+        if rt is None or loop is None:
+            return
+
+        async def _coro() -> None:
+            if self._runtime is not rt:
+                return
+            try:
+                body = await rt.session.request_body(
+                    'stackTrace',
+                    {'threadId': thread_id, 'startFrame': 0, 'levels': 32},
+                    timeout=_CMD_WAIT_S,
+                )
+            except (DapError, ConnectionError, OSError) as exc:
+                dbg_log.warning('stackTrace потока %s не снят: %s', thread_id, exc)
+                return
+            if self._runtime is not rt:
+                return
+            self._signals.stack_ready.emit(
+                gen, thread_id, self._threads_snapshot_loop_safe(),
+                dt.frames_from_response(body),
+            )
+            if reveal:
+                frames = dt.frames_from_response(body)
+                if frames:
+                    frame = frames[0]
+                    rt.current_path = frame.path
+                    rt.current_line = frame.line
+                    self._signals.stopped_revealed.emit(
+                        gen, frame.path, frame.line, frame.column,
+                    )
+
+        asyncio.run_coroutine_threadsafe(_coro(), loop).add_done_callback(
+            _log_future_error,
+        )
+
+    def _threads_snapshot_loop_safe(self) -> list[ThreadRow]:
+        """Список потоков для повторной подписи stack_ready (копия безопасна:
+        GUI-список меняется только в GUI-слотах, чтение из loop-потока —
+        снимок-копия).
+        """
+        return list(self._threads)
+
+    def _clear_debug_panels(self) -> None:
+        """(GUI) Снять показ стека/переменных (новый запуск/конец сессии)."""
+        self._frames = []
+        self._threads = []
+        self._scopes = []
+        self._current_frame_id = None
+        self._fetched_child_refs.clear()
+        if self.stack_view is not None:
+            self.stack_view.set_threads([], 0)
+            self.stack_view.set_frames([], None)
+        if self.variables_view is not None:
+            self.variables_view.clear_all()
+
     def _on_session_gone(self, gen: int, reason: str) -> None:
         """Сессия умерла (terminated/смерть адаптера): стат-машина в IDLE."""
         if gen != self._gen:
@@ -742,6 +1059,7 @@ class DapControl(BaseControl):
         )
         self._set_state(STATE_IDLE)
         self._clear_execution_lines()
+        self._clear_debug_panels()
 
     def _sync_breakpoints_to_session(self, path: str) -> None:
         """Новый набор строк одного файла — в живую сессию (fire-and-forget)."""
@@ -793,6 +1111,7 @@ class DapControl(BaseControl):
             self._runtime = None
         self._set_state(STATE_IDLE)
         self._clear_execution_lines()
+        self._clear_debug_panels()
 
     def _ensure_loop(self) -> None:
         """Ленивый (идемпотентный) подъём потока отладки со своим циклом."""
