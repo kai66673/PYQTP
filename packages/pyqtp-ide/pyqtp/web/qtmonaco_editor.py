@@ -40,6 +40,8 @@ class QtMonacoEditorWidget(Monaco):
     workspace_edit_requested = Signal(dict)
     # этап 9.7: клик по дорожке закладок в gutter — переключение строки ``line``
     bookmark_toggle_requested = Signal(int)
+    # этап 11 (D1): клик по дорожке брейкпоинтов — переключение строки ``line``
+    breakpoint_toggle_requested = Signal(int)
 
     def __init__(
         self, file_path: Path, /, *, lsp_host: str | list[dict] | None = None
@@ -143,6 +145,42 @@ class QtMonacoEditorWidget(Monaco):
             med_log.warning('Monaco прислал запрос переключения закладки без строки: %r', value)
             return
         self.bookmark_toggle_requested.emit(line)
+
+    def set_breakpoints(self, lines: list[int]) -> None:
+        """Прислать в Monaco номера строк-брейкпоинтов этого документа (этап 11).
+
+        Как ``set_bookmarks``: состояние живёт на python-стороне
+        (``.pyqtp/breakpoints.json`` + ``DapControl``), редактору сообщаются
+        только строки его файла — JS перекрашивает дорожку (своя
+        ``breakpointCollection`` в main.ts). Буферизуется ``Connector`` до
+        инициализации моста.
+        """
+        self._connector.send('set_breakpoints', sorted({int(line) for line in lines}))
+
+    def set_execution_line(self, payload: dict) -> None:
+        """Подсветка строки останова (current-line, этап 11).
+
+        ``{'line': N}`` — кадр останова в этом документе, ``{'line': 0}`` —
+        снять подсветку. JS-сторона: отдельная ``execLineCollection``
+        (глиф-стрелка в gutter + подсветка строки).
+        """
+        line = payload.get('line') if isinstance(payload, dict) else None
+        self._connector.send('set_execution_line', {'line': int(line or 0)})
+
+    def _toggle_breakpoint_request(self, value: dict) -> None:
+        """Обработчик ``_toggle_breakpoint_request`` из JS-стороны (этап 11).
+
+        Клик по дорожке брейкпоинтов Monaco (рядом с существующим брейкпоинтом
+        или в режиме брейкпоинт-дорожки); сам редактор состояние не ведёт —
+        прокидываем намерение наверх (см. ``DapControl.toggle_breakpoint_at``).
+        """
+        line = value.get('line') if isinstance(value, dict) else None
+        if not isinstance(line, int) or isinstance(line, bool) or line < 1:
+            med_log.warning(
+                'Monaco прислал запрос переключения брейкпоинта без строки: %r', value,
+            )
+            return
+        self.breakpoint_toggle_requested.emit(line)
 
     def apply_lsp_text_edits(self, uri: str, edits: list[dict]) -> None:
         """Применить TextEdit'ы к модели этого редактора (этап 8.2).

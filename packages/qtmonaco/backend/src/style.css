@@ -36,3 +36,29 @@ body {
 .pyqtp-bookmark-line {
   background-color: rgba(229, 166, 75, 0.12);
 }
+
+/* vendored-patch (этап 11 D1, отладчик): красный кружок брейкпоинта в той же
+   дорожке (radial-gradient — глифы закладок остаются тонкими штрихами), лёгкая
+   красноватая подсветка строки */
+.pyqtp-breakpoint-glyph {
+  background: radial-gradient(circle at center, #d1414d 0 4px, transparent 4.5px) no-repeat;
+  width: 10px !important;
+}
+
+.pyqtp-breakpoint-line {
+  background-color: rgba(209, 65, 77, 0.1);
+}
+
+/* строка кадра останова: жёлтая стрелка в дорожке + подсветка строки
+   (цвет как у current-line VS Code, полупрозрачно — не перекрывает выделения) */
+.pyqtp-exec-gutter::before {
+  content: "\25B8";
+  display: block;
+  text-align: center;
+  color: #e5c04b;
+  font-size: 11px;
+}
+
+.pyqtp-exec-line {
+  background-color: rgba(229, 192, 75, 0.16);
+}

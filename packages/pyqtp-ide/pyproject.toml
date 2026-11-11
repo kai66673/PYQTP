@@ -12,6 +12,8 @@ dependencies = [
     "websockets",
     # LSP-сервер стека python (этап 3.1): `ruff server` (stdio)
     "ruff",
+    # отладчик DAP (этап 11): адаптер `python -m debugpy.adapter` + debuggee debugpy
+    "debugpy",
 ]
 
 [tool.uv.sources]

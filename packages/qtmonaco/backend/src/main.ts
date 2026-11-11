@@ -156,6 +156,105 @@ function setBookmarks(lines: unknown) {
 qtmonaco.setBookmarks = setBookmarks;
 Object.defineProperty(qtmonaco, "bookmarkLines", { get: () => bookmarkLines });
 
+// vendored-patch (этап 11 D1, отладчик): брейкпоинты в дорожке + подсветка строки
+// останова (current-line). Состояние живёт на python-стороне (.pyqtp/breakpoints.json
+// + DapControl), сюда приходят только номера строк этого документа. Коллекции свои
+// (брейкпоинт/закладка/останов могут соседствовать на одной строке); переприменение
+// то же, что у applyBookmarks: decorations гибнут вместе с моделью/редактором.
+let breakpointCollection: monaco.editor.IEditorDecorationsCollection | null = null;
+let breakpointLines: number[] = [];
+let execLineCollection: monaco.editor.IEditorDecorationsCollection | null = null;
+let execLine = 0; // 0 — подсветки останова нет
+
+function applyBreakpoints() {
+  const model = editor.getModel();
+  const decorations: monaco.editor.IModelDeltaDecoration[] = [];
+  if (model) {
+    const total = model.getLineCount();
+    for (const line of breakpointLines) {
+      if (line >= 1 && line <= total) {
+        decorations.push({
+          range: new monaco.Range(line, 1, line, 1),
+          options: {
+            isWholeLine: true,
+            className: "pyqtp-breakpoint-line",
+            linesDecorationsClassName: "pyqtp-breakpoint-glyph",
+          },
+        });
+      }
+    }
+  }
+  if (breakpointCollection) {
+    breakpointCollection.set(decorations);
+  } else {
+    breakpointCollection = editor.createDecorationsCollection(decorations);
+  }
+}
+
+function setBreakpoints(lines: unknown) {
+  breakpointLines = Array.isArray(lines)
+    ? lines.filter((line) => Number.isInteger(line) && line >= 1)
+    : [];
+  applyBreakpoints();
+}
+
+function applyExecLine() {
+  const model = editor.getModel();
+  const decorations: monaco.editor.IModelDeltaDecoration[] = [];
+  if (model && execLine >= 1 && execLine <= model.getLineCount()) {
+    decorations.push({
+      range: new monaco.Range(execLine, 1, execLine, 1),
+      options: {
+        isWholeLine: true,
+        className: "pyqtp-exec-line",
+        linesDecorationsClassName: "pyqtp-exec-gutter",
+      },
+    });
+  }
+  if (execLineCollection) {
+    execLineCollection.set(decorations);
+  } else {
+    execLineCollection = editor.createDecorationsCollection(decorations);
+  }
+}
+
+function setExecutionLine(payload: unknown) {
+  const line = payload && typeof payload === "object" ? (payload as any).line : 0;
+  execLine = Number.isInteger(line) && line >= 1 ? line : 0;
+  applyExecLine();
+}
+
+// для live-тестов/отладки: установка меток и чтение текущих наборов
+qtmonaco.setBreakpoints = setBreakpoints;
+qtmonaco.setExecutionLine = setExecutionLine;
+Object.defineProperty(qtmonaco, "breakpointLines", { get: () => breakpointLines });
+Object.defineProperty(qtmonaco, "execLine", { get: () => execLine });
+
+// vendored-patch (этап 11): клик по дорожке строки разбираем по реально задетому
+// глифу: красная точка брейкпоинта — переключение брейкпоинта, всё остальное
+// (пустое место дорожки, глифы закладок/стрелка останова) — закладка (поведение
+// 9.7 сохранено). Новый брейкпоинт ставится F9 на строке каретки: дорожка одна
+// на две функции, пустое пространство принадлежит закладкам.
+function routeGutterClick(line: number | undefined, element: HTMLElement | null) {
+  if (!line) {
+    return;
+  }
+  const isBreakpoint = !!element && element.classList.contains("pyqtp-breakpoint-glyph");
+  sendToPython(isBreakpoint ? "_toggle_breakpoint_request" : "_toggle_bookmark_request", {
+    line,
+  });
+}
+
+// тестовый хук для offscreen-проб: настоящей мыши там нет — эмулируем попадание
+// по глифу ('breakpoint' — брейкпоинт, любое иное значение — закладка)
+qtmonaco.__pyqtp_gutter_click = (line: unknown, kind: unknown) => {
+  const span = document.createElement("span");
+  if (kind === "breakpoint") {
+    span.className = "pyqtp-breakpoint-glyph";
+  }
+  routeGutterClick(typeof line === "number" ? line : undefined, span);
+};
+
 let decorationsCollection: monaco.editor.IEditorDecorationsCollection | null = null;
 
 // vendored-patch (PYQTP, этап 6): reveal из set_cursor не работает, пока
@@ -260,16 +359,15 @@ function attachEditorListeners(target: monaco.editor.IStandaloneCodeEditor) {
       column: e.position.column,
     });
   });
-  // vendored-patch (этап 9.7, закладки): клик по дорожке закладок (справа от
-  // номеров строк) — запрос переключения; состояние на python, он пришлёт строки
+  // vendored-patch (этап 9.7, закладки / этап 11, брейкпоинты): клик по дорожке
+  // строки в gutter — запрос переключения; разбор «брейкпоинт это или закладка»
+  // в routeGutterClick, состояние на python, он пришлёт строки обратно
   gutterClickDisposable = target.onMouseDown((e) => {
     if (e.target.type !== monaco.editor.MouseTargetType.GUTTER_LINE_DECORATIONS) {
       return;
     }
     const line = e.target.position ? e.target.position.lineNumber : undefined;
-    if (line) {
-      sendToPython("_toggle_bookmark_request", { line });
-    }
+    routeGutterClick(line, e.target.element ?? null);
   });
 }
 
@@ -292,12 +390,17 @@ function setActiveEditor(newEditor: monaco.editor.IStandaloneCodeEditor) {
   clearPendingCursor(); // vendored-patch (этап 6): pending reveal старого редактора не нужен
   decorationsCollection = null;
   bookmarkCollection = null; // vendored-patch (этап 9.7): коллекция привязана к редактору
+  // vendored-patch (этап 11): коллекции брейкпоинтов/останова тоже привязаны
+  breakpointCollection = null;
+  execLineCollection = null;
   disposeBookmarkListener(); // vendored-patch (этап 9.7): слушатель тоже привязан к редактору
   editor = newEditor;
   qtmonaco.editor = editor;
   attachEditorListeners(editor);
   seedNavHistory();
   applyBookmarks(); // vendored-patch (этап 9.7): закладки переприменяем к новому редактору
+  applyBreakpoints(); // vendored-patch (этап 11): то же для брейкпоинтов и строки останова
+  applyExecLine();
 }
 
 function switchToStandaloneEditor() {
@@ -647,6 +750,8 @@ function updateFromPython(name: string, value: string) {
           resetNavHistory(); // vendored-patch (этап 7): позиции старой модели неактуальны
           seedNavHistory(); // vendored-patch (этап 7): старт истории от новой позиции
           applyBookmarks(); // vendored-patch (этап 9.7): decorations с model'ю сбрасываются
+          applyBreakpoints();
+          applyExecLine(); // vendored-patch (этап 11): брейкпоинты/останов — туда же
           sendToPython("_current_uri", new_model.uri.toString());
           break;
         }
@@ -666,6 +771,8 @@ function updateFromPython(name: string, value: string) {
         resetNavHistory();
         seedNavHistory();
         applyBookmarks(); // vendored-patch (этап 9.7): строки за пределами нового текста — в мусор
+        applyBreakpoints();
+        applyExecLine(); // vendored-patch (этап 11): тот же срез строк для меток отладки
         break;
       } else {
         // If no model exists, create a new one
@@ -678,6 +785,8 @@ function updateFromPython(name: string, value: string) {
         resetNavHistory(); // vendored-patch (этап 7): новая модель — новая история переходов
         seedNavHistory(); // vendored-patch (этап 7): старт истории от текущей позиции
         applyBookmarks(); // vendored-patch (этап 9.7): закладки на новую модель
+        applyBreakpoints();
+        applyExecLine(); // vendored-patch (этап 11): и метки отладки на новую модель
         sendToPython("_current_uri", new_model.uri.toString());
         break;
       }
@@ -819,6 +928,14 @@ function updateFromPython(name: string, value: string) {
       // vendored-patch (этап 9.7, закладки): номера строк-закладок текущего
       // документа (состояние хранит python, сюда приходит только список строк)
       setBookmarks(data);
+      break;
+    case "set_breakpoints":
+      // vendored-patch (этап 11 D1, отладчик): строки-брейкпоинты этого документа
+      setBreakpoints(data);
+      break;
+    case "set_execution_line":
+      // vendored-patch (этап 11 D1): строка кадра останова ({line: N}, 0 — снять)
+      setExecutionLine(data);
       break;
     case "delete_line": {
       // Delete a specific line in the editor

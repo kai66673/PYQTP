@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING
 
 from pyqtp.base.base_main_window import BaseMainWindow
 from pyqtp.controls.bookmark_control.bookmark_control import BookmarkControl
+from pyqtp.controls.dap_control.dap_control import DapControl
 from pyqtp.controls.doc_control.document_manager import DocumentManager
 from pyqtp.controls.lsp_control.lsp_hub import LspHub
 from pyqtp.controls.lsp_control.lsp_monitor_control import LspMonitorControl
@@ -26,6 +27,7 @@ class IdeMainWindow(BaseMainWindow):
     bookmark_ctrl: BookmarkControl
     problems_ctrl: ProblemsControl
     lsp_monitor_ctrl: LspMonitorControl
+    dap_ctrl: DapControl
 
     @staticmethod
     def dbus_iface_name() -> str:
@@ -54,6 +56,9 @@ class IdeMainWindow(BaseMainWindow):
         self.problems_ctrl = self.plug_register(ProblemsControl())
         # «Монитор LSP» (этап 10.3) — кольцо трафика того же хаба
         self.lsp_monitor_ctrl = self.plug_register(LspMonitorControl())
+        # отладчик DAP (этап 11, срез D1) — после проекта/доков: брейкпоинты
+        # живут в корне проекта, current-line раздаётся открытым редакторам
+        self.dap_ctrl = self.plug_register(DapControl())
 
     #############################################
     # Тема: два слоя (этап 9.6B, см. ThemeMainWindow) #

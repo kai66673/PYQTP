@@ -43,9 +43,9 @@
 | Find/replace, folding, minimap, multi-cursor, jump history | частично своё, на GtkSourceView | **бесплатно встроено в Monaco** — только команды/шорткаты/опции UI | **этап 7** |
 | Дерево проекта, сессии, quick open, поиск по проекту | есть (файловая панель; fuzzy-поиск свой; сессии в GSettings) | нет | **этап 9** |
 | Problems-панель, статус, мониторинг LSP | есть (`LspMonitorPanel` — сильная фича) | нет | **этап 10** |
-| Отладчик DAP | есть (debugpy/lldb; **без F5/F10/F11**) | нет | **этап 11** |
+| Отладчик DAP | есть (debugpy/lldb; **без F5/F10/F11**) | D1 **есть** (debugpy stdio, F5/F9/F10/F11, консоль) — панели D2/D3 нет | **этап 11 (D1 готово)** |
 | Tree-sitter (15 грамматик, 5 рабочих) | есть | не нужно — роль закрывают Monaco + semanticTokens | не переносим |
-| Закладки/брейкпоинты в JSON проекта | есть | закладки **есть** (9.7) | закладки — закрыто / брейкпоинты — этап 11 |
+| Закладки/брейкпоинты в JSON проекта | есть | закладки **есть** (9.7), брейкпоинты **есть** (11.1) | закрыто |
 | Плагины/расширяемость | нет | **есть в архитектуре** (plugins, Python-консоль) | **этап 12** — наше преимущество |
 | CLI, welcome-экран, недавние проекты | нет | нет | этап 12 |
 | Git | нет у обоих | — | этап 13 (отложен) |
@@ -580,7 +580,7 @@ toggle_active по зеркалу каретки, next/prev с циклом, п�
 (глифы `.pyqtp-bookmark-glyph` в DOM, строка за текстом игнорируется,
 набор переживает смену модели и короткий файл, каретка из JS прилетает в
 `current_cursor`, `_toggle_bookmark_request` → сигнал с отсевом мусора).
-Остаток этапа 9 закрыт; брейкпоинты — этап 11 (DAP).
+Остаток этапа 9 закрыт; брейкпоинты закрыты этапом 11.1 (DAP).
 
 ### Этап 10 — Problems-панель, статус-бар, монитор LSP
 - агрегация маркеров всех документов (модель маркеров Monaco читается из
@@ -776,7 +776,75 @@ publishDiagnostics в кольце и сводка без текста доку�
 прогон 226, live/webengine 43 — зелёные.
 
 
-### Этап 11 — отладчик DAP
+### Этап 11 — отладчик DAP 🔶 (D1 готово; D2/D3 — впереди)
+
+#### Этап 11.1 (D1) — DAP-клиент, брейкпоинты Monaco, консоль отладки ✅ (готово)
+
+Топология: **stdio** — адаптер `python -m debugpy.adapter` БЕЗ `--port`
+говорит DAP на собственном stdin/stdout (Content-Length-фрейминг; ноль
+токенов/сетевых портов), debuggee адаптер поднимает сам после `launch`+
+`configurationDone`. Ответ на `launch` приходит только после
+`configurationDone` — поэтому обязателен отдельный читатель+``futures`` по
+`request_seq` (`dap_session.DapSession`).
+
+- Чистые модули `controls/dap_control/` (этап в стиле 9.x/10.x):
+  `dap_framing` (фреймы/конструкторы сообщений), `dap_session` (клиент:
+  ритуал initialize→launch→initialized→setBreakpoints→configurationDone→
+  ответ launch, хук `on_breakpoints_ready`, `_HANDSHAKE_TIMEOUT`,
+  `_fail_all` при смерти адаптера, `close(terminate=)` идемпотентен с
+  закрытием транспорта пока loop жив — иначе unraisable `__del__`),
+  `launch_config` (`.pyqtp/launch.json` — подмножество формата VS Code:
+  name/program/args/cwd/env/stopOnEntry/justMyCode, `${workspaceFolder}`,
+  первая конфигурация = цель запуска, дефолт — активный документ + cwd=
+  корень; аргументы `launch`: `console:'internalConsole'` — нашей
+  капбилити `supportsRunInTerminalRequest` нет), `breakpoints`
+  (`.pyqtp/breakpoints.json` — тот же контракт, что у закладок 9.7),
+  `dap_process` (`adapter_command()`, env-шов `PYQTP_DAP_ADAPTER_COMMAND`
+  для тестового фейкового адаптера).
+- `DapControl` (`dap_ctrl`, в `init_controls` после `problems_ctrl`):
+  ленивый asyncio-loop-поток, сессия трогается только из loop-потока
+  (`run_coroutine_threadsafe`), queued-мост `_DapSignals` + гейт поколения
+  `_gen`; стат-машина IDLE/RUNNING/STOPPED; у `stopped` НЕТ строки — кадр
+  берётся из `stackTrace` frame0 и вскрывается тем же маршрутом, что LSP-
+  переходы (`open_definition_uri` + каретка с центрированием); консольные
+  строки «[Отладка] …» (запуск/остановка/вывод debuggee/коды завершения);
+  меню «Отладка» (PriorityMenu priority=-3, экшены 1..6), связки VS Code
+  F5/Shift+F5/F9/F10/F11/Shift+F11 (обычные QAction WindowShortcut);
+  console-API `debug_start/stop/continue/step_*/status/breakpoints_show`;
+  логгер `bcad.dbg` (группа «Отладка»).
+- Брейкпоинты: F9 на строке каретки (python-зеркало `current_cursor`,
+  как 9.7/10.2); клик по дорожке — глиф брейкпоинта → переключение
+  брейкпоинта, иначе (пусто/закладка) → закладка 9.7 сохранена; новый
+  брейкпоинт — только F9. Раздача строк редакторам + широковещательный
+  `setBreakpoints` в живую сессию при правках; стартовый набор уходит в
+  handshake (хук `on_breakpoints_ready`).
+- Monaco (вендорные патчи `main.ts`/`style.css`): отдельные
+  `breakpointCollection`/`execLineCollection`, `routeGutterClick` по классу
+  задетого глифа, bridge-случаи `set_breakpoints`/`set_execution_line`,
+  тестовый хук `window.qtmonaco.__pyqtp_gutter_click`; CSS
+  `.pyqtp-breakpoint-glyph/-line`, `.pyqtp-exec-gutter/-line`; пересборка
+  `js_build` обязательна. Подсветка текущей строки останова чистится при
+  конце сессии.
+- Консоль: пассивная `views/debug_console_view.py` (`widget_area='bottom'`):
+  read-only QPlainTextEdit (моноширинный, потолок буфера), строка статуса
+  «Не отлаживаем/Выполняется/Остановлено», кнопка «Очистить»
+  (`clear_requested`).
+- Live-сессия в тестах: фейковый stdio DAP-адаптер (скрипт только stdlib,
+  режимы normal/no_initialized/launch_fail/crash/dead/no_frames +
+  JSONL-журнал запросов) через env-шов; живые прогоны — настоящий
+  debugpy (entry-шаги 1→2→3 + print в консоль; брейкпоинт в цикле).
+
+**Демонстрация:** `tests/test_dap_debugger.py` — 41 тест (36 дефолтных:
+юниты фрейминга/launch.json/брейкпоинтов/сессии + offscreen-GUI стат-
+машина/брейкпоинты/консоль; 2 live debugpy; 3 webengine DOM-пробы
+глифов/строки останова/маршрута дорожки). Итог: дефолтный прогон 262,
+live/webengine 48 — зелёные.
+
+Остаток этапа: D2 — панели переменных/call stack/потоки + тулбар;
+D3 — шаги по инструкциям, conditional брейкпоинты, hover значения,
+вкладка Debug в настройках.
+
+### Этап 11 plan (исторично, для D2/D3)
 - `DapControl(BaseControl)` + DAP-клиент поверх нашего asyncio-опыта
   (Content-Length-фрейминг переиспользуется из LSP-обёртки);
 - debugpy built-in + `.pyqtp/launch.json`;
