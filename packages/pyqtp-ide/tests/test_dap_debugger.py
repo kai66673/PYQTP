@@ -8,7 +8,11 @@
   форма аргументов ``launch`` для debugpy;
 * ``breakpoints`` — ``.pyqtp/breakpoints.json`` (тот же контракт, что у
   закладок 9.7: толерантный разбор, каноническая запись, срезка мёртвых
-  файлов, соседство с ``session.json``/``settings.json``);
+  файлов, соседство с ``session.json``/``settings.json``; срез D3 — условия
+  брейкпоинтов и хелперы ``set_breakpoint_condition``/``remove_breakpoint``/
+  ``breakpoint_entries_for``);
+* ``debug_options`` — двухслойные опции отладки (QSettings ``DapOptions`` +
+  проектная секция ``debug``; набор фильтров ``setExceptionBreakpoints``);
 * ``dap_session`` против фейкового stdio DAP-адаптера (``python <скрипт>``
   через env-шов ``PYQTP_DAP_ADAPTER_COMMAND``): порядок ритуала handshake
   (журнал запросов), хук брейкпоинтов, тексты ошибок, смерть адаптера.
@@ -16,14 +20,22 @@
 Offscreen-GUI без Monaco/WebEngine (дефолтный прогон) — ``DapControl``:
 меню «Отладка» и экшены, брейкпоинты (файл проекта + раздача редакторам +
 gutter-клик + синхронизация в живую сессию), стат-машина F5/шаги/стоп на
-фейковом адаптере, консоль отладки.
+фейковом адаптере, консоль отладки. Срез D3 — условия брейкпоинтов и
+контекстное меню дорожки (подменные ``QMenu``/``QInputDialog``), фильтры
+исключений (``setExceptionBreakpoints`` на handshake и переприменение при
+смене опции), hover-значения (гейт + ``evaluate`` в останове), страница
+настроек «Отладка» (двухслойность областей «Приложение»/«Проект»).
 
 Live (маркер ``live``) — настоящий ``python -m debugpy.adapter`` на крошечной
 программе (launch.json со ``stopOnEntry``: останова 1→2→3 + вывод print).
 
 WebEngine-пробы (маркер ``webengine``) — метки брейкпоинтов и строка останова
 в DOM Monaco (``.pyqtp-breakpoint-glyph``/``.pyqtp-exec-gutter``) и маршрут
-клика по дорожке (хук ``qtmonaco.__pyqtp_gutter_click``).
+клика по дорожке (хук ``qtmonaco.__pyqtp_gutter_click``). Срез D3 — полые
+глифы условных брейкпоинтов (``.pyqtp-breakpoint-cond``), правый клик по
+глифу (``breakpoint_context_requested``), подавление контекстного меню Monaco
+над глифом и hover-round-trip (хук ``qtmonaco.__pyqtp_request_hover`` +
+подменный python-ответ).
 
 Настоящие документы подменены лёгкой вьюхой с фейковым редактором (свои
 классы в этом файле, харнес как в test_bookmarks.py).
@@ -42,13 +54,16 @@ import pytest
 
 import qtmonaco
 from PySide6.QtCore import QEventLoop, QObject, Qt, QSettings, QTimer, Signal
-from PySide6.QtWidgets import QApplication, QMenu, QWidget
+from PySide6.QtGui import QAction
+from PySide6.QtWidgets import QApplication, QCheckBox, QMenu, QWidget
 
 from pyqtp.base.base_document_view import BaseDocumentView
 from pyqtp.base.docking_system.base_views_manager import ViewsManagerType
 from pyqtp.controls.dap_control import breakpoints as bp
+from pyqtp.controls.dap_control import dap_control as dap_control_mod
 from pyqtp.controls.dap_control import dap_framing as framing
 from pyqtp.controls.dap_control import dap_session as session_mod
+from pyqtp.controls.dap_control import debug_options as dbg_opts
 from pyqtp.controls.dap_control import launch_config as lc
 from pyqtp.controls.dap_control.breakpoints import Breakpoint
 from pyqtp.controls.dap_control.dap_control import (
@@ -59,6 +74,11 @@ from pyqtp.controls.dap_control.dap_control import (
 from pyqtp.controls.dap_control.dap_process import ENV_ADAPTER_COMMAND, adapter_command
 from pyqtp.controls.dap_control.dap_session import DapError, DapSession
 from pyqtp.controls.doc_control import document_manager as doc_mod
+from pyqtp.controls.project_control.project_control import SCOPE_PROJECT
+from pyqtp.controls.project_control.project_settings import (
+    KEY_BREAK_ON_RAISED,
+    SECTION_DEBUG,
+)
 from pyqtp.main_wnd.ide_main_window import IdeMainWindow
 from pyqtp.web.qtmonaco_editor import QtMonacoEditorWidget
 
@@ -230,7 +250,7 @@ def test_read_launch_file_missing_and_broken(tmp_path: Path) -> None:
 
 
 def test_parse_breakpoints_tolerant() -> None:
-    """Мусор в файле — пропускаем записи, а не падаем."""
+    """Мусор в файле — пропускаем записи, а не падаем (D3: битое условие — «»)."""
     assert bp.parse_breakpoints('нечего разобрать') == []
     assert bp.parse_breakpoints('[1, 2]') == []
     assert bp.parse_breakpoints('{"breakpoints": "не список"}') == []
@@ -242,17 +262,21 @@ def test_parse_breakpoints_tolerant() -> None:
             {'path': '/a.py', 'line': '2'},
             {'path': '/a.py', 'line': True},
             {'path': '/b.py', 'line': 7, 'extra': 1},
+            {'path': '/c.py', 'line': 3, 'condition': 'i > 2'},
+            {'path': '/c.py', 'line': 4, 'condition': 5},
             'не словарь',
         ]
     })
     assert bp.parse_breakpoints(text) == [
         Breakpoint(path='/a.py', line=2),
         Breakpoint(path='/b.py', line=7),
+        Breakpoint(path='/c.py', line=3, condition='i > 2'),
+        Breakpoint(path='/c.py', line=4),
     ]
 
 
 def test_serialize_breakpoints_sorts_and_dedups() -> None:
-    """Запись канонична: сортировка по (path, line) + дедуп."""
+    """Запись канонична: сортировка по (path, line) + дедуп (D3: первое условие)."""
     items = [
         Breakpoint(path='/b.py', line=3),
         Breakpoint(path='/a.py', line=9),
@@ -267,6 +291,65 @@ def test_serialize_breakpoints_sorts_and_dedups() -> None:
             {'path': '/b.py', 'line': 3},
         ]
     }
+
+
+def test_serialize_breakpoints_condition_first_wins(tmp_path: Path) -> None:
+    """D3: ``condition`` пишется только при непустом; дедуп хранит ПЕРВОЕ условие."""
+    items = [
+        Breakpoint(path='/a.py', line=2, condition='i > 1'),
+        Breakpoint(path='/a.py', line=2, condition='второе'),  # потеряется молча
+        Breakpoint(path='/a.py', line=5, condition=''),
+    ]
+    payload = json.loads(bp.serialize_breakpoints(items))
+    assert payload == {'breakpoints': [
+        {'path': '/a.py', 'line': 2, 'condition': 'i > 1'},
+        {'path': '/a.py', 'line': 5},
+    ]}
+    bp.write_breakpoints(tmp_path, items)
+    assert bp.read_breakpoints(tmp_path) == [
+        Breakpoint(path='/a.py', line=2, condition='i > 1'),
+        Breakpoint(path='/a.py', line=5),
+    ]
+
+
+def test_set_breakpoint_condition_adds_and_clears() -> None:
+    """D3: условие на несуществующем — создаёт; пустое на существующем — снимает."""
+    base = [Breakpoint(path='/a.py', line=2)]
+    assert bp.set_breakpoint_condition(base, '/a.py', 5, 'x > 1') == [
+        Breakpoint(path='/a.py', line=2),
+        Breakpoint(path='/a.py', line=5, condition='x > 1'),
+    ]
+    assert bp.set_breakpoint_condition(base, '/a.py', 2, 'counter == 3') == [
+        Breakpoint(path='/a.py', line=2, condition='counter == 3'),
+    ]
+    assert bp.set_breakpoint_condition(base, '/a.py', 2, '') == [
+        Breakpoint(path='/a.py', line=2),
+    ]
+    # брейкпоинта нет + пустое условие — без изменений (вход не трогаем)
+    assert bp.set_breakpoint_condition(base, '/a.py', 9, '') == base
+    assert base == [Breakpoint(path='/a.py', line=2)]
+
+
+def test_remove_breakpoint_and_toggle_drops_condition() -> None:
+    """D3: remove снимает пару; toggle снятого брейкпоинта — вместе с условием."""
+    base = [Breakpoint(path='/a.py', line=2, condition='i > 1')]
+    assert bp.remove_breakpoint(base, '/a.py', 2) == []
+    assert bp.remove_breakpoint(base, '/a.py', 9) == base  # нет — без изменений
+    assert bp.toggle_breakpoint(base, '/a.py', 2) == []
+
+
+def test_breakpoint_entries_for_shape() -> None:
+    """D3: записи файла для Monaco/``setBreakpoints`` — line + condition по надобности."""
+    items = [
+        Breakpoint(path='/a.py', line=9),
+        Breakpoint(path='/a.py', line=2, condition='x != 0'),
+        Breakpoint(path='/b.py', line=4),
+    ]
+    assert bp.breakpoint_entries_for(items, '/a.py') == [
+        {'line': 2, 'condition': 'x != 0'},
+        {'line': 9},
+    ]
+    assert bp.breakpoint_entries_for(items, '/c.py') == []
 
 
 def test_write_breakpoints_roundtrip_no_temp_leftovers(tmp_path: Path) -> None:
@@ -333,20 +416,92 @@ def test_breakpoints_for_sorted_lines() -> None:
 
 
 #################################
+# Юниты опций отладки (срез D3) #
+
+
+def test_coerce_break_on_raised_forms() -> None:
+    """Флаг: настоящий bool проходит; строковые формы — как у опций редактора."""
+    assert dbg_opts.coerce_break_on_raised(True) is True
+    assert dbg_opts.coerce_break_on_raised(False) is False
+    for raw in ('true', 'TRUE ', '1', 'yes', 'on'):
+        assert dbg_opts.coerce_break_on_raised(raw) is True
+    for raw in ('false', '0', 'no', 'off', 'какой-то мусор'):
+        assert dbg_opts.coerce_break_on_raised(raw) is False
+    with pytest.raises(TypeError):
+        dbg_opts.coerce_break_on_raised(1)
+    with pytest.raises(TypeError):
+        dbg_opts.coerce_break_on_raised(None)
+
+
+def test_validate_break_on_raised_strict() -> None:
+    """Запись строгая: только bool; строки/числа — TypeError с текстом."""
+    dbg_opts.validate_break_on_raised(True)
+    dbg_opts.validate_break_on_raised(False)
+    for bad in ('true', 1, None):
+        with pytest.raises(TypeError):
+            dbg_opts.validate_break_on_raised(bad)
+
+
+def test_read_write_debug_options_roundtrip(tmp_path: Path) -> None:
+    """QSettings-слой: дефолт не пишется, ненулевое значение пишется и читается."""
+    settings = QSettings(str(tmp_path / 'dbg.ini'), QSettings.Format.IniFormat)
+    try:
+        assert dbg_opts.read_debug_options(settings) == {KEY_BREAK_ON_RAISED: False}
+        dbg_opts.write_debug_options(settings, {KEY_BREAK_ON_RAISED: True})
+        settings.sync()
+        assert dbg_opts.read_debug_options(settings) == {KEY_BREAK_ON_RAISED: True}
+        # значение, равное дефолту, снимается (группа не мусорит)
+        dbg_opts.write_debug_options(settings, {KEY_BREAK_ON_RAISED: False})
+        settings.sync()
+        assert KEY_BREAK_ON_RAISED not in settings.allKeys()
+        assert dbg_opts.read_debug_options(settings) == {KEY_BREAK_ON_RAISED: False}
+    finally:
+        settings.clear()
+        settings.sync()
+
+
+def test_merge_debug_options_tolerant() -> None:
+    """Проектная секция старше слоя: валидная — перекрывает, мусор — мимо."""
+    options = dict(dbg_opts.DEFAULT_DEBUG_OPTIONS)
+    dbg_opts.merge_debug_options(options, {
+        'unknown_key': True,
+        KEY_BREAK_ON_RAISED: 5,  # не bool и не строка-флаг — нижний слой живёт
+    })
+    assert options == {KEY_BREAK_ON_RAISED: False}
+    dbg_opts.merge_debug_options(options, {KEY_BREAK_ON_RAISED: True})
+    assert options == {KEY_BREAK_ON_RAISED: True}
+    dbg_opts.merge_debug_options(options, {KEY_BREAK_ON_RAISED: 'off'})
+    assert options == {KEY_BREAK_ON_RAISED: False}
+
+
+def test_exception_filters_layering() -> None:
+    """``uncaught`` всегда; ``raised`` — только при break_on_raised (первым)."""
+    assert dbg_opts.exception_filters({KEY_BREAK_ON_RAISED: False}) == ['uncaught']
+    assert dbg_opts.exception_filters({}) == ['uncaught']
+    assert dbg_opts.exception_filters(
+        {KEY_BREAK_ON_RAISED: True},
+    ) == ['raised', 'uncaught']
+
+
+#################################
 # Фейковый stdio DAP-адаптер    #
 
 # Скрипт-адаптер (только stdlib): отвечает initialize → initialized → ждёт
 # launch (сам ответ launch — только после configurationDone, как debugpy) →
-# setBreakpoints (верифицирует все строки) → configurationDone → stopped →
+# setBreakpoints (верифицирует все строки; D3: журнал хранит и raw-записи
+# ``breakpoints`` с условиями) → setExceptionBreakpoints (D3: журнал фильтров)
+# → configurationDone → stopped →
 # stackTrace (2 кадра на program из launch: frame0 строка 1 при stopOnEntry
 # иначе 3, +1 за каждый шаг; кадр1 — строка 1; у кадров потоков свои id) →
 # threads (2 потока) → scopes (Locals/Globals для кадров с файлом, один
 # Globals у кадра без источника) → variables (вложенный items) →
-# next/step*/continue → terminated/exited → выход 0.
+# evaluate (D3: значения из таблицы по expression, неизвестное — success=False)
+# → next/step*/continue → terminated/exited → выход 0.
 # Режимы (env PYQTP_FAKE_DAP_MODE): no_initialized (не шлёт initialized),
 # launch_fail (ответ launch success=False), crash (смерть с кодом 7 после
 # первого stopped), dead (умирает сразу, не прочитав ни одного запроса),
-# no_frames (stackTrace пустой), no_scopes (scopes с success=False).
+# no_frames (stackTrace пустой), no_scopes (scopes с success=False),
+# eval_fail (D3: любой evaluate success=False).
 # Каждый запрос — строка в JSONL-журнал (env PYQTP_FAKE_DAP_JOURNAL) —
 # порядок ритуала проверяется по нему.
 FAKE_ADAPTER_SOURCE = r"""
@@ -457,6 +612,15 @@ _VARIABLES = {
     ],
 }
 
+# D3 (hover/консоль): ответы evaluate по выражению; неизвестное — success=False
+_EVAL_VALUES = {
+    'x': '42',
+    'counter': '3',
+    'items': '[1, 2, 3]',
+    '__name__': "'__main__'",
+    'ticket': "'w2'",
+}
+
 
 def main():
     if MODE == 'dead':
@@ -496,7 +660,16 @@ def main():
         seq = msg.get('seq')
         if command == 'initialize':
             journal('initialize')
-            respond(seq, command, {'capabilities': {'supportsSetVariable': True}})
+            respond(seq, command, {'capabilities': {
+                'supportsSetVariable': True,
+                # D3: условные брейкпоинты + фильтры исключений (свои id —
+                # как у debugpy: 'raised'/'uncaught')
+                'supportsConditionalBreakpoints': True,
+                'exceptionBreakpointFilters': [
+                    {'filter': 'raised', 'label': 'Raised Exceptions'},
+                    {'filter': 'uncaught', 'label': 'Uncaught Exceptions'},
+                ],
+            }})
             if MODE != 'no_initialized':
                 send({'type': 'event', 'event': 'initialized'})
         elif command == 'launch':
@@ -507,15 +680,26 @@ def main():
             if args.get('stopOnEntry'):
                 cur_line = 1
         elif command == 'setBreakpoints':
-            lines = [b.get('line') for b in args.get('breakpoints') or []]
+            raw = args.get('breakpoints') or []
+            lines = [b.get('line') for b in raw]
             journal('setBreakpoints', {
                 'path': (args.get('source') or {}).get('path'), 'lines': lines,
+                # D3: и raw-записи (line + опциональный condition) — проверка,
+                # что условие реально доехало до адаптера
+                'breakpoints': raw,
             })
             respond(seq, command, {'breakpoints': [
                 {'id': i + 1, 'verified': True, 'line': line,
                  'source': args.get('source')}
                 for i, line in enumerate(lines)
             ]})
+        elif command == 'setExceptionBreakpoints':
+            # D3: явный обработчик — журнал фильтров (иначе проваливался бы
+            # в общий else без деталей)
+            journal('setExceptionBreakpoints', {
+                'filters': args.get('filters') or [],
+            })
+            respond(seq, command, {'breakpoints': []})
         elif command == 'configurationDone':
             journal('configurationDone')
             respond(seq, command)
@@ -572,6 +756,25 @@ def main():
             ref = int(args.get('variablesReference') or 0)
             journal('variables', {'variablesReference': ref})
             respond(seq, command, {'variables': _VARIABLES.get(ref, [])})
+        elif command == 'evaluate':
+            # D3: hover-значения и ввод в консоль отладки
+            expression = str(args.get('expression') or '')
+            journal('evaluate', {
+                'expression': expression,
+                'context': args.get('context'),
+                'frameId': args.get('frameId'),
+            })
+            if MODE == 'eval_fail':
+                respond(seq, command, success=False,
+                        message='Имя неизвестно: ' + expression)
+            elif expression not in _EVAL_VALUES:
+                respond(seq, command, success=False,
+                        message='Имя неизвестно: ' + expression)
+            else:
+                respond(seq, command, {
+                    'result': _EVAL_VALUES[expression],
+                    'variablesReference': 0,
+                })
         elif command in ('next', 'stepIn', 'stepOut'):
             journal(command)
             respond(seq, command)
@@ -797,22 +1000,28 @@ class FakeDocument:
 
 
 class FakeEditWidget(QObject):
-    """Фейковый редактор: рекордеры сообщений этапа 11 + каретка + сигнал дорожки.
+    """Фейковый редактор: рекордеры сообщений этапа 11 + каретка + сигналы дорожки/hover.
 
-    Повторяет контракт ``QtMonacoEditorWidget``: ``set_breakpoints(lines)``,
+    Повторяет контракт ``QtMonacoEditorWidget``: ``set_breakpoints(entries)``
+    (записи ``{'line': N[, 'condition']}``, терпим и к голым числам — D1),
     ``set_execution_line({'line': N|0})``, ``breakpoint_toggle_requested``
-    (клик по глифу брейкпоинта в дорожке Monaco), зеркало ``current_cursor``.
+    (клик по глифу брейкпоинта в дорожке Monaco), ``breakpoint_context_requested``
+    (правый клик по глифу, D3), ``hover_value_requested``/``reply_hover_value``
+    (hover-значения, D3), зеркало ``current_cursor``.
     """
 
     breakpoint_toggle_requested = Signal(int)
+    breakpoint_context_requested = Signal(int)
+    hover_value_requested = Signal(dict)
 
     def __init__(self) -> None:
         super().__init__()
         self.options_calls: list[dict[str, Any]] = []
         self.theme_calls: list[str] = []
-        self.breakpoint_calls: list[list[int]] = []
+        self.breakpoint_calls: list[list[dict[str, Any]]] = []
         self.exec_calls: list[dict[str, int]] = []
         self.cursor_calls: list[tuple[int, int, str]] = []
+        self.hover_reply_calls: list[dict[str, Any]] = []
         self.current_cursor: dict[str, int] = {'line': 1, 'column': 1}
 
     def update_editor_options(self, options: dict[str, Any]) -> None:
@@ -821,11 +1030,21 @@ class FakeEditWidget(QObject):
     def set_theme(self, theme: str) -> None:
         self.theme_calls.append(theme)
 
-    def set_breakpoints(self, lines: list[int]) -> None:
-        self.breakpoint_calls.append(list(lines))
+    def set_breakpoints(self, entries: list[Any]) -> None:
+        """Записи брейкпоинтов (D3); голые числа — как в D1 — к нормализуются."""
+        normalized: list[dict[str, Any]] = []
+        for entry in entries:
+            if isinstance(entry, int):
+                normalized.append({'line': entry})
+            else:
+                normalized.append(dict(entry))
+        self.breakpoint_calls.append(normalized)
 
     def set_execution_line(self, payload: dict) -> None:
         self.exec_calls.append(dict(payload))
+
+    def reply_hover_value(self, payload: dict[str, Any]) -> None:
+        self.hover_reply_calls.append(dict(payload))
 
     def set_cursor(
         self, line: int, column: int = 1, *, move_to_position: str = ''
@@ -1125,14 +1344,14 @@ def test_breakpoints_file_and_editor_sync(wnd: IdeMainWindow, prj_root: Path) ->
     assert ctrl.toggle_breakpoint_at(str(doc_a), 4) is True
     assert ctrl.breakpoints_snapshot() == [{'path': str(doc_a), 'line': 4}]
     assert bp.read_breakpoints(prj_root) == [Breakpoint(path=str(doc_a), line=4)]
-    assert edit_a.breakpoint_calls[-1] == [4]
+    assert edit_a.breakpoint_calls[-1] == [{'line': 4}]
     # чужой файл не задевает: широковещательный набор для него всегда пуст
     assert all(lines == [] for lines in edit_b.breakpoint_calls)
 
     ctrl.toggle_breakpoint_at(str(doc_a), 2)
-    assert edit_a.breakpoint_calls[-1] == [2, 4]
+    assert edit_a.breakpoint_calls[-1] == [{'line': 2}, {'line': 4}]
     ctrl.toggle_breakpoint_at(str(doc_a), 2)  # снятие
-    assert edit_a.breakpoint_calls[-1] == [4]
+    assert edit_a.breakpoint_calls[-1] == [{'line': 4}]
 
     # клик по глифу брейкпоинта в дорожке Monaco (сигнал редактора)
     edit_a.breakpoint_toggle_requested.emit(5)
@@ -1193,24 +1412,34 @@ def test_open_project_loads_and_prunes_breakpoints(
 def test_initial_breakpoints_pushed_in_handshake(
     wnd: IdeMainWindow, prj_root: Path, fake_adapter: Path, qtbot: Any
 ) -> None:
-    """Снимок брейкпоинтов уходит адаптеру до configurationDone."""
+    """Снимок брейкпоинтов (с условиями D3) + фильтры исключений уходят до configurationDone."""
     ctrl = wnd.dap_ctrl
     doc_a = prj_root / 'a.py'
     wnd.project_ctrl.open_project(prj_root)
     wnd.doc_ctrl.open_document(doc_a)
     ctrl.toggle_breakpoint_at(str(doc_a), 2)
     ctrl.toggle_breakpoint_at(str(doc_a), 5)
+    assert ctrl.set_breakpoint_condition(str(doc_a), 5, 'i == 2') is True
 
     assert ctrl.start_debugging() == ''
     wait_until(qtbot, lambda: ctrl.state == STATE_STOPPED,
                message='сессия на фейковом адаптере не встала на останов')
     commands = journal_commands(fake_adapter)
-    assert commands[:4] == [
-        'initialize', 'launch', 'setBreakpoints', 'configurationDone',
+    assert commands[:5] == [
+        'initialize', 'launch', 'setBreakpoints', 'setExceptionBreakpoints',
+        'configurationDone',
     ]
     sbp = next(e for e in journal_entries(fake_adapter) if e['command'] == 'setBreakpoints')
     assert sbp['path'] == str(doc_a)
     assert sbp['lines'] == [2, 5]
+    # D3: условие доехало до адаптера ровно в записи нужной строки
+    assert sbp['breakpoints'] == [{'line': 2}, {'line': 5, 'condition': 'i == 2'}]
+    # D3: фильтры исключений на handshake — только необработанные (дефолт опции)
+    seb = next(
+        e for e in journal_entries(fake_adapter)
+        if e['command'] == 'setExceptionBreakpoints'
+    )
+    assert seb['filters'] == ['uncaught']
 
     # правка набора в живой сессии — второй setBreakpoints следом
     ctrl.toggle_breakpoint_at(str(doc_a), 6)
@@ -1224,6 +1453,459 @@ def test_initial_breakpoints_pushed_in_handshake(
 
     ctrl.stop_debugging()
     assert ctrl.state == STATE_IDLE
+
+
+#####################################################
+# Условия/меню/фильтры/hover/опции (срез D3)        #
+
+
+def test_breakpoint_condition_api_and_editor_payload(
+    wnd: IdeMainWindow, prj_root: Path
+) -> None:
+    """Условия: файл с ``condition``, payload редактору, снятие условия/брейкпоинта."""
+    ctrl = wnd.dap_ctrl
+    doc_a = prj_root / 'a.py'
+    wnd.project_ctrl.open_project(prj_root)
+    wnd.doc_ctrl.open_document(doc_a)
+    edit_a = fake_edit(wnd, str(doc_a))
+
+    assert ctrl.toggle_breakpoint_at(str(doc_a), 4) is True
+    assert ctrl.set_breakpoint_condition(str(doc_a), 4, 'counter == 3') is True
+    assert ctrl.breakpoints_snapshot() == [
+        {'path': str(doc_a), 'line': 4, 'condition': 'counter == 3'},
+    ]
+    assert bp.read_breakpoints(prj_root) == [
+        Breakpoint(path=str(doc_a), line=4, condition='counter == 3'),
+    ]
+    assert edit_a.breakpoint_calls[-1] == [{'line': 4, 'condition': 'counter == 3'}]
+
+    # условие на отсутствующем брейкпоинте создаёт его сразу с условием
+    assert ctrl.set_breakpoint_condition(str(doc_a), 9, 'i > 1') is True
+    assert ctrl.breakpoint_lines_for(str(doc_a)) == [4, 9]
+    assert edit_a.breakpoint_calls[-1] == [
+        {'line': 4, 'condition': 'counter == 3'},
+        {'line': 9, 'condition': 'i > 1'},
+    ]
+
+    # пустое условие снимает условие, сам брейкпоинт остаётся
+    assert ctrl.set_breakpoint_condition(str(doc_a), 9, '') is True
+    assert edit_a.breakpoint_calls[-1] == [
+        {'line': 4, 'condition': 'counter == 3'},
+        {'line': 9},
+    ]
+    snap = ctrl.breakpoints_snapshot()
+    assert next(e for e in snap if e['line'] == 9).get('condition') is None
+
+    # снятие брейкпоинта целиком (меню/консоль)
+    assert ctrl.remove_breakpoint_at(str(doc_a), 9) is True
+    assert ctrl.breakpoint_lines_for(str(doc_a)) == [4]
+
+    # отказы: нет проекта / файл вне корня
+    assert ctrl.set_breakpoint_condition(
+        str(prj_root.parent / 'outside.py'), 1, 'x'
+    ) is False
+    wnd.project_ctrl.close_project()
+    assert ctrl.set_breakpoint_condition(str(doc_a), 4, '') is False
+    assert ctrl.remove_breakpoint_at(str(doc_a), 4) is False
+
+
+def test_breakpoint_context_menu_condition_flow(
+    wnd: IdeMainWindow, prj_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ПКМ по глифу: сигнальный маршрут, гейтинг пунктов, QInputDialog/снятие/удаление."""
+
+    class _FakeMenu:
+        """Подмена ``QMenu`` модуля контрола: запись экшенов, выбор по тексту."""
+
+        pick: str = ''
+        menus: list['_FakeMenu'] = []
+
+        def __init__(self, parent: Any = None) -> None:
+            self._actions: list[QAction] = []
+            _FakeMenu.menus.append(self)
+
+        def addAction(self, text: str) -> QAction:
+            action = QAction(text)
+            self._actions.append(action)
+            return action
+
+        def actions(self) -> list[QAction]:
+            return list(self._actions)
+
+        def exec(self, pos: Any = None) -> QAction | None:
+            return next(
+                (a for a in self._actions if a.text() == self.pick), None,
+            )
+
+    class _FakeInputDialog:
+        """Подмена ``QInputDialog.getText``: ({text}, accepted) из ``answer``."""
+
+        answer: tuple[str, bool] = ('', False)
+        calls: list[tuple[str, str, str]] = []
+
+        @staticmethod
+        def getText(
+            parent: Any, title: str, label: str, echo: Any = None, current: str = '',
+        ) -> tuple[str, bool]:
+            _FakeInputDialog.calls.append((title, label, current))
+            return _FakeInputDialog.answer
+
+    monkeypatch.setattr(dap_control_mod, 'QMenu', _FakeMenu)
+    monkeypatch.setattr(dap_control_mod, 'QInputDialog', _FakeInputDialog)
+
+    ctrl = wnd.dap_ctrl
+    doc_a = prj_root / 'a.py'
+    wnd.project_ctrl.open_project(prj_root)
+    wnd.doc_ctrl.open_document(doc_a)
+    edit_a = fake_edit(wnd, str(doc_a))
+
+    # брейкпоинта нет: «Снять условие»/«Удалить» выключены, «Условие...» — да;
+    # маршрут — сигнал редактора (связка ``_wire_doc_view``), не прямой вызов
+    _FakeMenu.pick = 'Условие...'
+    _FakeInputDialog.answer = ('  i == 2  ', True)
+    edit_a.breakpoint_context_requested.emit(4)
+    menu = _FakeMenu.menus[-1]
+    by_text = {a.text(): a for a in menu.actions()}
+    assert set(by_text) == {'Условие...', 'Снять условие', 'Удалить брейкпоинт'}
+    assert by_text['Условие...'].isEnabled() is True
+    assert by_text['Снять условие'].isEnabled() is False
+    assert by_text['Удалить брейкпоинт'].isEnabled() is False
+    title, label, current = _FakeInputDialog.calls[-1]
+    assert 'Условие' in title and '4' in label and current == ''
+    assert ctrl.breakpoints_snapshot() == [
+        {'path': str(doc_a), 'line': 4, 'condition': 'i == 2'},
+    ]
+    assert edit_a.breakpoint_calls[-1] == [{'line': 4, 'condition': 'i == 2'}]
+
+    # отмена диалога — ничего не меняется (текст поля — текущее условие)
+    _FakeInputDialog.answer = ('мусор', False)
+    edit_a.breakpoint_context_requested.emit(4)
+    assert _FakeInputDialog.calls[-1][2] == 'i == 2'
+    assert ctrl.breakpoints_snapshot() == [
+        {'path': str(doc_a), 'line': 4, 'condition': 'i == 2'},
+    ]
+
+    # условие есть: все пункты активны; «Снять условие» — без диалога
+    _FakeMenu.pick = 'Снять условие'
+    calls_before = len(_FakeInputDialog.calls)
+    edit_a.breakpoint_context_requested.emit(4)
+    menu = _FakeMenu.menus[-1]
+    assert all(a.isEnabled() for a in menu.actions())
+    assert len(_FakeInputDialog.calls) == calls_before
+    assert ctrl.breakpoints_snapshot() == [{'path': str(doc_a), 'line': 4}]
+
+    # «Удалить брейкпоинт» — снимает запись целиком
+    _FakeMenu.pick = 'Удалить брейкпоинт'
+    edit_a.breakpoint_context_requested.emit(4)
+    assert ctrl.breakpoints_snapshot() == []
+    assert edit_a.breakpoint_calls[-1] == []
+
+    # файл вне корня — меню не показывается вовсе
+    _FakeMenu.menus.clear()
+    ctrl.breakpoint_context_menu(str(prj_root.parent / 'outside.py'), 4)
+    assert _FakeMenu.menus == []
+
+
+def test_exception_filters_option_and_live_repush(
+    wnd: IdeMainWindow, prj_root: Path, fake_adapter: Path, qtbot: Any
+) -> None:
+    """``break_on_raised``: фильтры на handshake и переприменение в живую сессию."""
+    ctrl = wnd.dap_ctrl
+    doc_a = prj_root / 'a.py'
+    wnd.project_ctrl.open_project(prj_root)
+    wnd.doc_ctrl.open_document(doc_a)
+
+    assert ctrl.set_debug_option_app(KEY_BREAK_ON_RAISED, True) == ''
+    assert ctrl.debug_options()[KEY_BREAK_ON_RAISED] is True
+    assert dbg_opts.exception_filters(ctrl.debug_options()) == ['raised', 'uncaught']
+
+    assert ctrl.start_debugging() == ''
+    wait_until(qtbot, lambda: ctrl.state == STATE_STOPPED,
+               message='сессия на фейковом адаптере не встала на останов')
+
+    def seb_entries() -> list[dict[str, Any]]:
+        return [
+            e for e in journal_entries(fake_adapter)
+            if e['command'] == 'setExceptionBreakpoints'
+        ]
+
+    assert len(seb_entries()) == 1
+    assert seb_entries()[0]['filters'] == ['raised', 'uncaught']
+
+    # смена опции в останове — фильтры переприменяются в живую сессию
+    assert ctrl.set_debug_option_app(KEY_BREAK_ON_RAISED, False) == ''
+    wait_until(
+        qtbot, lambda: len(seb_entries()) >= 2,
+        message='смена фильтра исключений не переприменена в живую сессию',
+    )
+    assert seb_entries()[-1]['filters'] == ['uncaught']
+
+    # ошибки контракта: неизвестный ключ/битое значение
+    with pytest.raises(ValueError, match='Неизвестная опция'):
+        ctrl.set_debug_option_app('nope', True)
+    with pytest.raises(TypeError):
+        ctrl.set_debug_option_app(KEY_BREAK_ON_RAISED, 'да')
+
+    ctrl.stop_debugging()
+    assert ctrl.state == STATE_IDLE
+
+
+def test_debug_options_two_layers(wnd: IdeMainWindow, prj_root: Path) -> None:
+    """Двухслойность: проект старее приложения; снятие перекрытия/дефолт-ключа."""
+    ctrl = wnd.dap_ctrl
+    assert ctrl.debug_options_app() == {KEY_BREAK_ON_RAISED: False}
+    assert dbg_opts.exception_filters(ctrl.debug_options()) == ['uncaught']
+
+    prj = wnd.project_ctrl
+    prj.open_project(prj_root)
+    prj.project_settings_set(SECTION_DEBUG, KEY_BREAK_ON_RAISED, True)
+    assert ctrl.debug_options()[KEY_BREAK_ON_RAISED] is True
+    assert ctrl.debug_options_app()[KEY_BREAK_ON_RAISED] is False
+
+    # приложение True, проект False — проектное перекрытие старше
+    assert ctrl.set_debug_option_app(KEY_BREAK_ON_RAISED, True) == ''
+    assert ctrl.debug_options()[KEY_BREAK_ON_RAISED] is True
+    prj.project_settings_set(SECTION_DEBUG, KEY_BREAK_ON_RAISED, False)
+    assert ctrl.debug_options()[KEY_BREAK_ON_RAISED] is False
+    assert ctrl.debug_options_app()[KEY_BREAK_ON_RAISED] is True
+
+    # строгая валидация записи в секцию проекта
+    with pytest.raises(ValueError, match='флаг'):
+        prj.project_settings_set(SECTION_DEBUG, KEY_BREAK_ON_RAISED, 'не флаг')
+    with pytest.raises(ValueError, match='Неизвестный ключ'):
+        prj.project_settings_set(SECTION_DEBUG, 'nope', True)
+
+    # закрытие проекта — перекрытие снято с модели, слой приложения остаётся
+    prj.close_project()
+    assert ctrl.debug_options()[KEY_BREAK_ON_RAISED] is True
+
+    # возврат к дефолту — ключ QSettings снимается
+    assert ctrl.set_debug_option_app(KEY_BREAK_ON_RAISED, False) == ''
+    assert ctrl.debug_options_app() == {KEY_BREAK_ON_RAISED: False}
+
+
+def test_hover_gate_outside_stop(wnd: IdeMainWindow, prj_root: Path) -> None:
+    """Вне останова hover-запрос отвечает мгновенно found=False; мусор — без ответа."""
+    doc_a = prj_root / 'a.py'
+    wnd.project_ctrl.open_project(prj_root)
+    wnd.doc_ctrl.open_document(doc_a)
+    edit_a = fake_edit(wnd, str(doc_a))
+
+    edit_a.hover_value_requested.emit(
+        {'requestId': 'h1', 'expression': 'x', 'line': 4}
+    )
+    assert edit_a.hover_reply_calls == [
+        {'requestId': 'h1', 'found': False, 'text': ''},
+    ]
+
+    # битые payload'ы (нет requestId / нет expression / пустое выражение) — без ответа
+    for bad in (
+        {'expression': 'x'},
+        {'requestId': 'h2', 'line': 1},
+        {'requestId': 'h3', 'expression': '', 'line': 1},
+    ):
+        edit_a.hover_value_requested.emit(bad)
+    assert len(edit_a.hover_reply_calls) == 1
+
+
+def test_hover_evaluate_in_stopped_session(
+    wnd: IdeMainWindow, prj_root: Path, fake_adapter: Path, qtbot: Any
+) -> None:
+    """Останов на фейковом адаптере: hover ``evaluate`` context='hover', значения из таблицы."""
+    ctrl = wnd.dap_ctrl
+    doc_a = prj_root / 'a.py'
+    wnd.project_ctrl.open_project(prj_root)
+    wnd.doc_ctrl.open_document(doc_a)
+    edit_a = fake_edit(wnd, str(doc_a))
+    assert ctrl.toggle_breakpoint_at(str(doc_a), 4) is True
+
+    assert ctrl.start_debugging() == ''
+    wait_until(qtbot, lambda: ctrl.state == STATE_STOPPED,
+               message='сессия не встала на останов')
+    wait_until(qtbot, lambda: ctrl._current_frame_id is not None,
+               message='кадр останова не поднят для hover')
+
+    edit_a.hover_value_requested.emit(
+        {'requestId': 'h1', 'expression': 'x', 'line': 4}
+    )
+    wait_until(qtbot, lambda: len(edit_a.hover_reply_calls) >= 1,
+               message='hover-ответ не дошёл до редактора')
+    assert edit_a.hover_reply_calls[-1] == {
+        'requestId': 'h1', 'found': True, 'text': '42',
+    }
+
+    evaluate = next(
+        e for e in journal_entries(fake_adapter) if e['command'] == 'evaluate'
+    )
+    assert evaluate['expression'] == 'x'
+    assert evaluate['context'] == 'hover'
+    assert evaluate['frameId'] == ctrl._current_frame_id
+
+    # неизвестное выражение — адаптер отвечает success=False, редактор получает пусто
+    edit_a.hover_value_requested.emit(
+        {'requestId': 'h2', 'expression': 'nosuchvar', 'line': 4}
+    )
+    wait_until(qtbot, lambda: len(edit_a.hover_reply_calls) >= 2,
+               message='второй hover-ответ не дошёл до редактора')
+    assert edit_a.hover_reply_calls[-1] == {
+        'requestId': 'h2', 'found': False, 'text': '',
+    }
+
+    ctrl.stop_debugging()
+    assert ctrl.state == STATE_IDLE
+
+
+def test_evaluate_to_console_repl(
+    wnd: IdeMainWindow, prj_root: Path, fake_adapter: Path, qtbot: Any
+) -> None:
+    """``debug_evaluate``: контекст 'repl', итог/ошибка в консоль, текст вне сессии."""
+    ctrl = wnd.dap_ctrl
+    doc_a = prj_root / 'a.py'
+    wnd.project_ctrl.open_project(prj_root)
+    wnd.doc_ctrl.open_document(doc_a)
+
+    assert ctrl.evaluate_to_console('x') == 'Ошибка evaluate: Не в останове'
+
+    assert ctrl.start_debugging() == ''
+    wait_until(qtbot, lambda: ctrl.state == STATE_STOPPED,
+               message='сессия не встала на останов')
+    wait_until(qtbot, lambda: ctrl._current_frame_id is not None,
+               message='кадр останова не поднят для evaluate')
+
+    assert ctrl.evaluate_to_console('counter') == '3'
+    assert ctrl.evaluate_to_console('nosuchvar') == (
+        'Ошибка evaluate: Имя неизвестно: nosuchvar'
+    )
+    repls = [
+        e for e in journal_entries(fake_adapter)
+        if e['command'] == 'evaluate' and e['context'] == 'repl'
+    ]
+    assert [e['expression'] for e in repls] == ['counter', 'nosuchvar']
+
+    view = ctrl.debug_console_view
+    assert view is not None
+    text = view.console_text()
+    assert '> counter\n3' in text
+    assert '[ошибка] Имя неизвестно: nosuchvar' in text
+
+    ctrl.stop_debugging()
+    assert ctrl.state == STATE_IDLE
+    assert ctrl.evaluate_to_console('x') == 'Ошибка evaluate: Не в останове'
+
+
+def test_evaluate_adapter_failure_message(
+    wnd: IdeMainWindow,
+    prj_root: Path,
+    fake_adapter: Path,
+    qtbot: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``eval_fail``: success=False от адаптера — человеческий текст в консоли."""
+    monkeypatch.setenv('PYQTP_FAKE_DAP_MODE', 'eval_fail')
+    ctrl = wnd.dap_ctrl
+    doc_a = prj_root / 'a.py'
+    wnd.project_ctrl.open_project(prj_root)
+    wnd.doc_ctrl.open_document(doc_a)
+
+    assert ctrl.start_debugging() == ''
+    wait_until(qtbot, lambda: ctrl.state == STATE_STOPPED,
+               message='сессия не встала на останов')
+    wait_until(qtbot, lambda: ctrl._current_frame_id is not None,
+               message='кадр останова не поднят для evaluate')
+
+    assert ctrl.evaluate_to_console('counter') == (
+        'Ошибка evaluate: Имя неизвестно: counter'
+    )
+    view = ctrl.debug_console_view
+    assert view is not None
+    assert '[ошибка] Имя неизвестно: counter' in view.console_text()
+
+    ctrl.stop_debugging()
+    assert ctrl.state == STATE_IDLE
+
+
+def test_debug_d3_console_api(wnd: IdeMainWindow, prj_root: Path) -> None:
+    """Console-API среза D3: условия/снятие брейкпоинтов, опции, evaluate вне сессии."""
+    env: dict[str, Any] = wnd.api_ctrl.env
+    for name in (
+        'debug_breakpoint_condition',
+        'debug_breakpoint_remove',
+        'debug_options_show',
+        'debug_options_set',
+        'debug_evaluate',
+    ):
+        assert name in env
+
+    doc_a = prj_root / 'a.py'
+    wnd.project_ctrl.open_project(prj_root)
+    assert env['debug_breakpoint_condition'](str(doc_a), 3, 'i > 1') is True
+    assert env['debug_breakpoint_condition'](str(doc_a), 5, 'j < 0') is True
+    assert env['debug_breakpoints_show']() == [
+        {'path': str(doc_a), 'line': 3, 'condition': 'i > 1'},
+        {'path': str(doc_a), 'line': 5, 'condition': 'j < 0'},
+    ]
+    assert env['debug_breakpoint_remove'](str(doc_a), 3) is True
+    assert env['debug_breakpoints_show']() == [
+        {'path': str(doc_a), 'line': 5, 'condition': 'j < 0'},
+    ]
+
+    assert env['debug_options_set'](KEY_BREAK_ON_RAISED, True) == ''
+    assert env['debug_options_show']() == {KEY_BREAK_ON_RAISED: True}
+    with pytest.raises(ValueError, match='Неизвестная опция'):
+        env['debug_options_set']('nope', True)
+    with pytest.raises(TypeError):
+        env['debug_options_set'](KEY_BREAK_ON_RAISED, 1)
+    assert env['debug_evaluate']('x') == 'Ошибка evaluate: Не в останове'
+    assert env['debug_options_set'](KEY_BREAK_ON_RAISED, False) == ''
+    assert env['debug_options_show']() == {KEY_BREAK_ON_RAISED: False}
+
+
+def test_debug_settings_page_two_layers(
+    wnd: IdeMainWindow, prj_root: Path
+) -> None:
+    """Страница «Отладка»: одна галка, две области, effective-load/reset-слоя."""
+    ctrl = wnd.dap_ctrl
+    page = wnd.settings_ctrl.page_get('debug')
+    assert page is not None
+    assert page.title == 'Отладка'
+    assert page.order == 60
+    assert page.scope_applicable is True
+
+    widget = page.create_page_widget()
+    assert len(widget.findChildren(QCheckBox)) == 1
+    box = widget.findChild(QCheckBox)
+    assert isinstance(box, QCheckBox)
+    assert box.isChecked() is False  # дефолт
+
+    # «Приложение»: apply пишет слой приложения (QSettings)
+    box.setChecked(True)
+    page.apply()
+    assert ctrl.debug_options_app()[KEY_BREAK_ON_RAISED] is True
+
+    # «Проект»: load — ЭФФЕКТИВное значение, apply — слой проекта, app не тронут
+    wnd.project_ctrl.open_project(prj_root)
+    page.scope_set(SCOPE_PROJECT)
+    page.load()
+    assert box.isChecked() is True
+    box.setChecked(False)
+    page.apply()
+    assert ctrl.debug_options()[KEY_BREAK_ON_RAISED] is False
+    assert wnd.project_ctrl.project_settings_section(SECTION_DEBUG) == {
+        KEY_BREAK_ON_RAISED: False,
+    }
+    assert ctrl.debug_options_app()[KEY_BREAK_ON_RAISED] is True
+
+    # reset в «Проекте» — снимает перекрытие и сам грузит страницу (откат на app)
+    page.reset_defaults()
+    assert wnd.project_ctrl.project_settings_section(SECTION_DEBUG) == {}
+    assert ctrl.debug_options()[KEY_BREAK_ON_RAISED] is True
+    assert box.isChecked() is True
+
+    # reset в «Приложении» — снимает ключ QSettings
+    page.scope_set('app')
+    page.reset_defaults()
+    assert ctrl.debug_options_app()[KEY_BREAK_ON_RAISED] is False
+    assert box.isChecked() is False
 
 
 ###########################
@@ -1326,6 +2008,129 @@ def test_live_debugpy_breakpoint_hit(
     view = ctrl.debug_console_view
     assert view is not None
     assert 'Остановка по требованию' in view.console_text()
+
+
+@pytest.mark.live
+def test_live_debugpy_conditional_breakpoint(
+    wnd: IdeMainWindow, loop_root: Path, clean_dap_env: None, qtbot: Any
+) -> None:
+    """Условный брейкпоинт ``i == 2`` в цикле: останов на нужной итерации, ``i`` вычислим."""
+    ctrl = wnd.dap_ctrl
+    target = loop_root / 'loopy.py'
+    wnd.project_ctrl.open_project(loop_root)
+    wnd.doc_ctrl.open_document(target)
+    assert ctrl.toggle_breakpoint_at(str(target), 4) is True
+    assert ctrl.set_breakpoint_condition(str(target), 4, 'i == 2') is True
+
+    assert ctrl.start_debugging() == ''
+    wait_until(qtbot, lambda: ctrl.state == STATE_STOPPED, timeout=60.0,
+               message='условный брейкпоинт в живой сессии не сработал')
+    wait_until(qtbot, lambda: ctrl._current_frame_id is not None,
+               message='кадр останова не поднят')
+    status = ctrl.debug_status()
+    assert Path(status['path']).name == 'loopy.py'
+    assert status['line'] == 4
+    # условие уважается: останов именно на итерации i == 2
+    assert ctrl.evaluate_to_console('i') == '2'
+
+    ctrl.stop_debugging()
+    assert ctrl.state == STATE_IDLE
+
+
+@pytest.mark.live
+def test_live_debugpy_hover_value(
+    wnd: IdeMainWindow, live_root: Path, clean_dap_env: None, qtbot: Any
+) -> None:
+    """Hover в живой сессии: на entry ``x`` не вычислено, после шага — ``x`` = 1."""
+    ctrl = wnd.dap_ctrl
+    prog = live_root / 'prog.py'
+    wnd.project_ctrl.open_project(live_root)
+    wnd.doc_ctrl.open_document(prog)
+    edit = fake_edit(wnd, str(prog))
+
+    assert ctrl.start_debugging() == ''
+    wait_until(qtbot, lambda: ctrl.state == STATE_STOPPED, timeout=40.0,
+               message='debugpy не остановился на entry')
+    wait_until(qtbot, lambda: ctrl._current_frame_id is not None,
+               message='кадр останова не поднят для hover')
+
+    edit.hover_value_requested.emit({'requestId': 'h1', 'expression': 'x', 'line': 1})
+    wait_until(qtbot, lambda: len(edit.hover_reply_calls) >= 1, timeout=30.0,
+               message='hover-ответ не дошёл до редактора')
+    assert edit.hover_reply_calls[-1] == {
+        'requestId': 'h1', 'found': False, 'text': '',
+    }
+
+    assert ctrl.step_over() == ''
+    wait_until(qtbot, lambda: ctrl.debug_status().get('line') == 2, timeout=20.0,
+               message='шаг F10 в живой сессии не дал новую строку останова')
+
+    edit.hover_value_requested.emit({'requestId': 'h2', 'expression': 'x', 'line': 2})
+    wait_until(qtbot, lambda: len(edit.hover_reply_calls) >= 2, timeout=30.0,
+               message='второй hover-ответ не дошёл до редактора')
+    assert edit.hover_reply_calls[-1] == {
+        'requestId': 'h2', 'found': True, 'text': '1',
+    }
+
+    ctrl.stop_debugging()
+    assert ctrl.state == STATE_IDLE
+
+
+@pytest.fixture
+def bug_root(tmp_path: Path) -> Path:
+    """Проект с проглоченным исключением (``try/except``) — цель для фильтра raised."""
+    root = tmp_path / 'buggy'
+    root.mkdir()
+    (root / 'buggy.py').write_text(
+        'result = None\n'
+        'try:\n'
+        '    1 / 0\n'
+        'except ZeroDivisionError:\n'
+        '    result = "handled"\n'
+        'print(result)\n'
+        'print("done")\n',
+        encoding='utf-8',
+    )
+    return root
+
+
+def _user_file_stop(qtbot: Any, ctrl: Any, file_name: str) -> bool:
+    """Останов в пользовательском файле; шумы debugpy вне него — продолжить (raised-фильтр)."""
+    if ctrl.state != STATE_STOPPED:
+        return False
+    status = ctrl.debug_status()
+    if Path(str(status.get('path') or '')).name == file_name:
+        return True
+    ctrl.continue_execution()
+    return False
+
+
+@pytest.mark.live
+def test_live_break_on_raised_exception_filter(
+    wnd: IdeMainWindow, bug_root: Path, clean_dap_env: None, qtbot: Any
+) -> None:
+    """Без флага проглоченное исключение не видно; с ``break_on_raised`` — останов в try."""
+    ctrl = wnd.dap_ctrl
+    target = bug_root / 'buggy.py'
+    wnd.project_ctrl.open_project(bug_root)
+    wnd.doc_ctrl.open_document(target)
+
+    # дефолт (только uncaught): программа доходит до конца без остановов
+    assert ctrl.start_debugging() == ''
+    wait_until(qtbot, lambda: ctrl.state == STATE_IDLE, timeout=40.0,
+               message='живая сессия с перехваченным исключением не завершилась')
+    view = ctrl.debug_console_view
+    assert view is not None
+    assert 'done' in view.console_text()
+
+    # флаг raised: та же программа встаёт на выброшенном исключении внутри try
+    assert ctrl.set_debug_option_app(KEY_BREAK_ON_RAISED, True) == ''
+    assert ctrl.start_debugging() == ''
+    wait_until(qtbot, lambda: _user_file_stop(qtbot, ctrl, 'buggy.py'), timeout=60.0,
+               message='фильтр raised не остановил на выброшенном исключении')
+    assert ctrl.debug_status()['line'] == 3
+    ctrl.stop_debugging()
+    assert ctrl.state == STATE_IDLE
 
 
 #############################
@@ -1460,3 +2265,154 @@ def test_webengine_gutter_click_routing(
     with qtbot.waitSignal(dap_editor.bookmark_toggle_requested, timeout=10000) as blocker:
         run_js(dap_editor, "window.qtmonaco.__pyqtp_gutter_click(5, 'bookmark')")
     assert blocker.args == [5]
+
+
+@pytest.mark.webengine
+@webengine_only
+def test_webengine_conditional_breakpoint_glyphs(
+    qtbot: Any, dap_editor: QtMonacoEditorWidget
+) -> None:
+    """Записи с ``condition``: обычный глиф + полый кружок ``.pyqtp-breakpoint-cond``."""
+    wait_editor_ready(qtbot, dap_editor)
+    dap_editor.set_breakpoints([{'line': 2}, {'line': 5, 'condition': 'i == 2'}])
+    wait_until(qtbot, lambda: dom_count(dap_editor, '.pyqtp-breakpoint-glyph') == '2',
+               timeout=20.0, poll=0.3,
+               message='глифы брейкпоинтов не появились в DOM')
+    assert dom_count(dap_editor, '.pyqtp-breakpoint-cond') == '1'
+
+    dap_editor.set_breakpoints([{'line': 2, 'condition': 'x > 1'}])
+    wait_until(qtbot, lambda: dom_count(dap_editor, '.pyqtp-breakpoint-glyph') == '1',
+               timeout=20.0, poll=0.3,
+               message='набор глифов брейкпоинтов не обновился')
+    assert dom_count(dap_editor, '.pyqtp-breakpoint-cond') == '1'
+
+    # голые числа (payload D1) — условий больше нет
+    dap_editor.set_breakpoints([2, 5])
+    wait_until(qtbot, lambda: dom_count(dap_editor, '.pyqtp-breakpoint-glyph') == '2',
+               timeout=20.0, poll=0.3,
+               message='глифы брейкпоинтов не восстановились')
+    assert dom_count(dap_editor, '.pyqtp-breakpoint-cond') == '0'
+
+
+@pytest.mark.webengine
+@webengine_only
+def test_webengine_breakpoint_context_route(
+    qtbot: Any, dap_editor: QtMonacoEditorWidget
+) -> None:
+    """Правый клик по глифу — ``breakpoint_context_requested``; правый мимо глифа — мимо."""
+    wait_editor_ready(qtbot, dap_editor)
+    dap_editor.set_breakpoints([3])
+    wait_until(qtbot, lambda: dom_count(dap_editor, '.pyqtp-breakpoint-glyph') == '1',
+               timeout=20.0, poll=0.3,
+               message='глиф брейкпоинта не подготовлен для пробы ПКМ')
+
+    with qtbot.waitSignal(dap_editor.breakpoint_context_requested, timeout=10000) as blocker:
+        run_js(dap_editor, "window.qtmonaco.__pyqtp_gutter_click(3, 'breakpoint', 'right')")
+    assert blocker.args == [3]
+
+    # правый клик не по глифу брейкпоинта — в python не уходит ничего
+    with qtbot.assertNotEmitted(dap_editor.breakpoint_context_requested, wait=500):
+        run_js(dap_editor, "window.qtmonaco.__pyqtp_gutter_click(6, 'bookmark', 2)")
+    with qtbot.assertNotEmitted(dap_editor.breakpoint_toggle_requested, wait=500):
+        run_js(dap_editor, "window.qtmonaco.__pyqtp_gutter_click(6, 'breakpoint', 2)")
+    with qtbot.assertNotEmitted(dap_editor.bookmark_toggle_requested, wait=500):
+        run_js(dap_editor, "window.qtmonaco.__pyqtp_gutter_click(6, 'bookmark', 2)")
+
+
+@pytest.mark.webengine
+@webengine_only
+def test_webengine_glyph_suppresses_monaco_context_menu(
+    qtbot: Any, dap_editor: QtMonacoEditorWidget
+) -> None:
+    """``contextmenu`` на глифе перехвачен нашим слушателем, на тексте — нет.
+
+    Monaco сам preventDefault'ит ``contextmenu`` на тексте (своё меню), поэтому
+    пробираем именно наш перехват: хук ``__pyqtp_ctx_prevented`` выставляет
+    только наша capture-ветка на глифе брейкпоинта.
+    """
+    wait_editor_ready(qtbot, dap_editor)
+    dap_editor.set_breakpoints([3])
+    wait_until(qtbot, lambda: dom_count(dap_editor, '.pyqtp-breakpoint-glyph') == '1',
+               timeout=20.0, poll=0.3,
+               message='глиф брейкпоинта не подготовлен для пробы contextmenu')
+
+    def dispatch_context(selector: str) -> str:
+        """Dispatch синтетического contextmenu на селектор; 'prevented|наш-перехват'."""
+        return str(run_js(
+            dap_editor,
+            "(() => {"
+            f"  const el = document.querySelector('{selector}');"
+            "  if (!el) return 'NO_EL';"
+            "  const ev = new MouseEvent('contextmenu',"
+            "    {bubbles: true, cancelable: true});"
+            "  el.dispatchEvent(ev);"
+            "  return String(ev.defaultPrevented) + '|' + String("
+            "    window.qtmonaco.__pyqtp_ctx_prevented === true);"
+            "})()",
+        ))
+
+    # глиф: наш слушатель preventDefault'ит и останавливает всплытие (наше Qt-меню)
+    assert dispatch_context('.pyqtp-breakpoint-glyph') == 'true|true'
+
+    # текст: наш перехват не срабатывает (наше меню не подменяет меню Monaco)
+    assert dispatch_context('.view-lines') == 'true|false'
+
+
+@pytest.mark.webengine
+@webengine_only
+def test_webengine_hover_value_roundtrip(
+    qtbot: Any,
+    dap_editor: QtMonacoEditorWidget,
+) -> None:
+    """Hover round-trip: запрос в python, ответы FOUND/EMPTY и JS-тайм-аут TIMEOUT."""
+    wait_editor_ready(qtbot, dap_editor)
+
+    requests: list[dict[str, Any]] = []
+
+    def _on_request(payload: dict[str, Any]) -> None:
+        requests.append(dict(payload))
+
+    dap_editor.hover_value_requested.connect(_on_request)
+
+    def last_hover() -> str:
+        return str(run_js(
+            dap_editor, "String(window.qtmonaco.__pyqtp_last_hover || 'NONE')"
+        ))
+
+    def request_hover(expression: str, line: int, expect: int) -> dict[str, Any]:
+        run_js(dap_editor,
+               f"window.qtmonaco.__pyqtp_request_hover({expression!r}, {line})")
+        wait_until(qtbot, lambda: len(requests) >= expect, timeout=15.0, poll=0.2,
+                   message='hover-запрос не дошёл до python')
+        return requests[-1]
+
+    # найденное значение → FOUND
+    payload = request_hover('counter', 2, 1)
+    assert payload['expression'] == 'counter'
+    assert payload['line'] == 2
+    assert str(payload['requestId']).startswith('h')
+    dap_editor.reply_hover_value(
+        {'requestId': payload['requestId'], 'found': True, 'text': '42'}
+    )
+    wait_until(qtbot, lambda: last_hover() == 'FOUND', timeout=15.0, poll=0.2,
+               message='hover-маркер не стал FOUND')
+
+    # ответ по неизвестному requestId — молча мимо, маркер не меняется
+    dap_editor.reply_hover_value(
+        {'requestId': 'h999', 'found': True, 'text': 'мимо'}
+    )
+    qtbot.wait(300)
+    assert last_hover() == 'FOUND'
+
+    # found=False → EMPTY
+    payload = request_hover('x', 4, 2)
+    dap_editor.reply_hover_value(
+        {'requestId': payload['requestId'], 'found': False, 'text': ''}
+    )
+    wait_until(qtbot, lambda: last_hover() == 'EMPTY', timeout=15.0, poll=0.2,
+               message='hover-маркер не стал EMPTY')
+
+    # без ответа — JS-тайм-аут 2 с → TIMEOUT
+    request_hover('slow', 2, 3)
+    wait_until(qtbot, lambda: last_hover() == 'TIMEOUT', timeout=15.0, poll=0.3,
+               message='JS-тайм-аут hover-запроса не сработал')

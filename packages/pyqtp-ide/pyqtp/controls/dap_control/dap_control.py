@@ -8,9 +8,16 @@
 ``state_changed``.
 
 Брейкпоинты проекта (``.pyqtp/breakpoints.json``, паттерн 9.7) живут здесь
-же: переключение (F9/клик по дорожке Monaco), персистентность, раздача строк
-открытым редакторам (``set_breakpoints``) и синхронизация в живую сессию
-(``setBreakpoints`` + хук ``on_breakpoints_ready`` на handshake).
+же: переключение (F9/клик по дорожке Monaco), условия брейкпоинтов и
+контекстное меню по правому клику в дорожке (срез D3), персистентность,
+раздача записей открытым редакторам (``set_breakpoints``) и синхронизация
+в живую сессию (``setBreakpoints`` + хук ``on_breakpoints_ready`` на
+handshake). Опции отладки (``break_on_raised``, страница «Отладка») — два
+слоя, как у редактора/LSP (9.6B): QSettings ``DapOptions`` + проектная
+секция ``debug``; фильтры исключений DAP применяются хуком
+``on_exception_breakpoints_ready`` и переприменяются в живую сессию.
+HOVER-значения выражений из Monaco обслуживаются запросом ``evaluate``
+(context='hover') текущей сессии в останове.
 
 Треды/корутины: все ``DapSession``-операции живут только в loop-потоке;
 GUI-поток дергает их через ``run_coroutine_threadsafe`` и ждёт результат
@@ -31,19 +38,26 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from PySide6.QtCore import QObject, Qt, Signal
-from PySide6.QtGui import QAction, QIcon, QKeySequence
+from PySide6.QtGui import QAction, QCursor, QIcon, QKeySequence
+from PySide6.QtWidgets import QInputDialog, QLineEdit, QMenu
 
 from pyqtp.controls.base_control import BaseControl
 from pyqtp.controls.dap_control import breakpoints as bp_mod
+from pyqtp.controls.dap_control import debug_options as dbg_opts
 from pyqtp.controls.dap_control import debug_tree as dt
 from pyqtp.controls.dap_control.dap_process import adapter_command
 from pyqtp.controls.dap_control.dap_session import DapError, DapSession
+from pyqtp.controls.dap_control.debug_settings_page import DebugSettingsPage
 from pyqtp.controls.dap_control.launch_config import (
     LaunchConfig,
     default_config,
     launch_arguments,
     read_launch_file,
     resolve_config,
+)
+from pyqtp.controls.project_control.project_settings import (
+    KEY_BREAK_ON_RAISED,
+    SECTION_DEBUG,
 )
 from pyqtp.utils.priority_menu import PriorityMenu
 from pyqtp.views.debug_console_view import DebugConsoleView
@@ -109,6 +123,9 @@ class _DapSignals(QObject):
     scopes_ready = Signal(int, int, list)
     # gen, variablesReference родителя, VariableRow-список детей
     variables_ready = Signal(int, int, list)
+    # D3 — ответ на hover-запрос выражения: gen, ключ документа-источника,
+    # payload для редактора {'requestId', 'found', 'text'} (queued из loop)
+    hover_ready = Signal(int, str, dict)
 
 
 @dataclass
@@ -233,6 +250,14 @@ class DapControl(BaseControl):
         self._signals.stack_ready.connect(self._on_stack_ready)
         self._signals.scopes_ready.connect(self._on_scopes_ready)
         self._signals.variables_ready.connect(self._on_variables_ready)
+        self._signals.hover_ready.connect(self._on_hover_ready)
+        # смена опций проекта — переприменить фильтры исключений в живую сессию
+        self._main_wnd.project_ctrl.project_settings_changed.connect(
+            self._repush_exception_filters,
+        )
+
+        # Страница опций отладки в окне настроек IDE (паттерн LspHub)
+        self._main_wnd.settings_page_register(DebugSettingsPage(self))
 
         self._main_wnd.api_ctrl.register_variables({
             'debug_start': self.start_debugging,
@@ -247,6 +272,12 @@ class DapControl(BaseControl):
             'debug_threads_show': self.threads_snapshot,
             'debug_scopes_show': self.scopes_snapshot,
             'debug_frame_select': self.select_frame,
+            # D3 — условия брейкпоинтов, опции отладки, evaluate в консоль
+            'debug_breakpoint_condition': self.set_breakpoint_condition,
+            'debug_breakpoint_remove': self.remove_breakpoint_at,
+            'debug_options_show': self.debug_options,
+            'debug_options_set': self.set_debug_option_app,
+            'debug_evaluate': self.evaluate_to_console,
         })
         self._update_actions_enabled()
 
@@ -390,33 +421,92 @@ class DapControl(BaseControl):
     # ------------------------------------------------------------------ #
 
     def breakpoints_snapshot(self) -> list[dict[str, Any]]:
-        """Список брейкпоинтов проекта (формат консоли/тестов)."""
-        return [{'path': item.path, 'line': item.line} for item in self._breakpoints]
+        """Список брейкпоинтов проекта (формат консоли/тестов).
+
+        Ключ ``condition`` (срез D3) — только при непустом условии.
+        """
+        entries = []
+        for item in self._breakpoints:
+            entry: dict[str, Any] = {'path': item.path, 'line': item.line}
+            if item.condition:
+                entry['condition'] = item.condition
+            entries.append(entry)
+        return entries
 
     def breakpoint_lines_for(self, path: str) -> list[int]:
         """Отсортированные строки брейкпоинтов одного файла."""
         return bp_mod.breakpoints_for(self._breakpoints, str(Path(path)))
 
+    def breakpoint_entries_for(self, path: str) -> list[dict[str, Any]]:
+        """Записи брейкпоинтов файла для Monaco/``setBreakpoints`` (D3)."""
+        return bp_mod.breakpoint_entries_for(self._breakpoints, str(Path(path)))
+
+    def breakpoint_at(self, path: str, line: int) -> Breakpoint | None:
+        """Брейкпоинт ``(path, line)`` или ``None``."""
+        key = (str(Path(path)), int(line))
+        return next(
+            (item for item in self._breakpoints if (item.path, item.line) == key),
+            None,
+        )
+
     def toggle_breakpoint_at(self, path: str, line: int) -> bool:
         """Переключает брейкпоинт (F9/клик по дорожке): файл + редакторы + сессия."""
+        updated = self._checked_breakpoints_update(
+            lambda items: bp_mod.toggle_breakpoint(items, path, int(line)),
+            path,
+        )
+        return updated is not None
+
+    def set_breakpoint_condition(self, path: str, line: int, condition: str) -> bool:
+        """Ставит/меняет/снимает условие брейкпоинта (срез D3).
+
+        Непустое условие на отсутствующем брейкпоинте добавляет его с
+        условием; пустое условие на существующем снимает условие, сам
+        брейкпоинт остаётся.
+        """
+        updated = self._checked_breakpoints_update(
+            lambda items: bp_mod.set_breakpoint_condition(
+                items, path, int(line), str(condition),
+            ),
+            path,
+        )
+        return updated is not None
+
+    def remove_breakpoint_at(self, path: str, line: int) -> bool:
+        """Снимает брейкпоинт ``(path, line)`` (контекстное меню/консоль)."""
+        updated = self._checked_breakpoints_update(
+            lambda items: bp_mod.remove_breakpoint(items, path, int(line)),
+            path,
+        )
+        return updated is not None
+
+    def _checked_breakpoints_update(
+        self, mutate: Callable[[list[Breakpoint]], list[Breakpoint]], path: str,
+    ) -> list[Breakpoint] | None:
+        """Общий маршрут правки набора: корень -> файл -> состояние -> раздача.
+
+        ``None`` — отказ (нет проекта / файл вне корня / запись файла не
+        удалась); иначе новый набор. Синхронизация в живую сессию — после
+        успеха записи (path нормализуется один раз).
+        """
         root = self._main_wnd.project_ctrl.project_root
         if root is None:
             dbg_log.info('Брейкпоинт: проект не открыт')
-            return False
+            return None
         resolved = str(Path(path))
         if not self._under_root(root, resolved):
             dbg_log.info('Брейкпоинт вне корня проекта: %s', resolved)
-            return False
-        updated = bp_mod.toggle_breakpoint(self._breakpoints, resolved, int(line))
+            return None
+        updated = mutate(self._breakpoints)
         try:
             bp_mod.write_breakpoints(root, updated)
         except OSError as exc:
             dbg_log.warning('Не удалось сохранить брейкпоинты проекта: %s', exc)
-            return False
+            return None
         self._breakpoints = updated
         self._broadcast_breakpoints()
         self._sync_breakpoints_to_session(resolved)
-        return True
+        return updated
 
     def toggle_breakpoint_active(self) -> None:
         """F9: брейкпоинт на строке каретки активного документа."""
@@ -470,16 +560,62 @@ class DapControl(BaseControl):
         return candidate == root or root in candidate.parents
 
     # ------------------------------------------------------------------ #
+    # Контекстное меню брейкпоинта в дорожке (срез D3)                   #
+    # ------------------------------------------------------------------ #
+
+    def breakpoint_context_menu(self, path: str, line: int) -> None:
+        """Правый клик по дорожке Monaco: условия/удаление брейкпоинта.
+
+        Пункт «Условие...» открывает ``QInputDialog.getText`` (выражение
+        Python — его шлёт debugpy в ``setBreakpoints``), «Снять условие» и
+        «Удалить брейкпоинт» активны только когда есть что снимать.
+        Диалоги — стандартные Qt-виджеты: тесты подменяют ``QInputDialog``
+        и ``QMenu`` в модуле.
+        """
+        root = self._main_wnd.project_ctrl.project_root
+        if root is None:
+            return
+        resolved = str(Path(path))
+        if not self._under_root(root, resolved):
+            return
+        existing = self.breakpoint_at(resolved, int(line))
+
+        menu = QMenu(self._main_wnd)
+        action_condition = menu.addAction('Условие...')
+        action_clear = menu.addAction('Снять условие')
+        action_clear.setEnabled(existing is not None and bool(existing.condition))
+        action_remove = menu.addAction('Удалить брейкпоинт')
+        action_remove.setEnabled(existing is not None)
+        chosen = menu.exec(QCursor.pos())
+        if chosen is action_condition:
+            current = existing.condition if existing is not None else ''
+            text, accepted = QInputDialog.getText(
+                self._main_wnd,
+                'Условие брейкпоинта',
+                f'Условие остановки (строка {int(line)}, Python-выражение):',
+                QLineEdit.EchoMode.Normal,
+                current,
+            )
+            if not accepted:
+                return
+            self.set_breakpoint_condition(resolved, int(line), text.strip())
+        elif chosen is action_clear:
+            self.set_breakpoint_condition(resolved, int(line), '')
+        elif chosen is action_remove:
+            self.remove_breakpoint_at(resolved, int(line))
+
+    # ------------------------------------------------------------------ #
     # Раздача строк открытым редакторам (паттерн 9.7)                   #
     # ------------------------------------------------------------------ #
 
     _WIRED_ATTR = '_pyqtp_breakpoint_wired'
 
     def _wire_doc_view(self, doc_view: Any) -> None:
-        """Свежеоткрытый документ: его строки-брейкпоинты его редактору.
+        """Свежеоткрытый документ: его брейкпоинты его редактору.
 
-        Плюс клик по дорожке Monaco (``breakpoint_toggle_requested``) — одно
-        подключение на вьюху (флаг на объекте вьюхи, как ``_pyqtp_bookmark_wired``).
+        Плюс сигналы дорожки/ховера Monaco (``breakpoint_toggle_requested``,
+        ``breakpoint_context_requested``, ``hover_value_requested``) — одна
+        связка на вьюху (флаг на объекте вьюхи, как ``_pyqtp_bookmark_wired``).
         """
         self._push_lines_to_view(doc_view.key)
         self._push_exec_line_to_view(doc_view.key)
@@ -489,7 +625,22 @@ class DapControl(BaseControl):
         if connect is None or getattr(doc_view, self._WIRED_ATTR, False):
             return
         setattr(doc_view, self._WIRED_ATTR, True)
-        connect(lambda line, key=doc_view.key: self.toggle_breakpoint_at(key, line))
+        key = doc_view.key
+        connect(lambda line, key=key: self.toggle_breakpoint_at(key, line))
+        # D3: правый клик по дорожке — контекстное меню условий брейкпоинтов
+        context_signal = getattr(
+            edit_widget, 'breakpoint_context_requested', None,
+        )
+        context_connect = getattr(context_signal, 'connect', None)
+        if context_connect is not None:
+            context_connect(
+                lambda line, key=key: self.breakpoint_context_menu(key, line),
+            )
+        # D3: hover-запросы значений выражений из Monaco
+        hover_signal = getattr(edit_widget, 'hover_value_requested', None)
+        hover_connect = getattr(hover_signal, 'connect', None)
+        if hover_connect is not None:
+            hover_connect(lambda payload, key=key: self._on_hover_requested(payload, key))
 
     def _push_lines_to_view(self, path: str) -> None:
         view = self._main_wnd.doc_ctrl.document_view(path)
@@ -499,15 +650,72 @@ class DapControl(BaseControl):
         push = getattr(edit_widget, 'set_breakpoints', None)
         if not callable(push):
             return
-        push(self.breakpoint_lines_for(path))
+        push(self.breakpoint_entries_for(path))
 
     def _broadcast_breakpoints(self) -> None:
-        """Раздаёт строки брейкпоинтов всем открытым документам проекта."""
+        """Раздаёт записи брейкпоинтов всем открытым документам проекта."""
         root = self._main_wnd.project_ctrl.project_root
         if root is None:
             return
         for doc_path in self._main_wnd.doc_ctrl.documents_under(root):
             self._push_lines_to_view(str(doc_path))
+
+    # ------------------------------------------------------------------ #
+    # Опции отладки (срез D3): слой приложения + проектное перекрытие    #
+    # ------------------------------------------------------------------ #
+
+    def debug_options_app(self) -> dict[str, Any]:
+        """Опции отладки в СЛОЕ НАСТРОЕК ПРИЛОЖЕНИЯ (QSettings, ``DapOptions``)."""
+        return dbg_opts.read_debug_options(self._main_wnd.settings)
+
+    def debug_options(self) -> dict[str, Any]:
+        """ЭФФЕКТИВНЫЕ опции: слой приложения + поключевой merge секции ``debug``."""
+        options = self.debug_options_app()
+        dbg_opts.merge_debug_options(
+            options,
+            self._main_wnd.project_ctrl.project_settings_section(SECTION_DEBUG),
+        )
+        return options
+
+    def set_debug_option_app(self, key: str, value: Any) -> str:
+        """Слой приложения: валидация -> QSettings -> переприменение фильтров.
+
+        ``ValueError``/``TypeError`` с текстом на неизвестный ключ/битое
+        значение ('' — успех) — контракт console-API/страницы «Отладка».
+        """
+        if key != KEY_BREAK_ON_RAISED:
+            error_message = f'Неизвестная опция отладки: {key}'
+            raise ValueError(error_message)
+        dbg_opts.validate_break_on_raised(value)  # TypeError с текстом
+        options = self.debug_options_app()
+        options[KEY_BREAK_ON_RAISED] = bool(value)
+        dbg_opts.write_debug_options(self._main_wnd.settings, options)
+        self._repush_exception_filters()
+        return ''
+
+    def _repush_exception_filters(self) -> None:
+        """(GUI) ``setExceptionBreakpoints`` в живую сессию (fire-and-forget).
+
+        Зовётся на смену опции (страница/консоль/``project_settings_changed``);
+        вне сессии — nothing to do: нужные фильтры уйдут на handshake старта.
+        """
+        rt = self._runtime
+        loop = self._loop
+        if rt is None or loop is None or self._state == STATE_IDLE:
+            return
+        filters = dbg_opts.exception_filters(self.debug_options())
+
+        async def _coro() -> None:
+            if self._runtime is not rt or rt.session.closed:
+                return
+            rt.session.exception_filters = filters
+            # apply_exception_breakpoints сам глотает сбои запроса и гейтится
+            # по capability адаптера exceptionBreakpointFilters
+            await rt.session.apply_exception_breakpoints()
+
+        asyncio.run_coroutine_threadsafe(_coro(), loop).add_done_callback(
+            _log_future_error,
+        )
 
     # ------------------------------------------------------------------ #
     # Консоль отладки (read-only, срез D1)                              #
@@ -551,6 +759,136 @@ class DapControl(BaseControl):
         self._exec_path = ''
         self._exec_line = 0
         self._broadcast_execution_lines()
+
+    # ------------------------------------------------------------------ #
+    # Hover-значения выражений (срез D3): Monaco -> evaluate в останове  #
+    # ------------------------------------------------------------------ #
+
+    def _on_hover_requested(self, payload: dict[str, Any], key: str) -> None:
+        """(GUI) hover-запрос редактора: гейт -> ``evaluate`` в loop-потоке.
+
+        Осмыслен только в STOPPED с текущим кадром — иначе мгновенный пустой
+        ответ (Monaco просто не покажет блок значения). Выражение берётся из
+        наведённого на hover текста, вычисляется в КАДРЕ ОСТАНОВА сессии —
+        как в VS Code, независимо от того, документ какого файла наводили.
+        """
+        request_id = payload.get('requestId')
+        expression = payload.get('expression')
+        if not (isinstance(request_id, str) and isinstance(expression, str)):
+            return
+        if not expression:
+            return
+        rt = self._runtime
+        loop = self._loop
+        frame_id = self._current_frame_id
+        if (
+            rt is None
+            or loop is None
+            or self._state != STATE_STOPPED
+            or frame_id is None
+        ):
+            self._signals.hover_ready.emit(
+                self._gen,
+                key,
+                {'requestId': request_id, 'found': False, 'text': ''},
+            )
+            return
+
+        gen = self._gen
+
+        async def _coro() -> None:
+            found = False
+            text = ''
+            try:
+                body = await rt.session.request_body(
+                    'evaluate',
+                    {
+                        'expression': expression,
+                        'frameId': frame_id,
+                        'context': 'hover',
+                    },
+                    timeout=_CMD_WAIT_S,
+                )
+                result = body.get('result')
+                if isinstance(result, str) and result:
+                    found, text = True, result
+            except (DapError, ConnectionError, OSError) as exc:
+                dbg_log.info('Hover %r не вычислен: %s', expression, exc)
+            self._signals.hover_ready.emit(
+                gen, key, {'requestId': request_id, 'found': found, 'text': text},
+            )
+
+        asyncio.run_coroutine_threadsafe(_coro(), loop).add_done_callback(
+            _log_future_error,
+        )
+
+    def _on_hover_ready(self, gen: int, key: str, payload: dict[str, Any]) -> None:
+        """(GUI) ответ ``evaluate``; чужое поколение — отбрасываем.
+
+        Найденное значение вне останова не показываем (кадр мог протухнуть за
+        время запроса), а пустой ответ проводим всегда — он гасит JS-проmise
+        мгновенно вместо двухсекундного JS-тайм-аута.
+        """
+        if gen != self._gen:
+            return
+        if payload.get('found') and self._state != STATE_STOPPED:
+            return
+        view = self._main_wnd.doc_ctrl.document_view(key)
+        edit_widget = getattr(view, 'edit_widget', None)
+        reply = getattr(edit_widget, 'reply_hover_value', None)
+        if not callable(reply):
+            return
+        reply(dict(payload))
+
+    # ------------------------------------------------------------------ #
+    # evaluate в консоль (console API, срез D3)                          #
+    # ------------------------------------------------------------------ #
+
+    def _evaluate_blocking(
+        self, expression: str, context: str,
+    ) -> tuple[bool, str]:
+        """(GUI) ``evaluate`` текущего кадра с ожиданием; (found, text/err)."""
+        if self._state != STATE_STOPPED:
+            return False, 'Не в останове'
+        rt = self._runtime
+        loop = self._loop
+        frame_id = self._current_frame_id
+        if rt is None or loop is None or frame_id is None:
+            return False, 'Сессия отладки не активна'
+
+        async def _coro() -> tuple[bool, str]:
+            if self._runtime is not rt:
+                return False, 'Сессия отладки не активна'
+            try:
+                body = await rt.session.request_body(
+                    'evaluate',
+                    {
+                        'expression': expression,
+                        'frameId': frame_id,
+                        'context': context,
+                    },
+                    timeout=_CMD_WAIT_S,
+                )
+            except (DapError, ConnectionError, OSError) as exc:
+                return False, str(exc)
+            result = body.get('result')
+            text = result if isinstance(result, str) else ''
+            return bool(text), text
+
+        future = asyncio.run_coroutine_threadsafe(_coro(), loop)
+        try:
+            return future.result(_CMD_WAIT_S + 2.0)
+        except concurrent.futures.TimeoutError:
+            return False, 'Тайм-аут ответа evaluate'
+
+    def evaluate_to_console(self, expression: str) -> str:
+        """Console API ``debug_evaluate``: вычислить в останове, итог в консоль."""
+        found, text = self._evaluate_blocking(str(expression), 'repl')
+        if found:
+            self._console_line(f'> {expression}\n{text}')
+        else:
+            self._console_line(f'> {expression}\n[ошибка] {text}')
+        return text if found else f'Ошибка evaluate: {text}'
 
     # ------------------------------------------------------------------ #
     # Команды отладки (GUI-поток; корутины уходят в loop-поток)         #
@@ -598,7 +936,15 @@ class DapControl(BaseControl):
         loop = self._loop
         assert loop is not None
         future = asyncio.run_coroutine_threadsafe(
-            self._start_session(config, root, gen, self._breakpoints_initial_payload()),
+            self._start_session(
+                config,
+                root,
+                gen,
+                self._breakpoints_initial_payload(),
+                # эффективные опции снимаются в GUI-потоке (QSettings/проект
+                # из loop-потока не читаем), filters — на handshake старта
+                dbg_opts.exception_filters(self.debug_options()),
+            ),
             loop,
         )
         try:
@@ -647,13 +993,18 @@ class DapControl(BaseControl):
             return None, msg
         return config, ''
 
-    def _breakpoints_initial_payload(self) -> dict[str, list[int]]:
-        """Снимок брейкпоинтов для handshake (только живые файлы)."""
-        grouped: dict[str, list[int]] = {}
+    def _breakpoints_initial_payload(self) -> dict[str, list[dict[str, Any]]]:
+        """Снимок брейкпоинтов для handshake (только живые файлы, с условиями)."""
+        grouped: dict[str, list[dict[str, Any]]] = {}
         for item in self._breakpoints:
             if Path(item.path).is_file():
-                grouped.setdefault(item.path, []).append(item.line)
-        return {path: sorted(lines) for path, lines in grouped.items()}
+                entry: dict[str, Any] = {'line': item.line}
+                if item.condition:
+                    entry['condition'] = item.condition
+                grouped.setdefault(item.path, []).append(entry)
+        for entries in grouped.values():
+            entries.sort(key=lambda entry: int(entry['line']))
+        return grouped
 
     def continue_execution(self) -> str:
         """Продолжить выполнение (F5 из останова / console API)."""
@@ -1062,12 +1413,12 @@ class DapControl(BaseControl):
         self._clear_debug_panels()
 
     def _sync_breakpoints_to_session(self, path: str) -> None:
-        """Новый набор строк одного файла — в живую сессию (fire-and-forget)."""
+        """Новый набор брейкпоинтов одного файла — в живую сессию (fire-and-forget)."""
         rt = self._runtime
         loop = self._loop
         if rt is None or loop is None or self._state == STATE_IDLE:
             return
-        lines = self.breakpoint_lines_for(path)
+        entries = self.breakpoint_entries_for(path)
 
         async def _coro() -> None:
             if self._runtime is not rt or rt.session.closed:
@@ -1075,7 +1426,7 @@ class DapControl(BaseControl):
             if not isinstance(rt.session, _ControlledDapSession):
                 return
             try:
-                await rt.session.push_file_breakpoints(path, lines)
+                await rt.session.push_file_breakpoints(path, entries)
             except (DapError, ConnectionError, OSError) as exc:
                 dbg_log.warning('Брейкпоинты не обновлены в сессии: %s', exc)
 
@@ -1177,13 +1528,15 @@ class DapControl(BaseControl):
         config: LaunchConfig,
         root: Path,
         gen: int,
-        initial_breakpoints: dict[str, list[int]],
+        initial_breakpoints: dict[str, list[dict[str, Any]]],
+        exception_break_filters: list[str],
     ) -> str:
         """(loop-поток) Запуск адаптера + handshake; '' — успех, иначе текст."""
         session = _ControlledDapSession(
             adapter_command(),
             lambda name, body: self._signals.dap_event.emit(gen, name, body),
             initial_breakpoints=initial_breakpoints,
+            exception_filters=exception_break_filters,
             cwd=str(root),
         )
         runtime = _SessionRuntime(session=session, gen=gen, root=root)
@@ -1246,11 +1599,15 @@ def _log_future_error(future: concurrent.futures.Future) -> None:
 
 
 class _ControlledDapSession(DapSession):
-    """``DapSession`` с раздачей брейкпоинтов на handshake.
+    """``DapSession`` с раздачей брейкпоинтов и фильтров на handshake.
 
     Хук ``on_breakpoints_ready`` (между ``initialized`` и ``configurationDone``):
     рассылает ``setBreakpoints`` по снимку набора контрола, сделанному до старта
-    сессии (дальнейшие правки — отдельным маршрутом ``push_file_breakpoints``).
+    сессии (дальнейшие правки — отдельным маршрутом ``push_file_breakpoints``);
+    записи содержат ``condition`` условных брейкпоинтов (срез D3).
+    Хук ``on_exception_breakpoints_ready`` (следом) шлёт
+    ``setExceptionBreakpoints`` по ``exception_filters`` — базовая реализация
+    ``DapSession.apply_exception_breakpoints`` (гейт по capability адаптера).
     ``verified`` — подтверждённые адаптером строки по файлам (в файл проекта НЕ
     пишется: верификация — свойство живой сессии).
     """
@@ -1260,25 +1617,53 @@ class _ControlledDapSession(DapSession):
         command: list[str],
         on_event: Callable[[str, dict[str, Any]], None],
         *,
-        initial_breakpoints: dict[str, list[int]],
+        initial_breakpoints: dict[str, list[dict[str, Any]]],
+        exception_filters: list[str] | None = None,
         cwd: str | None = None,
     ) -> None:
         super().__init__(command, on_event, cwd=cwd)
-        self.initial_breakpoints = dict(initial_breakpoints)
+        self.initial_breakpoints = {
+            path: [dict(entry) for entry in entries]
+            for path, entries in initial_breakpoints.items()
+        }
         self.verified: dict[str, list[int]] = {}
+        # None — базовый хук не шлёт setExceptionBreakpoints вовсе (сырые
+        # DapSession-тесты D1), список — шлёт при объявленной capability
+        self.exception_filters = (
+            list(exception_filters) if exception_filters is not None else None
+        )
 
     async def on_breakpoints_ready(self) -> None:
-        for path, lines in self.initial_breakpoints.items():
+        for path, entries in self.initial_breakpoints.items():
             try:
-                await self.push_file_breakpoints(path, lines)
+                await self.push_file_breakpoints(path, entries)
             except (DapError, ConnectionError, OSError):
                 dbg_log.warning('Не удалось раздать брейкпоинты файла: %s', path)
 
-    async def push_file_breakpoints(self, path: str, lines: list[int]) -> None:
-        """``setBreakpoints`` одного файла; запоминает верифицированные строки."""
+    async def push_file_breakpoints(
+        self, path: str, entries: list[dict[str, Any]],
+    ) -> None:
+        """``setBreakpoints`` одного файла; запоминает верифицированные строки.
+
+        ``entries`` — записи ``{'line': N[, 'condition']}`` (условие — только
+        при непустом, D3); записи идут в запрос почти как есть — их формат
+        совпадает с DAP-массивом ``breakpoints``.
+        """
+        lines = sorted({
+            int(entry['line']) for entry in entries if entry.get('line')
+        })
+        by_line = {int(entry['line']): entry for entry in entries}
+        dap_breakpoints: list[dict[str, Any]] = []
+        for line in lines:
+            entry = by_line[line]
+            condition = entry.get('condition')
+            payload: dict[str, Any] = {'line': line}
+            if isinstance(condition, str) and condition:
+                payload['condition'] = condition
+            dap_breakpoints.append(payload)
         body = await self.request_body('setBreakpoints', {
             'source': {'path': path},
-            'breakpoints': [{'line': int(line)} for line in sorted(set(lines))],
+            'breakpoints': dap_breakpoints,
         })
         accepted = body.get('breakpoints')
         verified: list[int] = []

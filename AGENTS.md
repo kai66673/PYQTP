@@ -67,9 +67,10 @@ Verify in this order: **ruff → pyright → tests → run the app**.
     + stage-10.3 LSP monitor (test_lsp_monitor.py: 15 юнитов без GUI и без процессов — чистый lsp_monitor.py (кольцо: продолжение `seq` после `clear`, вытеснение по ёмкости, потокобезопасность; сводки didOpen/обрезка/результаты; фабрики; `filter_records`) + API кольца на голом `LspHub` (наблюдатели/очистка/жизнь после `shutdown`) + точки записи на `_ServerInstance` с фейковыми процессом/сокетом (`_make_inst()` возвращает хаб+инстанс+события, `proc`/`ws` подменяются атрибутами, `isinstance`-сужение хелперами `_fake`/`_fake_ws`; `_route_from_client`/`_detach` — методы хаба, `asyncio.run`) + 6 offscreen панель «Монитор LSP» (фикстуры `org_app`/`fake_docs`/`wnd` импортом из test_problems_panel) + 2 live через ws-хаб (харнес test_lsp_hub_store: `fake_server_script`/`fake_registry_json`/`client_open`/ `wait_for` импортом, своя фикстура `fake_hub` поверх локальной `hub`))
      + stage-11.1 DAP-отладчик (test_dap_debugger.py: юниты без GUI и без процессов — чистые dap_framing (Content-Length-фрейминг)/launch_config (`.pyqtp/launch.json`, `${workspaceFolder}`, дефолт=активный документ+cwd=корень)/breakpoints (`.pyqtp/breakpoints.json`, контракт 9.7) + DapSession против фейкового stdio DAP-адаптера (встроенный python-скрипт только stdlib через env-шов `PYQTP_DAP_ADAPTER_COMMAND`, JSONL-журнал `PYQTP_FAKE_DAP_JOURNAL`, режимы `PYQTP_FAKE_DAP_MODE`: normal/no_initialized/launch_fail/crash/dead/no_frames/no_scopes; ритуал initialize→launch(ожидает configurationDone)→initialized→setBreakpoints→configurationDone; launch_fail — ОДИН ответ с message+body) + offscreen-GUI: стат-машина DapControl/меню «Отладка»/консоль/брейкпоинты (F9-зеркало `current_cursor`; широковещание — чужие файлы получают пустые наборы, `[]`-вызовы — норма; фейк-редактор обязан иметь `update_editor_options`/`set_theme`/`breakpoint_calls`/`exec_calls`; запуск отладки гейтится открытым проектом — тесты обязаны `open_project`); 2 live debugpy (entry-шаги+print в консоль; брейкпоинт в цикле — цель обязана быть открыта, конфиг по умолчанию берётся из активного документа); 3 webengine DOM-пробы: глифы `.pyqtp-breakpoint-glyph`, строка останова `.pyqtp-exec-*`, маршрут клика дорожки (глиф→брейкпоинт, иначе→закладка))
      + stage-11.2 панели отладчика (test_dap_panels.py: 6 юнитов без GUI — чистый debug_tree.py (разбор stackTrace/threads/scopes/variables: кадры без id выпадают, области с ref 0, пустые имена, evaluateName→name; `frame_reveal_payload` — payload вскрытия как LSP/10.2 и `None` для кадров без файла/строки и **файлов нет на диске**; `frame_display` — relativно корня, «[без источника]»); харнес D1 переиспользуется импортом из test_dap_debugger (расширенный фейковый адаптер: поток 1 кадры 100/101+102 без источника, поток 2 — 200/201, `threads`, scopes по frameId (у кадра без файла только Globals), variables с вложенным items→ref 20, режим `no_scopes` (scopes success=False+message — `respond` харнеса умеет `message=`); 2 сессионных теста без GUI) + 8 offscreen-GUI (заполнение панелей на останове; `select_frame`+ленивые scopes/variables+дедуп повторного раскрытия (`_fetched_child_refs` — метка НЕ снимается при ответе, чистится со сменой кадра/останова); двойной клик — каретка по кадру, кадр без файла — строка «Кадр без файла» без движения каретки; комбик потоков — свой `stackTrace` без show-перехода (cursor_calls/exec_calls не меняются); тулбар `debug_toolbar` (объект/те же экшены/гейтинг); очистка панелей при стопе и новом старте; `no_scopes` — кадры живы, переменны пусты; console API+ключи вьюх `DapControl_stack_view/_variables_view`); фикстуры/фейк-редактор — контракт D1; live 1 debugpy — loopy-программа как в D1, `Locals` содержит `i`)
-  `webengine` (real QWebEngineView/Monaco) are deselected by default via `addopts` → 278 passed / 49
+     + stage-11.3 условные брейкпоинты/hover/опции (test_dap_debugger.py: новые юниты без GUI — чистый breakpoints.py с условиями (запись `{'path','line'[,condition]}`, `condition` пишется только непустой, дедуп по (path,line) хранит ПЕРВОЕ условие, хелперы `set_breakpoint_condition`/`remove_breakpoint`/`breakpoint_entries_for`) + debug_options.py (QSettings-группа `DapOptions`, ключ `break_on_raised`; значение вне дефолта пишется, при возврате к дефолту ключ снимается; двухслойность с проектной секцией `debug` — константы `SECTION_DEBUG`/`KEY_BREAK_ON_RAISED` канонично в project_settings.py) + DapSession: записи setBreakpoints получают `'condition'` только когда он непустой, порядок ритуала initialize→launch→setBreakpoints→**setExceptionBreakpoints**→configurationDone, `exception_filters`+`apply_exception_breakpoints()` (live-перепостановка при смене опции) гейтятся НЕпустым `exceptionBreakpointFilters` из capabilities адаптера; хук базового `handshake` no-op — сырые сессионные тесты считают `[:4]`, `_ControlledDapSession` добавляет фильтр-запрос → `[:5]`; ГОЧКА debugpy 1.8: capabilities лежат ПЛОСКО в теле initialize (без обёртки `capabilities`) — `handshake` сливает обе формы, иначе гейт фильтров молча не срабатывал; offscreen-секция D3 — контекстное меню брейкпоинта (`breakpoint_context_menu()` c QMenu «Условие...»/«Снять условие»/«Удалить брейкпоинт», фейки QMenu/QInputDialog monkeypatch'атся в модуль dap_control), гейт/валидация секции `debug` в project_settings (не-bool → ValueError, не TypeError — контракт `project_settings_set`; console/page-путь `set_debug_option_app` бросает TypeError), страница «Отладка» (key `debug`, order 60, scope-aware: `load()` показывает ЭФФЕКТИВное значение в обеих областях, apply в области проекта пишет слой проекта, reset снимает оверлей + сам `load()`), hover-гейт `_on_hover_ready` (несовпадение поколения — сбрасывает БЕЗУСЛОВНО; `found=True` ответ — только на STOPPED; пустые ответы проходят ВСЕГДА — отменяют JS-тайм-аут, а не ждут 2 с), console-API `debug_breakpoint_condition`/`debug_breakpoint_remove`/`debug_options_show`/`debug_options_set`/`debug_evaluate`; live debugpy 1 — `break_on_raised=True` останавливает на raise-строке внутри try (фикстура `bug_root`, хелпер `_user_file_stop()` продолжает случайные остановки вне пользовательского файла); 4 webengine-пробы — полые глифы условий `.pyqtp-breakpoint-cond` (`set_breakpoints` терпима к payload: int-строки D1 или записи `{'line'[,condition]}`), hover round-trip (хуки `__pyqtp_request_hover`/`__pyqtp_last_hover` = FOUND/EMPTY/TIMEOUT, JS-тайм-аут 2 с), подавление контекстного меню Monaco на глифе (capture-слушатель на `document`; хук `__pyqtp_ctx_prevented`: на глифе `'true|true'`, на тексте `'true|false'` — Monaco сам preventDefault'ит на тексте, сравнивать defaultPrevented было нельзя))
+  `webengine` (real QWebEngineView/Monaco) are deselected by default via `addopts` → 297 passed / 56
   deselected; run them with `uv run pytest -m 'live or webengine'` (~2½ min, they work offscreen) or
-  all 327 in one
+  all 353 in one
   process with `uv run pytest -m ''` (~6½ min, full run keeps passing despite `os._exit` in
   `pytest_sessionfinish` eating the summary line — count the dots; NB the stage81
   document-symbols/document-highlight webengine tests are cold-start flaky under full-suite
@@ -220,7 +221,12 @@ Verify in this order: **ruff → pyright → tests → run the app**.
     «Языковые серверы (LSP)» (`lsp_settings_page.LspRegistrySettingsPage`, key
     `lsp`, order 50) — её `LspHub` регистрирует в `setup()`; кнопок применения
     на самой странице нет — кнопки окна вызывают `registry_apply_json/
-    registry_reset/registry_json`.
+    registry_reset/registry_json`,
+    «Отладка» (ide `dap_control/debug_settings_page.DebugSettingsPage`, key
+    `debug`, order 60, регистрирует `DapControl.setup()`) — один чекбокс
+    «Останавливаться на исключении», scope-aware (двухслойность `DapOptions/
+    break_on_raised` QSettings-слоя и проектной секции `debug`, см. этап 11.3
+    в тестах).
   - Квирка pyright/ruff при подклассировании `QDialog`: имена параметров
     оверрайдов `showEvent/closeEvent` (у `eventFilter` стаб — `arg__1`/
     `arg__2`) должны совпадать со стабами PySide6 (`arg__1`), а `showEvent`
@@ -347,8 +353,9 @@ Verify in this order: **ruff → pyright → tests → run the app**.
    `MainWindowKDD/dockState`).
    Настройки проекта (этап 9.6B1): чистый `project_control/project_settings.py`
    — оверлей `{секция: {ключ: значение}}` в `<root>/.pyqtp/settings.json`
-   (секции `appearance`/`editor`/`lsp`, ключи `theme_name`/`EditorOptions`-ключи/
-   `registry_json`); `parse_overlay` недоедливый (не-словари и пустые секции
+   (секции `appearance`/`editor`/`lsp`/`debug` (этап 11 D3), ключи
+   `theme_name`/`EditorOptions`-ключи/`registry_json`/`break_on_raised`);
+   `parse_overlay` недоедливый (не-словари и пустые секции
    вычищаются, неизвестные секции сохраняются при правках), запись атомарная,
    пустой оверлей снимает файл и пустой `.pyqtp/` (не трогая `session.json`),
    `overlay_set(None)` снимает ключ. Проектное перекрытие СТАРШЕ настроек
@@ -770,6 +777,22 @@ Verify in this order: **ruff → pyright → tests → run the app**.
   is sent on EVERY `onDidChangeCursorPosition` (upstream mirrored it only on
   the `set_cursor` echo, so the real caret was invisible to Python); CSS
   classes `.pyqtp-bookmark-glyph` (#e5a64b) + `.pyqtp-bookmark-line`.
+  stage 11 debugger (`main.ts` + `style.css`, D1+D3): separate
+  `breakpointCollection` + `setBreakpoints()` (payload items = bare line ints
+  or `{line, condition}` records — Python normalizes both; `condition` renders
+  a hollow `.pyqtp-breakpoint-cond` ring) and bridge case `set_breakpoints`;
+  stop-execution line decorations `.pyqtp-exec-*`; gutter click route
+  `routeGutterClick(line, element, right)` — right-click over a glyph sends
+  `_breakpoint_context_request {line}` (Python shows the Qt menu), otherwise
+  left toggles breakpoint/bookmark as before; Monaco's native context menu is
+  suppressed ONLY on the glyph via a capture-phase `contextmenu` listener on
+  `document` (Monaco replaces its editor root DOM node at runtime — a
+  listener attached to `getDomNode()` at init silently disappeared); value
+  hover provider sends `_hover_value_request {requestId, expression, line}`
+  with a 2 s JS timeout, Python answers via `reply_hover_value` → JS
+  `hover_value_reply` (FOUND/EMPTY/TIMEOUT); test hooks
+  `__pyqtp_gutter_click`/`__pyqtp_request_hover`/`__pyqtp_last_hover`/
+  `__pyqtp_ctx_prevented`.
   python patch in `monaco.py` —
   `Monaco.__init__` takes an `lsp_host` param and no longer eagerly spawns
   `get_pylsp_host()` (lazy `_resolve_lsp_host()` fallback keeps standalone

@@ -12,13 +12,14 @@
    {
      "appearance": {"theme_name": "Темная"},
      "editor": {"font_size": 16, "minimap": false},
-     "lsp": {"registry_json": "{...JSON-строка реестра серверов...}"}
+     "lsp": {"registry_json": "{...JSON-строка реестра серверов...}"},
+     "debug": {"break_on_raised": true}
    }
 
-Секции — известные (``appearance``/``editor``/``lsp``), внутри — отдельные
-ключи: перекрытие работает поштучно, остальное берётся из настроек
-приложения. Неизвестные секции сохраняются при правках и игнорируются при
-применении; битый JSON воспринимается как пустой слой.
+Секции — известные (``appearance``/``editor``/``lsp``/``debug``), внутри —
+отдельные ключи: перекрытие работает поштучно, остальное берётся из
+настроек приложения. Неизвестные секции сохраняются при правках и
+игнорируются при применении; битый JSON воспринимается как пустой слой.
 """
 
 from __future__ import annotations
@@ -39,12 +40,15 @@ PROJECT_SETTINGS_FILE_NAME = 'settings.json'
 SECTION_APPEARANCE = 'appearance'
 SECTION_EDITOR = 'editor'
 SECTION_LSP = 'lsp'
-KNOWN_SECTIONS = (SECTION_APPEARANCE, SECTION_EDITOR, SECTION_LSP)
+SECTION_DEBUG = 'debug'  # этап 11 D3: опции отладчика (DapControl/debug_options)
+KNOWN_SECTIONS = (SECTION_APPEARANCE, SECTION_EDITOR, SECTION_LSP, SECTION_DEBUG)
 
 # ключи секции appearance
 KEY_THEME_NAME = 'theme_name'
 # ключи секции lsp
 KEY_REGISTRY_JSON = 'registry_json'
+# ключи секции debug (этап 11 D3; тот же ключ и в QSettings-слое, см. dap_control.debug_options)
+KEY_BREAK_ON_RAISED = 'break_on_raised'
 
 
 def settings_file(root: str | Path) -> Path:

@@ -776,7 +776,7 @@ publishDiagnostics в кольце и сводка без текста доку�
 прогон 226, live/webengine 43 — зелёные.
 
 
-### Этап 11 — отладчик DAP 🔶 (D1+D2 готовы; D3 — впереди)
+### Этап 11 — отладчик DAP ✅ (D1+D2+D3 готовы)
 
 #### Этап 11.1 (D1) — DAP-клиент, брейкпоинты Monaco, консоль отладки ✅ (готово)
 
@@ -884,8 +884,77 @@ debug_tree + 2 сессии против расширенного фейково
 + 1 live debugpy). Харнес D1 переиспользуется импортом. Итог: дефолтный
 прогон 278, live/webengine 49, полный 327 — зелёные.
 
-Остаток этапа: D3 — шаги по инструкциям, conditional брейкпоинты, hover
-значения, вкладка Debug в настройках.
+#### Этап 11.3 (D3) — условные брейкпоинты, hover-значения, страница «Отладка» ✅ (готово)
+
+Корректировка объёма: «шаги по инструкциям» из плана **не делаются** — у
+debugpy/pydevd нет пошаговости машинными инструкциями (нет `goto`/
+`stepInTargets`), python-шаги из D1 — потолок адаптера; остальной D3
+выполнен полностью.
+
+- **Условные брейкпоинты**:
+  - чистый `breakpoints.py` — запись `{'path','line'[,condition]}`
+    (`condition` пишется только непустой; дедуп по (path,line) хранит
+    ПЕРВОЕ условие), хелперы `set_breakpoint_condition`/`remove_breakpoint`/
+    `breakpoint_entries_for`;
+  - `DapSession.set_breakpoints` добавляет в запись `'condition'` только
+    когда он непустой (debugpy заявляет `supportsConditionalBreakpoints`);
+  - UX: правый клик по глифу брейкпоинта → JS `_breakpoint_context_request
+    {line}` → `QtMonacoEditorWidget.breakpoint_context_requested` →
+    `DapControl.breakpoint_context_menu()` — Qt-меню «Условие...»
+    (QInputDialog) / «Снять условие» / «Удалить брейкпоинт»; нативное меню
+    Monaco гасится ТОЛЬКО на глифе (capture-слушатель `contextmenu` на
+    `document`: корневой DOM-узел редактора Monaco подменяет в рантайме,
+    слушатель на `getDomNode()` терялся — найдено пробами);
+  - Monaco: у глифа с условием полый кружок `.pyqtp-breakpoint-cond`
+    (`style.css`); `set_breakpoints` терпима к payload — голые строки (D1)
+    или записи `{'line'[,condition]}`, python нормализует всегда в записи.
+- **Фильтры исключений** (опция «Останавливаться на выброшенном
+  исключении»):
+  - двухслойность в стиле 9.6B: слой приложения — QSettings-группа
+    `DapOptions`, ключ `break_on_raised` (дефолт False, при возврате к
+    дефолту ключ снимается); проектный слой — секция `debug` в
+    `.pyqtp/settings.json` (`SECTION_DEBUG`/`KEY_BREAK_ON_RAISED`
+    канонично в `project_settings.py`, гейт в валидаторе
+    `project_settings_set`: не-bool → ValueError);
+  - `exception_filters()` = всегда `['uncaught']` + `['raised']` при опции;
+    ритуал становится initialize→launch→setBreakpoints→**setExceptionBreakpoints**
+    →configurationDone; `apply_exception_breakpoints()` гейтится НЕпустым
+    `exceptionBreakpointFilters` из capabilities адаптера и умеет
+    перепостанавливать фильтры live при смене опции (без перезапуска
+    сессии);
+  - ГОЧКА, найденная live-тестом: debugpy 1.8 возвращает capabilities
+    ПЛОСКО в теле ответа `initialize` (без обёртки `capabilities`) —
+    `handshake` теперь сливает обе формы, иначе гейт фильтров молча никогда
+    не срабатывал.
+- **Hover-значения** (только на останове): Monaco hover-provider →
+  `_hover_value_request {requestId, expression, line}` (JS-тайм-аут 2 с) →
+  гейт на python-стороне (STOPPED + текущий кадр + поколение запроса) →
+  `evaluate` (context='hover') в loop-потоке → queued `hover_ready` →
+  `reply_hover_value` → `hover_value_reply` в JS (FOUND/EMPTY; маркеры
+  `__pyqtp_last_hover` FOUND/EMPTY/TIMEOUT). Пустые ответы проходят гейт
+  ВСЕГДА — чтобы отменить JS-тайм-аут, а не ждать 2 с.
+- **Страница «Отладка»** (`DebugSettingsPage`, key `debug`, order 60,
+  регистрирует `DapControl.setup()`): один чекбокс; scope-aware (9.6B2):
+  `load()` в обеих областях показывает ЭФФЕКТИВное значение, apply в
+  области «Проект» пишет слой проекта, reset в проектной области снимает
+  оверлей (флаг приложения остаёт).
+- console-API: `debug_breakpoint_condition`, `debug_breakpoint_remove`,
+  `debug_options_show`, `debug_options_set`, `debug_evaluate`.
+
+**Демонстрация:** `tests/test_dap_debugger.py` — новые юниты без GUI
+(breakpoints с условиями, чистый debug_options, `setExceptionBreakpoints`
+с гейтом по caps + журнал evaluate `{expression, context, frameId}` против
+расширенного фейкового адаптера, режим `eval_fail`) + offscreen-D3 секция
+(меню условий с фейковыми QMenu/QInputDialog, страница «Отладка» в обеих
+областях, гейт hover) + 1 live debugpy (`break_on_raised` останавливает на
+raise-строке внутри try; фикстура `bug_root` + хелпер `_user_file_stop()`)
++ 4 webengine-пробы (глифы условий, hover round-trip, подавление контекстного
+меню). Харнес D1 расширен: caps фейка заявляют `supportsConditionalBreakpoints`
++ `exceptionBreakpointFilters` (id'ы 'raised'/'uncaught' — как у debugpy).
+Итог: дефолтный прогон 297, live/webengine 56, полный 353 — зелёные.
+
+Остаток этапа 11 закрыт; незакрытым осознанно остался только «шаг по
+инструкциям» — недоступен на debugpy (см. корректировку объёма выше).
 
 ### Этап 11 plan (исторично, для D2/D3)
 - `DapControl(BaseControl)` + DAP-клиент поверх нашего asyncio-опыта

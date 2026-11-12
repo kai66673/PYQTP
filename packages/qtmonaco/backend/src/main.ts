@@ -66,6 +66,23 @@ let gutterClickDisposable: monaco.IDisposable | null = null;
 
 let qtmonaco = (window as any).qtmonaco;
 
+// vendored-patch (этап 11 D3): контекстное меню Monaco на глифе брейкпоинта
+// глушим в пользу нашего Qt-меню (условия/удаление). capture-слушатель на
+// document стоит ВЫШЕ всех обработчиков Monaco (сам корневой узел редактора
+// Monaco умеет подменять, на нём слушатель терялся); срабатывает только на
+// глифе текущего редактора. Сам правый клик уходит в python через
+// onMouseDown-маршрут routeGutterClick (breakpoint_context_requested).
+document.addEventListener("contextmenu", (ev: MouseEvent) => {
+  qtmonaco.__pyqtp_ctx_prevented = false; // тестовый хук: перехватил ли наш слушатель
+  const el = ev.target instanceof Element ? ev.target : null;
+  const root = editor.getDomNode();
+  if (el && root && root.contains(el) && el.closest(".pyqtp-breakpoint-glyph")) {
+    ev.preventDefault();
+    ev.stopPropagation();
+    qtmonaco.__pyqtp_ctx_prevented = true;
+  }
+}, true);
+
 // Build qt bridge
 let bridge: any = null;
 
@@ -158,11 +175,17 @@ Object.defineProperty(qtmonaco, "bookmarkLines", { get: () => bookmarkLines });
 
 // vendored-patch (этап 11 D1, отладчик): брейкпоинты в дорожке + подсветка строки
 // останова (current-line). Состояние живёт на python-стороне (.pyqtp/breakpoints.json
-// + DapControl), сюда приходят только номера строк этого документа. Коллекции свои
+// + DapControl), сюда приходят только данные этого документа. Коллекции свои
 // (брейкпоинт/закладка/останов могут соседствовать на одной строке); переприменение
 // то же, что у applyBookmarks: decorations гибнут вместе с моделью/редактором.
+// vendored-patch (этап 11 D3): setBreakpoints принимает записи
+// {'line': N[, 'condition']} (условные брейкпоинты), набор терпим и к сырым
+// строкам (обратная совместимость); условный глиф получает доп. класс
+// .pyqtp-breakpoint-cond (полый кружок в css), window.qtmonaco.breakpointLines
+// остаётся списком строк.
 let breakpointCollection: monaco.editor.IEditorDecorationsCollection | null = null;
 let breakpointLines: number[] = [];
+const breakpointConditions = new Map<number, string>(); // строка -> условие (D3)
 let execLineCollection: monaco.editor.IEditorDecorationsCollection | null = null;
 let execLine = 0; // 0 — подсветки останова нет
 
@@ -173,12 +196,15 @@ function applyBreakpoints() {
     const total = model.getLineCount();
     for (const line of breakpointLines) {
       if (line >= 1 && line <= total) {
+        const conditional = breakpointConditions.has(line);
         decorations.push({
           range: new monaco.Range(line, 1, line, 1),
           options: {
             isWholeLine: true,
             className: "pyqtp-breakpoint-line",
-            linesDecorationsClassName: "pyqtp-breakpoint-glyph",
+            linesDecorationsClassName: conditional
+              ? "pyqtp-breakpoint-glyph pyqtp-breakpoint-cond"
+              : "pyqtp-breakpoint-glyph",
           },
         });
       }
@@ -191,10 +217,31 @@ function applyBreakpoints() {
   }
 }
 
-function setBreakpoints(lines: unknown) {
-  breakpointLines = Array.isArray(lines)
-    ? lines.filter((line) => Number.isInteger(line) && line >= 1)
-    : [];
+function setBreakpoints(payload: unknown) {
+  // vendored-patch (этап 11 D3): записи {'line', 'condition'} или сырые строки
+  breakpointLines = [];
+  breakpointConditions.clear();
+  if (Array.isArray(payload)) {
+    for (const item of payload) {
+      if (typeof item === "number") {
+        if (Number.isInteger(item) && item >= 1) {
+          breakpointLines.push(item);
+        }
+        continue;
+      }
+      if (item && typeof item === "object") {
+        const line = (item as any).line;
+        if (!Number.isInteger(line) || line < 1) {
+          continue;
+        }
+        breakpointLines.push(line);
+        const condition = (item as any).condition;
+        if (typeof condition === "string" && condition) {
+          breakpointConditions.set(line, condition);
+        }
+      }
+    }
+  }
   applyBreakpoints();
 }
 
@@ -224,6 +271,92 @@ function setExecutionLine(payload: unknown) {
   applyExecLine();
 }
 
+// vendored-patch (этап 11 D3): hover-значения выражений в отладке. Свой
+// hover-провайдер 'python' (один на webview) шлёт в python запрос
+// _hover_value_request {requestId, expression, line}; python отвечает в
+// текущем кадре останова через ``evaluate`` (context='hover') сообщением
+// hover_value_reply. Вне останова гейт отвечает мгновенно found=False.
+// Свой тайм-аут 2 с на JS-стороне: зависший ответ не должен вылезти late.
+let hoverReqSeq = 0;
+const pendingHover = new Map<string, (reply: { found: boolean; text: string } | null) => void>();
+
+function requestHoverValue(expression: string, line: number) {
+  hoverReqSeq += 1;
+  const id = `h${hoverReqSeq}`;
+  qtmonaco.__pyqtp_hover_id = id; // тестовый хук: id последнего запроса
+  return new Promise<{ found: boolean; text: string } | null>((resolve) => {
+    let done = false;
+    const settle = (reply: { found: boolean; text: string } | null) => {
+      if (done) {
+        return;
+      }
+      done = true;
+      clearTimeout(timer);
+      pendingHover.delete(id);
+      resolve(reply);
+    };
+    const timer = setTimeout(() => settle(null), 2000);
+    pendingHover.set(id, settle);
+    sendToPython("_hover_value_request", { requestId: id, expression, line });
+  });
+}
+
+function resolveHoverReply(payload: unknown) {
+  if (!payload || typeof payload !== "object") {
+    return;
+  }
+  const id = (payload as any).requestId;
+  const settle = typeof id === "string" ? pendingHover.get(id) : undefined;
+  if (!settle) {
+    return; // запоздалый ответ по уже отложенному запросу — молча мимо
+  }
+  settle({
+    found: (payload as any).found === true,
+    text: typeof (payload as any).text === "string" ? (payload as any).text : "",
+  });
+}
+
+// провайдер регистрируется один раз на webview: Monaco вызывает его для
+// наведения на python-модели; значение не найдено (не в отладке/не вычислено)
+// — null, остаётся только обычный LSP-hover
+monaco.languages.registerHoverProvider("python", {
+  provideHover: async (model, position) => {
+    const word = model.getWordAtPosition(position);
+    if (!word || word.endColumn <= word.startColumn) {
+      return null;
+    }
+    const expression = model.getValueInRange(
+      new monaco.Range(position.lineNumber, word.startColumn, position.lineNumber, word.endColumn),
+    );
+    if (!expression) {
+      return null;
+    }
+    const reply = await requestHoverValue(expression, position.lineNumber);
+    qtmonaco.__pyqtp_last_hover =
+      reply === null ? "TIMEOUT" : reply.found ? "FOUND" : "EMPTY"; // тестовый маркер
+    if (!reply || !reply.found) {
+      return null;
+    }
+    return {
+      range: new monaco.Range(position.lineNumber, word.startColumn, position.lineNumber, word.endColumn),
+      contents: [{ value: "```\n" + reply.text.replace(/`/g, "'") + "\n```" }],
+    };
+  },
+});
+
+// тестовый хук: тот же маршрут без настоящего наведения мышью (offscreen/webengine)
+qtmonaco.__pyqtp_request_hover = (expression: unknown, line: unknown) => {
+  const promise = requestHoverValue(
+    typeof expression === "string" ? expression : String(expression ?? ""),
+    typeof line === "number" ? line : 1,
+  );
+  return promise.then((reply) => {
+    qtmonaco.__pyqtp_last_hover =
+      reply === null ? "TIMEOUT" : reply.found ? "FOUND" : "EMPTY";
+    return reply ? "READY" : "NULL";
+  });
+};
+
 // для live-тестов/отладки: установка меток и чтение текущих наборов
 qtmonaco.setBreakpoints = setBreakpoints;
 qtmonaco.setExecutionLine = setExecutionLine;
@@ -235,24 +368,39 @@ Object.defineProperty(qtmonaco, "execLine", { get: () => execLine });
 // (пустое место дорожки, глифы закладок/стрелка останова) — закладка (поведение
 // 9.7 сохранено). Новый брейкпоинт ставится F9 на строке каретки: дорожка одна
 // на две функции, пустое пространство принадлежит закладкам.
-function routeGutterClick(line: number | undefined, element: HTMLElement | null) {
+// vendored-patch (этап 11 D3): правый клик по глифу брейкпоинта — запрос
+// контекстного меню условий (``_breakpoint_context_request``); правый клик по
+// остальной дорожке не порождает ничего (обычное меню Monaco живое).
+function routeGutterClick(
+  line: number | undefined,
+  element: HTMLElement | null,
+  right = false,
+) {
   if (!line) {
     return;
   }
   const isBreakpoint = !!element && element.classList.contains("pyqtp-breakpoint-glyph");
+  if (right) {
+    if (isBreakpoint) {
+      sendToPython("_breakpoint_context_request", { line });
+    }
+    return;
+  }
   sendToPython(isBreakpoint ? "_toggle_breakpoint_request" : "_toggle_bookmark_request", {
     line,
   });
 }
 
 // тестовый хук для offscreen-проб: настоящей мыши там нет — эмулируем попадание
-// по глифу ('breakpoint' — брейкпоинт, любое иное значение — закладка)
-qtmonaco.__pyqtp_gutter_click = (line: unknown, kind: unknown) => {
+// по глифу ('breakpoint' — брейкпоинт, любое иное значение — закладка;
+// button=2|'right' — правый клик, этап 11 D3)
+qtmonaco.__pyqtp_gutter_click = (line: unknown, kind: unknown, button?: unknown) => {
   const span = document.createElement("span");
   if (kind === "breakpoint") {
     span.className = "pyqtp-breakpoint-glyph";
   }
-  routeGutterClick(typeof line === "number" ? line : undefined, span);
+  const right = button === 2 || button === "right";
+  routeGutterClick(typeof line === "number" ? line : undefined, span, right);
 };
 
 let decorationsCollection: monaco.editor.IEditorDecorationsCollection | null = null;
@@ -361,13 +509,15 @@ function attachEditorListeners(target: monaco.editor.IStandaloneCodeEditor) {
   });
   // vendored-patch (этап 9.7, закладки / этап 11, брейкпоинты): клик по дорожке
   // строки в gutter — запрос переключения; разбор «брейкпоинт это или закладка»
-  // в routeGutterClick, состояние на python, он пришлёт строки обратно
+  // в routeGutterClick, состояние на python, он пришлёт строки обратно.
+  // vendored-patch (этап 11 D3): правая кнопка на глифе брейкпоинта — меню условий
   gutterClickDisposable = target.onMouseDown((e) => {
     if (e.target.type !== monaco.editor.MouseTargetType.GUTTER_LINE_DECORATIONS) {
       return;
     }
     const line = e.target.position ? e.target.position.lineNumber : undefined;
-    routeGutterClick(line, e.target.element ?? null);
+    const right = !!e.event && e.event.rightButton === true;
+    routeGutterClick(line, e.target.element ?? null, right);
   });
 }
 
@@ -930,8 +1080,14 @@ function updateFromPython(name: string, value: string) {
       setBookmarks(data);
       break;
     case "set_breakpoints":
-      // vendored-patch (этап 11 D1, отладчик): строки-брейкпоинты этого документа
+      // vendored-patch (этап 11 D1): строки-брейкпоинты этого документа;
+      // с D3 — записи {'line'[, 'condition']} (набор терпим и к сырым строкам)
       setBreakpoints(data);
+      break;
+    case "hover_value_reply":
+      // vendored-patch (этап 11 D3): ответ python на hover-запрос значения
+      // выражения {'requestId', 'found', 'text'} (гейт/evaluate на python)
+      resolveHoverReply(data);
       break;
     case "set_execution_line":
       // vendored-patch (этап 11 D1): строка кадра останова ({line: N}, 0 — снять)

@@ -49,6 +49,12 @@ body {
   background-color: rgba(209, 65, 77, 0.1);
 }
 
+/* vendored-patch (этап 11 D3): условный брейкпоинт — тот же кружок, но полый
+   (как в VS Code): радиальный градиент рисует только кольцо */
+.pyqtp-breakpoint-cond {
+  background: radial-gradient(circle at center, transparent 0 2.5px, #d1414d 3px 4.5px, transparent 5px) no-repeat;
+}
+
 /* строка кадра останова: жёлтая стрелка в дорожке + подсветка строки
    (цвет как у current-line VS Code, полупрозрачно — не перекрывает выделения) */
 .pyqtp-exec-gutter::before {

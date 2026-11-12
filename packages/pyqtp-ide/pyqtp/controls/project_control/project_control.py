@@ -25,10 +25,12 @@ from pyqtp.controls.project_control.project_session import (
     write_session,
 )
 from pyqtp.controls.project_control.project_settings import (
+    KEY_BREAK_ON_RAISED,
     KEY_REGISTRY_JSON,
     KEY_THEME_NAME,
     KNOWN_SECTIONS,
     SECTION_APPEARANCE,
+    SECTION_DEBUG,
     SECTION_EDITOR,
     SECTION_LSP,
     overlay_set,
@@ -673,30 +675,59 @@ class ProjectControl(BaseControl):
         if value is None:  # снятие перекрытия — значение любое
             return
         if section == SECTION_APPEARANCE:
-            if key != KEY_THEME_NAME:
-                error_message = f'Неизвестный ключ секции «{section}»: {key}'
-                raise ValueError(error_message)
-            names = self._main_wnd.theme_manager.theme_names
-            if not (isinstance(value, str) and value in names):
-                error_message = 'Тема должна быть одной из: ' + ', '.join(names)
-                raise ValueError(error_message)
+            self._validate_appearance_setting(section, key, value)
         elif section == SECTION_EDITOR:
-            if key not in DEFAULT_EDITOR_UX_OPTIONS:
-                error_message = f'Неизвестный ключ секции «{section}»: {key}'
-                raise ValueError(error_message)
-            coerce_editor_ux_value(key, value)  # ValueError/TypeError с текстом
-        else:  # SECTION_LSP
-            if key != KEY_REGISTRY_JSON:
-                error_message = f'Неизвестный ключ секции «{section}»: {key}'
-                raise ValueError(error_message)
-            if not isinstance(value, str):
-                error_message = 'LSP-реестр задаётся JSON-строкой'
-                raise ValueError(error_message)
-            try:
-                LspRegistry.from_json(value)
-            except (TypeError, ValueError) as exc:
-                error_message = f'Некорректный JSON LSP-реестра: {exc}'
-                raise ValueError(error_message) from exc
+            self._validate_editor_setting(section, key, value)
+        elif section == SECTION_LSP:
+            self._validate_lsp_setting(section, key, value)
+        elif section == SECTION_DEBUG:
+            self._validate_debug_setting(section, key, value)
+
+    def _validate_appearance_setting(
+        self, section: str, key: str, value: Any
+    ) -> None:
+        if key != KEY_THEME_NAME:
+            error_message = f'Неизвестный ключ секции «{section}»: {key}'
+            raise ValueError(error_message)
+        names = self._main_wnd.theme_manager.theme_names
+        if not (isinstance(value, str) and value in names):
+            error_message = 'Тема должна быть одной из: ' + ', '.join(names)
+            raise ValueError(error_message)
+
+    def _validate_editor_setting(
+        self, section: str, key: str, value: Any
+    ) -> None:
+        if key not in DEFAULT_EDITOR_UX_OPTIONS:
+            error_message = f'Неизвестный ключ секции «{section}»: {key}'
+            raise ValueError(error_message)
+        coerce_editor_ux_value(key, value)  # ValueError/TypeError с текстом
+
+    def _validate_lsp_setting(self, section: str, key: str, value: Any) -> None:
+        if key != KEY_REGISTRY_JSON:
+            error_message = f'Неизвестный ключ секции «{section}»: {key}'
+            raise ValueError(error_message)
+        if not isinstance(value, str):
+            error_message = 'LSP-реестр задаётся JSON-строкой'
+            raise ValueError(error_message)  # noqa: TRY004 — контракт API
+        try:
+            LspRegistry.from_json(value)
+        except (TypeError, ValueError) as exc:
+            error_message = f'Некорректный JSON LSP-реестра: {exc}'
+            raise ValueError(error_message) from exc
+
+    def _validate_debug_setting(
+        self, section: str, key: str, value: Any
+    ) -> None:
+        # этап 11 D3: фильтры исключений отладчика
+        if key != KEY_BREAK_ON_RAISED:
+            error_message = f'Неизвестный ключ секции «{section}»: {key}'
+            raise ValueError(error_message)
+        if not isinstance(value, bool):
+            error_message = (
+                'Настройка «Останавливаться на исключениях» должна быть '
+                'флагом (True/False)'
+            )
+            raise ValueError(error_message)  # noqa: TRY004 — контракт API
 
     def _load_project_settings(self, root: Path) -> None:
         """Читает оверлей ``<root>/.pyqtp/settings.json`` в память.

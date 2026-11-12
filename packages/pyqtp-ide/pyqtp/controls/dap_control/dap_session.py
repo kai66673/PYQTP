@@ -46,7 +46,8 @@ _HANDSHAKE_TIMEOUT = 15.0
 _GRACEFUL_WAIT = 3.0
 
 # капбилити клиента: адаптер на их наличие решает, что слать (например,
-# supportsRunInTerminalRequest у нас нет — console должен быть internalConsole)
+# supportsRunInTerminalRequest у нас нет — console должен быть internalConsole;
+# supportsConditionalBreakpoints — ключ 'condition' в setBreakpoints, этап 11 D3)
 CLIENT_CAPABILITIES = {
     'supportsVariableType': True,
     'supportsVariablePaging': False,
@@ -54,6 +55,7 @@ CLIENT_CAPABILITIES = {
     'supportsMemoryReferences': False,
     'supportsProgressReporting': False,
     'supportsInvalidatedEvent': False,
+    'supportsConditionalBreakpoints': True,
 }
 
 
@@ -92,6 +94,12 @@ class DapSession:
         self.initialized_event: asyncio.Event = asyncio.Event()
         self.terminated_event: asyncio.Event = asyncio.Event()
         self.last_error = ''
+        # capabilities адаптера из ответа initialize (пусто до handshake;
+        # по ним гейтятся setExceptionBreakpoints, этап 11 D3)
+        self.capabilities: dict[str, Any] = {}
+        # набор фильтров setExceptionBreakpoints ('|None — не слать);
+        # выставляется контролом перед handshake (_ControlledDapSession)
+        self.exception_filters: list[str] | None = None
         self._proc: asyncio.subprocess.Process | None = None
         self._reader_task: asyncio.Task | None = None
         self._stderr_task: asyncio.Task | None = None
@@ -144,7 +152,8 @@ class DapSession:
         Порядок (иначе адаптер зависает): ``initialize`` → запрос ``launch``
         (ответ придёт ПОСЛЕ ``configurationDone``) → дождаться события
         ``initialized`` → ``setBreakpoints`` (хук ``on_breakpoints_ready``) →
-        ``configurationDone`` → дождаться ответа ``launch``.
+        ``setExceptionBreakpoints`` (хук ``on_exception_breakpoints_ready``,
+        этап 11 D3) → ``configurationDone`` → дождаться ответа ``launch``.
         """
         init_resp = await self.request(
             'initialize',
@@ -158,8 +167,17 @@ class DapSession:
             },
             timeout=_HANDSHAKE_TIMEOUT,
         )
-        caps = (init_resp.get('body') or {}).get('capabilities')
-        dbg_log.debug('Capabilities адаптера: %r', sorted(caps or {}))
+        # capabilities адаптера: по спеке они лежат НЕСАМЫМ телом ответа
+        # (InitializeResult.body == DebugServerCapabilities), но pydevd/debugpy
+        # кладут их ровно в тело без обёртки 'capabilities', а соответствующие
+        # спеке адаптеры (и наш фейк) — вложенным словарём. сливаем обе формы
+        body = init_resp.get('body') or {}
+        caps = dict(body)
+        nested = body.get('capabilities')
+        if isinstance(nested, dict):
+            caps.update(nested)
+        self.capabilities = caps
+        dbg_log.debug('Capabilities адаптера: %r', sorted(self.capabilities))
 
         launch_seq = self._next_seq()
         launch_fut = self._register(launch_seq)
@@ -173,6 +191,7 @@ class DapSession:
             return 'Адаптер не прислал событие initialized'
 
         await self.on_breakpoints_ready()
+        await self.on_exception_breakpoints_ready()
         await self.request('configurationDone', {}, timeout=_HANDSHAKE_TIMEOUT)
         try:
             launch_resp = await asyncio.wait_for(launch_fut, _HANDSHAKE_TIMEOUT)
@@ -189,12 +208,45 @@ class DapSession:
         брейкпоинты верифицируются и сработают при импорте модуля.
         """
 
+    async def on_exception_breakpoints_ready(self) -> None:
+        """Хук handshake: выставить фильтры исключений (этап 11 D3).
+
+        По спеке запрос шлётся только если адаптер объявил capability
+        ``exceptionBreakpointFilters``; сам набор задаёт контрол через
+        ``exception_filters`` (``None`` — не слать вовсе).
+        """
+        await self.apply_exception_breakpoints()
+
+    async def apply_exception_breakpoints(self) -> None:
+        """``setExceptionBreakpoints`` по ``self.exception_filters`` (best effort).
+
+        Не объявлен адаптером/не задан контролом — ничего не делаем; сбой
+        запроса не рвёт handshake (фильтры — вспомогательные, этап 11 D3).
+        Тот же метод используется для переприменения фильтров в живую сессию
+        при смене опции ``break_on_raised``.
+        """
+        filters = self.exception_filters
+        if filters is None:
+            return
+        declared = self.capabilities.get('exceptionBreakpointFilters')
+        if not isinstance(declared, list) or not declared:
+            dbg_log.info(
+                'Адаптер не объявил exceptionBreakpointFilters — фильтры не применены',
+            )
+            return
+        try:
+            await self.request_body(
+                'setExceptionBreakpoints', {'filters': list(filters)},
+            )
+        except (DapError, ConnectionError, OSError) as exc:
+            dbg_log.warning('Фильтры исключений не применены: %s', exc)
+
     async def request(
         self,
         command: str,
         arguments: dict[str, Any] | None = None,
         *,
-        timeout: float = 10.0,  # noqa: ASYNC109 -同步-ожидание ответа адаптера
+        timeout: float = 10.0,  # noqa: ASYNC109 - синхронное-ожидание ответа адаптера
     ) -> dict[str, Any]:
         """Отправить запрос и дождаться ответа (полный dict-ответ адаптера)."""
         seq = self._next_seq()

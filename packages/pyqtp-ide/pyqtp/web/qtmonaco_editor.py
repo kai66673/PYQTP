@@ -42,6 +42,11 @@ class QtMonacoEditorWidget(Monaco):
     bookmark_toggle_requested = Signal(int)
     # этап 11 (D1): клик по дорожке брейкпоинтов — переключение строки ``line``
     breakpoint_toggle_requested = Signal(int)
+    # этап 11 (D3): правый клик по глифу брейкпоинта — контекстное меню строки
+    breakpoint_context_requested = Signal(int)
+    # этап 11 (D3): hover-запрос значения выражения
+    # состав payload: requestId, expression, line
+    hover_value_requested = Signal(dict)
 
     def __init__(
         self, file_path: Path, /, *, lsp_host: str | list[dict] | None = None
@@ -146,16 +151,36 @@ class QtMonacoEditorWidget(Monaco):
             return
         self.bookmark_toggle_requested.emit(line)
 
-    def set_breakpoints(self, lines: list[int]) -> None:
-        """Прислать в Monaco номера строк-брейкпоинтов этого документа (этап 11).
+    def set_breakpoints(self, lines: list[int | dict[str, Any]]) -> None:
+        """Прислать в Monaco брейкпоинты этого документа (этап 11, срез D3).
 
         Как ``set_bookmarks``: состояние живёт на python-стороне
         (``.pyqtp/breakpoints.json`` + ``DapControl``), редактору сообщаются
-        только строки его файла — JS перекрашивает дорожку (своя
+        только данные его файла — JS перекрашивает дорожку (своя
         ``breakpointCollection`` в main.ts). Буферизуется ``Connector`` до
         инициализации моста.
+
+        ``lines`` — записи ``{'line': N[, 'condition']}`` (D3) или просто
+        строки (обратная совместимость: webengine-тесты D1 и фейки в тестах
+        9.x присылают int); на выход всегда уходят нормализованные записи,
+        отсортированные по строке, по одной записи на строку.
         """
-        self._connector.send('set_breakpoints', sorted({int(line) for line in lines}))
+        by_line: dict[int, dict[str, Any]] = {}
+        for item in lines:
+            if isinstance(item, dict):
+                line = item.get('line')
+                condition = item.get('condition')
+                if not isinstance(line, int) or isinstance(line, bool):
+                    continue
+                entry: dict[str, Any] = {'line': line}
+                if isinstance(condition, str) and condition:
+                    entry['condition'] = condition
+                by_line[line] = entry
+            elif isinstance(item, int) and not isinstance(item, bool):
+                by_line[item] = {'line': item}
+        self._connector.send(
+            'set_breakpoints', [by_line[line] for line in sorted(by_line)],
+        )
 
     def set_execution_line(self, payload: dict) -> None:
         """Подсветка строки останова (current-line, этап 11).
@@ -181,6 +206,48 @@ class QtMonacoEditorWidget(Monaco):
             )
             return
         self.breakpoint_toggle_requested.emit(line)
+
+    def _breakpoint_context_request(self, value: dict) -> None:
+        """Обработчик ``_breakpoint_context_request`` из JS-стороны (D3).
+
+        Правый клик по глифу брейкпоинта в дорожке Monaco (нативное контекстное
+        меню Monaco при этом перехвачено и подавлено) — намерение показать
+        меню условий/удаления (см. ``DapControl.breakpoint_context_menu``).
+        """
+        line = value.get('line') if isinstance(value, dict) else None
+        if not isinstance(line, int) or isinstance(line, bool) or line < 1:
+            med_log.warning(
+                'Monaco прислал запрос контекстного меню брейкпоинта без строки: %r',
+                value,
+            )
+            return
+        self.breakpoint_context_requested.emit(line)
+
+    def _hover_value_request(self, value: dict) -> None:
+        """Обработчик ``_hover_value_request`` из JS-стороны (D3).
+
+        Свой hover-провайдер Monaco наводит блок значения выражения: запрос
+        ``{'requestId', 'expression', 'line'}`` уходит наверх, ответ придёт
+        обратно сообщением ``hover_value_reply`` (см.
+        ``DapControl._on_hover_requested``).
+        """
+        if (
+            not isinstance(value, dict)
+            or not isinstance(value.get('requestId'), str)
+            or not isinstance(value.get('expression'), str)
+        ):
+            med_log.warning('Monaco прислал hover-запрос не по форме: %r', value)
+            return
+        self.hover_value_requested.emit(dict(value))
+
+    def reply_hover_value(self, payload: dict) -> None:
+        """Ответ на hover-запрос: ``{'requestId', 'found', 'text'}`` (D3).
+
+        JS-сторона подменяет содержимое hover-блока, если запрос ещё жив
+        (свой 2-сехундный тайм-аут на JS не даёт зависшему ответу вылезти
+        late); ``found=False`` — блок значения не показывается.
+        """
+        self._connector.send('hover_value_reply', dict(payload))
 
     def apply_lsp_text_edits(self, uri: str, edits: list[dict]) -> None:
         """Применить TextEdit'ы к модели этого редактора (этап 8.2).
